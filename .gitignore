@@ -1,0 +1,6 @@
+venv
+.DS_Store
+nostrmix-bot.env
+nostrmix-questions.md
+nostrmix-status.md
+__pycache__

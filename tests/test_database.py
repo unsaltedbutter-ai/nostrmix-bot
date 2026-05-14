@@ -1,0 +1,173 @@
+"""Tests for Database layer."""
+
+import os
+import sys
+import tempfile
+import pytest
+import asyncio
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+# Track temp files for cleanup
+_db_paths = []
+
+
+def cleanup_db():
+    for p in _db_paths[:]:
+        try:
+            os.unlink(p)
+            _db_paths.remove(p)
+        except:
+            pass
+
+
+async def make_db():
+    """Create a temporary database for testing."""
+    import src.database as db_mod
+    schema_path = os.path.join(os.path.dirname(__file__), "..", "src", "schema.sql")
+    db_mod.SCHEMA_PATH = schema_path
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    _db_paths.append(db_path)
+
+    database = db_mod.Database(db_path)
+    await database.connect()
+    return database
+
+
+class TestDatabase:
+    @pytest.mark.asyncio
+    async def test_create_and_get_mix(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(
+                output_size=1_000_000,
+                min_participants=3,
+                max_participants=10,
+                fee_per_element=100,
+            )
+            assert mid is not None
+            mix = await db.get_mix(mid)
+            assert mix is not None
+            assert mix["output_size"] == 1_000_000
+            assert mix["min_participants"] == 3
+            assert mix["state"] == "announced"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_add_participant(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "npub_hex_123", "user@pay.domain")
+            assert pid is not None
+            p = await db.get_participant(pid)
+            assert p["npub_hex"] == "npub_hex_123"
+            assert p["state"] == "interested"
+            assert p["lightning_addr"] == "user@pay.domain"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_add_utxo(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "npub_hex_123", "")
+            uid = await db.add_utxo(pid, "abc123", 0, 100_000, "p2wpkh")
+            assert uid is not None
+            utxos = await db.get_utxos_by_participant(pid)
+            assert len(utxos) == 1
+            assert utxos[0]["amount"] == 100_000
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_add_output(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "npub_hex_123", "")
+            oid = await db.add_output(pid, "bc1qabc123", 1_000_000, False)
+            assert oid is not None
+            outputs = await db.get_outputs_by_participant(pid)
+            assert len(outputs) == 1
+            assert outputs[0]["address"] == "bc1qabc123"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_utxo_double_spend_detection(self):
+        db = await make_db()
+        try:
+            mid1 = await db.create_mix(1_000_000, 3)
+            mid2 = await db.create_mix(1_000_000, 3)
+            pid1 = await db.add_participant(mid1, "npub1", "")
+            pid2 = await db.add_participant(mid2, "npub2", "")
+
+            await db.add_utxo(pid1, "txid_abc", 0, 100_000)
+            await db.add_utxo(pid2, "txid_abc", 0, 200_000)
+
+            await db.mark_utxo_used(pid1, "txid_abc", 0)
+
+            used = await db.is_utxo_used("txid_abc", 0)
+            assert used
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_active_mixes(self):
+        db = await make_db()
+        try:
+            await db.create_mix(1_000_000, 3)
+            active = await db.get_active_mixes()
+            assert len(active) == 1
+            assert active[0]["state"] == "announced"
+
+            await db.update_mix(active[0]["id"], state="completed")
+            active = await db.get_active_mixes()
+            assert len(active) == 0
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_participant_state_machine(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "npub_hex", "")
+            assert await db.get_participant(pid) is not None
+            await db.update_participant(pid, state="paid", fee_paid=500)
+            p = await db.get_participant(pid)
+            assert p["state"] == "paid"
+            assert p["fee_paid"] == 500
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_blacklist(self):
+        db = await make_db()
+        try:
+            bid = await db.add_to_blacklist("npub_bad", "txid:vout", "ghosting")
+            assert bid is not None
+            assert await db.is_blacklisted("npub_bad")
+            assert await db.is_blacklisted("npub_bad", "txid:vout")
+            assert not await db.is_blacklisted("npub_good")
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_count_active_participant_mixes(self):
+        db = await make_db()
+        try:
+            mid1 = await db.create_mix(1_000_000, 3)
+            mid2 = await db.create_mix(1_000_000, 3)
+            await db.add_participant(mid1, "npub_hex", "")
+            await db.add_participant(mid2, "npub_hex", "")
+            count = await db.count_active_participant_mixes("npub_hex")
+            assert count == 2
+        finally:
+            await db.close()

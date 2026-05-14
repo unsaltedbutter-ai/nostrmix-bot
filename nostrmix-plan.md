@@ -1,0 +1,646 @@
+# Plan: nostrbot — Bitcoin Coinjoin Mixer
+
+## Overview
+
+A PSBT-based coinjoin bot that operates over Nostr NIP-17 DMs, accepts fees via Lightning zaps, and assembles equal-output mixing transactions from multiple participants. Participants discover open mixes via the bot's daily Nostr announcements, join via DM, and co-sign a single on-chain transaction.
+
+
+Some basics:
+- nostrbot-sdk is located at https://github.com/unsaltedbutter-ai/nostrbot-sdk
+- - the nostrbot-sdk will have everything we need to listening to relays, receiving & sending NIP-17, receiving & validating zaps, sending refunds over lightning, publishing a daily "mixes available" listing post.
+- we have a BTCPay server at pay.unsaltedbutter.ai It is fully operational and this coding project does not need to consider it in any way beyond knowing how to use the url/store/apikey to issue refunds.
+- - we can create NIP-05 & LUD16 for the bot, and fill in with an env file later
+- keep everything inside of ~/Documents/nostrmix-bot
+- any venv should be named "venv" not ".venv"
+- any env files should regular files, not dot-prefixed files
+- our goal is to build this all. it can be done in phases, if you can define the phases and track the work
+- for the python nostr client we want to use nostrbot-sdk which has nostr-sdk as a dependency (https://pypi.org/project/nostr-sdk/)
+- we need unit tests for all aspects. Do what it takes to make sure the code is testable.
+- the README.md at https://raw.githubusercontent.com/unsaltedbutter-ai/nostrbot-sdk/refs/heads/main/README.md should give you lots of features of the nostr bot
+- payment of miner fee: the bot will assemble the transaction out of all participant's inputs, will allocate BTC to the outputs equally, and will use left over funds to pay the miner fee.
+- The bitcoin miner fee is calculated based upon looking at recent blockchain activity, applying a multiple, such as 1.5x which is controlled by an env variable, and this amount is deducted from participants outputs in equal amounts so that outputs remain equal and the miner fee is paid.
+- The on-chain need not be "known later." it can be precalculated based upon current/recent blockchain activity and adding a multiplier to give a buffer. If the blockchain becomes significantly more busy & expensive to get a confirmation it is acceptable for the join to take longer to become confirmed.
+- There will only be one zap (per participant) required to become a participant in the join.
+- all inputs must be of the same key type (such as p2wpkh). The cost per input/output should come from env variables so it can be raised or lowered if the example table (below) proves to be incorrect.
+- all outputs must be of the same key type as the inputs (such as p2wpkh).
+- let's us setup the database so that the same npub participant can be a party to more than one pending mix. This could result in the participant being asked to sign more than one PSBT at a time. We will need to match their reply to us against the n number of mixes they belong to. This should be a relatively small number. We can cap them to 5 simultaneous mixes, but let's use an env variable for the maximum allowed.
+- in logging when printing npubs, print the bech32-encoded format, not the hex, for operator readability.
+- The user decides for themselves how many outputs they want. They indicate the number by how many output addresses they send to us.
+- When the bot has no mixes open, it should make one using DEFAULT_OUTPUT_SIZE and DEFAULT_MIX_USER_COUNT
+
+---
+
+## 1. Dependencies
+
+```
+nostrbot-sdk                    # user's wrapper around nostr-sdk (NIP-17, NIP-57, relays)
+python-bitcoinlib               # PSBT building, validation, combination
+httpx                           # mempool.space API calls (UTXO lookup, fee estimates, broadcast)
+aiosqlite                       # async SQLite for state storage
+python-dotenv                   # env config
+```
+
+---
+
+## 2. Database Schema (SQLite)
+
+File: `schema.sql`
+
+```sql
+CREATE TABLE mixes (
+    id              TEXT PRIMARY KEY,          -- east-gate
+    output_size     INTEGER NOT NULL,          -- sats (1_000_000 = 0.01 BTC)
+    min_participants INTEGER NOT NULL DEFAULT 3,
+    max_participants INTEGER,
+    fee_rate        INTEGER DEFAULT 30,        -- sats/vbyte, set at assembly
+    fee_per_element INTEGER DEFAULT 100,       -- sats, zap fee per input+output
+    state           TEXT NOT NULL DEFAULT 'announced',
+    -- announced | collecting | assembling | signing | broadcast | completed | cancelled
+    deadline_unix   INTEGER,
+    broadcast_txid  TEXT,
+    ghost_retries   INTEGER DEFAULT 0,          -- how many times this round has restarted due to ghosting
+    max_ghost_retries INTEGER DEFAULT 3,        -- after this, cancel and refund everyone
+    created_at_unix INTEGER NOT NULL,
+    updated_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE participants (
+    id              TEXT PRIMARY KEY,
+    mix_id          TEXT NOT NULL REFERENCES mixes(id),
+    npub_hex        TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'interested',
+    -- interested | committed | paid | signing | signed | ghosted | broadcast | refunded
+    fee_paid        INTEGER,                    -- sats zap received
+    fee_share       INTEGER,                    -- on-chain fee share (calculated)
+    change_amount   INTEGER,                    -- change output sats, 0 = no change
+    lightning_addr  TEXT,                       -- from Nostr profile kind 0, for refunds
+    psbt_sent_at_unix INTEGER,                 -- when bot sent the PSBT to this participant
+    reminder_count  INTEGER DEFAULT 0,          -- how many ping DMs sent
+    created_at_unix INTEGER NOT NULL,
+    updated_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE utxos (
+    id              TEXT PRIMARY KEY,
+    participant_id  TEXT NOT NULL REFERENCES participants(id),
+    txid            TEXT NOT NULL,
+    vout            INTEGER NOT NULL,
+    amount          INTEGER NOT NULL,           -- sats
+    script_type     TEXT,                        -- p2wpkh | p2tr | p2pkh
+    is_used         BOOLEAN DEFAULT 0,           -- prevent double-spend across mixes
+    created_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE outputs (
+    id              TEXT PRIMARY KEY,
+    participant_id  TEXT NOT NULL REFERENCES participants(id),
+    address         TEXT NOT NULL,
+    amount          INTEGER NOT NULL,           -- sats
+    is_change       BOOLEAN DEFAULT 0,
+    created_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE psbt_rounds (
+    id              TEXT PRIMARY KEY,
+    mix_id          TEXT NOT NULL REFERENCES mixes(id),
+    participant_id  TEXT NOT NULL REFERENCES participants(id),
+    round_num       INTEGER DEFAULT 1,
+    psbt_sent_at_unix INTEGER,
+    psbt_sent       TEXT,                        -- hex of skeleton PSBT
+    psbt_returned   TEXT,                        -- hex of signed PSBT
+    psbt_returned_at_unix INTEGER,
+    psbt_valid      BOOLEAN,
+    UNIQUE(mix_id, participant_id, round_num)
+);
+
+CREATE TABLE blacklist (
+    id              TEXT PRIMARY KEY,
+    npub_hex        TEXT,                       -- ghosted participant pubkey
+    utxo_txid_vout  TEXT,                       -- txid:vout string
+    reason          TEXT DEFAULT 'ghosting',
+    created_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE announcements (
+    id              TEXT PRIMARY KEY,
+    mix_id          TEXT NOT NULL REFERENCES mixes(id),
+    event_id        TEXT,                        -- Nostr event ID of the posted note
+    posted_at_unix  INTEGER NOT NULL
+);
+```
+
+You have authority to add indices on tables & columns as apprporitate such as the foreign keys.
+
+Ghosting starts a new psbt_round. A mix only allows for <MAX_GHOST_RETRIES> rounds.
+
+
+---
+
+## 3. Component Specs
+
+### 3a. Nostr DM Handler (File: `nostr_handler.py`)
+
+Uses `nostrbot-sdk` for all transport. Handles:
+
+- **Incoming DMs**: parse commands and route to coordinator
+  - `/list`, `/join <mix_id> <num_outputs>`, `/commit <txid:vout> ...`, `/addresses <addr> ...`, `/psbt_accept <hex>`, `/cancel`
+- **Outgoing DMs**: send structured messages to participants
+- **Zap monitoring**: listen for kind 9735 (zap receipt) events on relays; match sender npub + amount to pending participant
+- **Profile lookup**: fetch kind 0 for lightning address (refund path)
+- **Daily announcements**: for each open mix, post a kind 1 note to configured relays
+- **Ghosting pings**: graduated DMs at 1/8 of signing time, 1/4 of signing time, 1/2 of signing time after PSBT sent
+
+Command protocol — rigid, no NL parsing required. The bot responds with structured text:
+
+```
+/list →
+  "mix_abc: 0.01 BTC outputs, 3/5 participants, 12h deadline"
+  "mix_def: 0.05 BTC outputs, 1/3 participants, 24h deadline"
+
+/join mix_abc 4 →
+  "Registered. Provide UTXOs with /commit <txid:vout> ..."
+
+/commit 123abc:0 456def:1 →
+  "3 UTXOs registered, total 0.0543 BTC.
+   Provide 4 output addresses with /addresses <addr1> ..."
+
+/addresses bc1q... bc1q... bc1q... bc1q... →
+  "4 outputs @ 0.01 each.
+   Pay 500 sats (1 input + 4 outputs × 100) as zap to ${lnurl}.
+   On mix timeout, I'll return 95% (minus the REFUND_KEEP_PERCENT)."
+```
+
+### 3b. Lightning Handler (File: `lightning_handler.py`)
+
+- **Receive zaps**: no special handling needed — the LNURL-pay endpoint generates invoices, the payer pays, the bot records the zap receipt (kind 9735) via Nostr. The zap_provider_pubkey_hex will be included in the env file. 
+- **Send refunds**: on mix cancellation, send 95% of participant's fee back to their LNURL (derived from kind 0 profile). Keeps 5% to cover Lightning routing fees.
+- **Balance check**: ensure the bot has sufficient outbound capacity for refunds before accepting new participants
+
+No invoice generation is required — the bot registers their LUD16 which tells the user where to send a zap. The Nostr zap protocol handles the rest.
+
+### 3c. Chain Monitor (File: `chain_monitor.py`)
+
+Uses `mempool.space` API (configurable).
+
+- **UTXO lookup**: fetch prevout for each txid:vout → returns amount (sats) + script type
+- **Fee estimation**: fetch the lowest fee rate confirmed in each of the last 4 blocks, average them, clamp to `MIN_FEE_RATE` (1.5 sats/vbyte from env)
+- **Broadcast**: submit final transaction hex via POST to mempool.space API → returns txid
+- **Confirmation checking**: The bot checks for confirmation once per day. If the mix has confirmed, all information is fully destroyed/removed from the datagbase. No trace (besides blacklisting) remains.
+
+### 3d. PSBT Manager (File: `psbt_manager.py`)
+
+Uses `python-bitcoinlib`.
+
+- **Build skeleton PSBT**: given all inputs (txid, vout, amount, script) and all outputs (address, amount), produce a valid PSBT
+- **Validate returned PSBT**: compare against the original skeleton, allowing signatures from the participant. Reject if:
+  - Output addresses changed
+  - Output amounts changed  
+  - Inputs removed or added
+  - Signature count doesn't match participant's input count
+- **Combine PSBTs**: extract partial signatures from all validated returned PSBTs and assemble a single final PSBT with every input signed
+- **Finalize**: extract the raw transaction hex for broadcast
+- **Vsize estimation**: given input count, output count, and script types, estimate vsize for fee calculation:
+  ```
+  total_vsize = 10 + (num_inputs × 68) + (num_outputs × 31)  # p2wpkh defaults
+  ```
+
+### 3e. Fee Engine (File: `fee_engine.py`)
+
+Two-tier fee model:
+
+**Tier 1 — Service fee (Lightning zap)**
+Charged at commitment: `fee_per_element × (inputs + outputs)`. Known upfront, paid via zap.
+The participant sends a zap using their nostr client. We do not need to do anything to create the invoice.
+- we tell the user to send us input information (txids & vouts) and output addresses and we calculate the amount and tell the user to zap us ### sats.
+- we record their information (npub and inputs/output) and await a zap of at least the correct amount
+- when the zap arrives, we know who sent it (npub) and we compare the amount to what we were waiting for and mark the user as a paid member if they paid enough.
+- Partial payments are the same as no payment
+
+**Tier 2 — On-chain miner fee (Bitcoin)**
+Calculated when all participants are known, based on actual vsize.
+
+Algorithm:
+
+```
+1. total_vsize = overhead + sum(participant_inputs × 68) + sum(participant_outputs × 31)
+2. total_miner_fee = total_vsize × fee_rate
+3. For each participant:
+     weight = (num_inputs × 68) + (num_outputs × 31) + overhead_share
+     proportional = total_miner_fee × weight / total_weight
+     actual_fee = clamp(proportional, participant.min_fee, participant.max_fee)
+     surplus = sum(participant.inputs) - (num_fixed_outputs × output_size)
+     change = surplus - actual_fee
+```
+
+- 68 & 31 above are example values that will come out of env on a per address-type basis.
+
+Users should pay the miner fee proportional to the number of input and outputs they are contributing to the join.
+The user doesn't directly tell us how many outputs they want. The tell us the input(s) and they provide us with n output addresses. The maximum number of outputs they can receive is the number of addresses they give us, but we calculate the number we will create based upon miner fee & minimum utxo size.
+The number cannot be more than the number of addresses they give us, but if their inputs contain 0.02002111 and they send us 10 output addresses and we're creating 0.01 outputs, we can only make 2 outputs for them. If however they send us 0.52002111 and only send us 2 output addresses, and we're creating 0.01 outputs, we will create one 0.01 and the rest (minus calculated miner fees) will be the change in their 2nd output address. We do not need to prompt the user for more output addresses.
+
+We start by taking the sum of one user's inputs and calculating the total number of outputs for the size the mix wants to create.
+Then from their input bitcoin total we subtract the estimated fee per input & output.
+- If the user hasn't given us enough output addresses, the will get a larger change output.
+- If the user has given us too many output addresses, we only use as many as we need.
+Once we subtract the fee based upon the number of outputs and our estimated fee per vbyte, we calculate their change based upon the remainder.
+- If there is a remainder from their inputs, that is their proposed change.
+- If the change is smaller than MINIMUM_UTXO_SIZE, those sats will be added to the miner fee.
+- If the change is greater than MINIMUM_UTXO_SIZE, those sats will use one of the participant's output addresses.
+It is acceptable for users to receive differing amounts of change. Those outputs are expected to be mixed by the user in a subsequent round.
+
+Once we calculate how many outputs we will actually use we perform out (inputs + used-outputs) * FEE_PER_ELEMENT and ask for payment.
+
+
+### 3f. Mixing Coordinator (File: `coordinator.py`)
+
+State machines, event loop, tie everything together.
+
+**Mix state machine:**
+
+```
+announced  → collecting  → assembling  → signing  → broadcast  → completed
+                │               │              │              │
+                ↓               ↓              ↓              ↓
+             cancelled        cancelled     retry +         cancelled
+               (timeout)       (ghost         restart        (double-spend
+                                detected)                    detected,
+                                                             or failed
+                                                             broadcast)
+```
+
+**Participant state machine:**
+
+```
+interested  → committed  → paid  → signing  → signed  → broadcast  → completed
+     │             │           │         │           │
+     ↓             ↓           ↓         ↓           ↓
+  cancelled     cancelled   ghosted    ghosted    cancelled
+                              │                     (double-spend
+                              │                     detected)
+                              ↓
+                          retry
+                          (removed + 
+                           round restarts)
+```
+There is an arrow from paid -> ghosted. If they do not pay within PAY_DEADLINE_HOURS they are removed from the mix.
+There is an arrow from paid -> signing. When the transition to signing, if they do not pay within SIGNING_DEADLINE_HOURS they are removed from the mix & blacklisted.
+There is an arrow from signing -> ghosted. If they do not pay within SIGNING_DEADLINE_HOURS they are removed from the mix & blacklisted.
+
+
+**Event loop pseudocode:**
+
+SIGNING_DEADLINE_HOURS is the
+```python
+async def run():
+    while True:
+        for mix in active_mixes:
+            match mix.state:
+                case "collecting":
+                    if deadline_unix passed:
+                        if participants < 2:
+                            cancel_and_refund(mix)
+                        elif participants < min_participants:
+                            if mix.allow_mini:
+                                proceed_to_assembling(mix)
+                            else:
+                                cancel_and_refund(mix)
+                        else:
+                            proceed_to_assembling(mix)
+
+                case "assembling":
+                    assemble_psbt(mix)
+                    update psbt_sent_at_unix for all min_participants
+                    set p.state = "signing"
+                    send_to_all_participants(mix)
+                    mix.state = "signing"
+
+                case "signing":
+                    for p in mix.participants:
+                        if p.state == "ghosted": continue
+                        if psbt_sent + SIGNING_DEADLINE_HOURS passed and no return:
+                            p.state = "ghosted"
+                            blacklist(p)
+                            ping_sequence(p)  # 6h, 12h
+                        elif psbt_sent + (SIGNING_DEADLINE_HOURS / 8) passed and no return:
+                            if p.reminder_count == 0:
+                                send_ping(p)
+                                p.reminder_count += 1
+                        elif psbt_sent + (SIGNING_DEADLINE_HOURS / 4) passed and no return:
+                            if p.reminder_count == 1:
+                                send_ping(p)
+                                p.reminder_count += 1
+                        elif psbt_sent + (SIGNING_DEADLINE_HOURS / 2) passed and no return:
+                            send_final_warning(p)
+                            p.reminder_count += 1
+
+                    # Check if all remaining participants have signed
+                    remaining = [p for p in mix.participants
+                                 if p.state not in ("ghosted", "cancelled")]
+                    if all(p.state == "signed" for p in remaining):
+                        combine_and_broadcast(mix)
+                        announce_broadcast_to_participants()
+                    else:
+                        # Check if ghost_retries exceeds max
+                        if mix.ghost_retries > mix.max_ghost_retries:
+                            cancel_and_refund_everyone(mix) # all non-blacklisted participants are refunded (minus the REFUND_KEEP_PERCENT)
+                        else:
+                            mix.ghost_retries ++
+                            remove_ghost_from_mix()
+                            notify_participants_of_ghosting()
+                            mix moves back into "collecting"
+
+                case "broadcast":
+                    if tx not confirmed after 1 hour:
+                        re-broadcast
+                    if confirmed:
+                        mix.state = "completed"
+
+        # Daily announcements (scheduled task)
+        if time matches daily announcement time:
+            assembled_message = ""
+            for mix in active_mixes:
+                assembled_message += summarize_mix(mix)
+            post_announcement(assembled_message)
+
+        await asyncio.sleep(1)
+```
+
+
+## 3g. Conversation Flow
+
+This is a summary of some of what command_parser.py needs to handle.
+If there are other flows that are required, a best guess is appropriate as long as it is written in a way that permits updating later.
+
+### Signup to mix (needing 2+ more people)
+- Participant DMs: "list" or "open mixes" (or something similar)
+- Bot replies with summmary or open mixes, including a short identifier such as:
+- - Mix Buggy-Whip: Waiting on 2 more participants. 0.01 BTC outputs. p2wpkh addresses only.
+- - Mix Fast-Muffin: Waiting on 1 more participant. 0.005 BTC outputs. p2wpkh addresses only.
+- - Mix East-Gate: Waiting on 1 more participant. 0.025 BTC outputs. p2wpkh addresses only.
+- Participant DMs: "Join East-Gate"
+- Bot replies: "Send me txid and vout and a list of <p2wpkh> output addresses"
+- - Bot adds npub to database as interested in "East-Gate"
+- Participant send txid(s), vout(s), and 6 output addresses.
+- Bot adds information to database, calculates joining fee (100 sats per input/output)
+- Bot sends: "Zap me <number> sats to join <east-gate> mix"
+- Participant sends zap
+- Bot detects zap, updates database.
+- Bot sends: "You are all paid up. We are waiting on 1 more participant"
+
+### Signup to mix (needing only 1 more person)
+- Participant DMs: "list" or "open mixes" (or something similar)
+- Bot replies with summmary or open mixes, including a short identifier such as:
+- - Mix Buggy-Whip: Waiting on 2 more participants. 0.01 BTC outputs. p2wpkh addresses only.
+- - Mix Fast-Muffin: Waiting on 1 more participant. 0.005 BTC outputs. p2wpkh addresses only.
+- - Mix East-Gate: Waiting on 1 more participant. 0.025 BTC outputs. p2wpkh addresses only.
+- Participant DMs: "Join East-Gate"
+- Bot replies: "Send me txid and vout and a list of <p2wpkh> output addresses"
+- - Bot adds npub to database as interested in "East-Gate"
+- Participant send txid(s), vout(s), and 6 output addresses.
+- Bot adds information to database, calculates joining fee (100 sats per input/output)
+- Bot sends: "Zap me <number> sats to join <east-gate> mix"
+- Participant sends zap
+- Bot detects zap, updates database.
+- Bot sends: "You are all paid up."
+
+### Signup to mix while already being in a different mix
+- If participant is already a member to another mix and the other mix is missing txid/vout/address information, bot rejects
+- Bot replies: "You need to send txid/vout/addresses for <east-gate> before you can join another mix.""
+
+### Signup to mix while already being in a different mix
+- If participant is already a member to another mix and has not paid, but rejects
+- Bot replies: "You need to zap me <amount> sats for <east-gate> before you can join another mix.""
+
+### Signup to mix while already paid for a different mix
+- If participant is already a member of other mixes. If the count is less than <MAX_PENDING_MIXES>, we go through "Signup to mix" above
+- If the count is >= MAX_PENDING_MIXES: "You're already in <MAX_PENDING_MIXES> mixes. Let's finish one of these first."
+
+### User sends txid/vout/address already pledged to a different mix
+- Bot detects duplicate and says: You can only use these in one mix. "Please send me a different txid - vout combo" or "Please send me different addresses"
+
+### User sends txid/vout and only 1 address
+- Bot tells them that they need to send us at least 2 addresses and takes no further action.
+
+
+### When mix has filled participant slots
+- Bot sends all participants: "We are going to start the signing process. Once I send you the PSBT, you have <SIGNING_DEADLINE_HOURS> hours to add your signatures and return it to me."
+- Bot generates the PSBT
+- Bot sends the PSBT to all participants using a timestamp positive relative to the "We are going to start..." message so they will be ordered correctly.
+
+### When an npub wants out of a mix:
+- Participant: exit east-gate
+- Bot: "We're sorry to see you go. We will refund your joining fee, minus the REFUND_KEEP_PERCENT."
+- Bot refunds 95% of fees to participant.
+
+### When an npub wants out of a mix: (alt where user in 2+ mixes)
+- Participant: exit
+- Bot: You are a part of two mixes: east-gate & buggy-whip. Say exit east-gate or exit buggy-whip
+- Participant: `exit east-gate` and the bot handles it in the flow described above.
+
+### When an npub wants out of a mix: (alt where user in only 1 mix)
+- Participant: exit
+- Bot realizes the user is in only 1 mix and acts as though `exit east-gate` was sent, which is described above.
+
+### When an npub wants out of a mix: (mix-name typo)
+- Participant: exit plezt-gabe
+- Bot checks if this user is in 1 mix, if so, uses the correct name and does the exit flow.
+- If the user is in 2+ but the name doesn't match, it acts as though the user had typed only `exit` which is described above.
+
+### When an npub wants out of a mix: (not a part of any mix)
+- Participant: exit ...
+- If the user is in 0 mixes, bot replies: "Done."
+
+### when an npub sends us txid/vout/addresses
+- If they have an unpaid mix, the information is added to the unpaid mix & continues with the "Signup to mix" script above
+- If they are not in any mix, the bot finds them a mix that accepts the input/output address types that they've specified
+- Bot says: we've added you to <east-gate> and resumes the "Signup to mix" script just after the txid,vout,address phase
+- - this let's users join the closest to completed mix quickly and easily.
+- - this needs to be atomic so we don't over-subscribe to a mix.
+- If there is no open mix, the Bot creates a DEFAULT_MIX_USER_COUNT person mix and calculates the correct output size by taking the sum of the inputs and dividing by DEFAULT_MIX_OUTPUT_COUNT, rounding to the nearest 0.025
+
+
+If user sends the wrong output address type for the mix, the bot should reject by saying:
+- "For this mix we're only accepting <address_type> addresses."
+
+---
+
+## 4. Key Edge Cases
+
+### Ghosting Recovery
+
+1. Ghoster detected at 24h → blacklisted (npub + all UTXOs)
+2. A new psbt_rounds starts: remove ghoster's inputs + outputs from PSBT
+4. DM remaining participants: "Someone ghosted us during the signing phase and saw your addresses. To insure your privacy, we've thrown out your addresses. Reply with new addresses: /addresses <new_addrs>" (and members go back to "paid" state.)
+- we remove the existing addresses and the user goes back to needing to send us txid,vout,addresses
+- we need to keep track of how many outputs they've paid for and only save that number if they send us more next time.
+5. Participants wait for a new participant to join. 
+6. Bot puts the job back into the advertising list until another party joins.
+
+It is well understood that if someone ghosts the mix, the mix needs to start over from the beginning. We them move the group/mix back into a state of waiting for one more participant.
+We should be transparent to the remaining users that someone has ghosted us, that their prior signatures are invalid & destroyed by us, and we're moving the group/mix back into advertising for another person.
+
+If a person pays but never signs, they forfeit their payment, and they're added to a blacklist table.
+
+When someone ghosts and we reset the mix, remaining participants move back to 'paid' state, awaiting another participant.
+If the mix ultimately fails because time has expired, remaining participants will have their fee refunded (minus the REFUND_KEEP_PERCENT)
+
+
+
+### Double-Spend Prevention
+
+Before building the PSBT, query `utxos.is_used` across all active mixes. If the same txid:vout appears in another mix (whether collecting, signing, or pending), reject the new participant and flag.
+
+### PSBT Size Limits
+
+If a PSBT hex exceeds 50KB (relay size concern), split into numbered chunks across multiple DMs with a reassembly header:
+```
+/psbt_chunk 1/3 <hex>
+/psbt_chunk 2/3 <hex>  
+/psbt_chunk 3/3 <hex>
+```
+Participant concatenates and imports as a single PSBT.
+
+### RBF Avoidance
+
+Set fee rate to `max(estimate, MIN_FEE_RATE) * FEE_MULTIPLIER` — buffer over the minimum ensures the transaction clears on the first broadcast. If mempool spikes, the transaction is still broadcast to the mempool and will have to wait longer than desired.
+
+
+### Crash recovery
+
+When starting up, the bot should check the database for unfinished work and resume work.
+We should make work and database writes idempotent so that a failure at the wrong time will not cause catastrophic failure of a mix.
+We should not update database state without preserving the dependent state, such as txid,vout,addresses must be perserved before moving participants to committed. Zaps should be confirmed before moving to paid. If someone pays before we move them to paid and we crash, the operator will handle that manually. We will need logging to help debug these cases.
+
+
+
+---
+
+## 5. File Tree
+
+```
+~/Documents/nostrmix-bot/
+├── nostrmix-bot.env
+├── bot.db
+├── src/
+│   ├── main.py                # entry point, async loop
+│   ├── config.py              # load env, validate
+│   ├── coordinator.py         # state machines, event loop
+│   ├── nostr_handler.py       # NIP-17 DMs, NIP-57 zaps, announcements
+│   ├── lightning_handler.py   # LND, zap detection, refund sending
+│   ├── chain_monitor.py       # UTXO lookup, fee estimate, broadcast
+│   ├── psbt_manager.py        # build, validate, combine PSBTs
+│   ├── fee_engine.py          # vsize calc, fee distribution
+│   ├── command_parser.py      # rigid DM command protocol
+│   ├── database.py            # SQLite access layer (aiosqlite)
+│   ├── privacy.py             # module for inspecting PSBT for checking at least N!/2 valid output partitionings exist
+│   └── schema.sql             # CREATE TABLE statements
+├── tests/
+│   └── <add tests as necessary to cover common and error cases>
+├── requirements.txt
+└── README.md
+```
+
+Privacy.py doesn't need to be fully authoratative. It only needs a sanity check on the PSBT. A simple: "are there at least as many identical outputs as there are participants?" 3 participants, at least 3 identical outputs.
+
+---
+
+## 6. `nostrmix-bot.env` Configuration
+
+```nostrmix-bot.env
+# Bot identity
+NOSTR_PRIVATE_KEY_NPUB=7b...
+NOSTR_RELAYS=wss://relay.damus.com,wss://nos.lol
+BOT_NAME=butterbot
+BOT_ABOUT=I help bitcoiners ...
+BOT_LUD16=nostrmix-bot@pay.unsaltedbutter.ai
+BOT_PICTURE=https://unsaltedbutter.ai/nostrmix-bot.png
+BOT_NIP05=nostrmix-bot@unsaltedbutter.ai
+BOT_WEBSITE=https://unsaltedbutter.ai
+
+
+# Zap receiving
+ZAP_PROVIDER_PUBKEY_HEX=64dd.....
+
+# Zap Sending for refunds
+BTCPAY_URL=pay.unsaltedbutter.ai
+BTCPAY_STORE=abc123...
+BTCPAY_API_KEY=456def...
+
+
+# Fee defaults
+FEE_PER_ELEMENT=100
+FEE_MULTIPLIER=1.5
+MIN_FEE_RATE_SATS=1.5
+MAX_FEE_RATE_SATS=510
+REFUND_KEEP_PERCENT=5
+REFUND_KEEP_MIN_SATS=50
+
+# Mix parameters
+DEFAULT_OUTPUT_SIZE=1000000
+MIN_PARTICIPANTS_DEFAULT=3
+MAX_PARTICIPANTS_DEFAULT=20
+MAX_PENDING_MIXES=3
+SIGNING_DEADLINE_HOURS=48
+PAY_DEADLINE_HOURS=12
+MAX_GHOST_RETRIES=3
+MINIMUM_UTXO_SIZE=10000
+DEFAULT_MIX_OUTPUT_COUNT=4
+DEFAULT_MIX_USER_COUNT=3
+
+# Bitcoin API (mempool.space — free, no key needed)
+MEMPOOL_API=https://mempool.space/api
+
+# Database
+DB_PATH=./bot.db
+```
+
+All of these values are illustrative and placeholders. Make no assumption about them other than they will be strings/numbers, and should be whitespace trimmed when pulled out of the env file.
+
+The app should not accept MIN_PARTICIPANTS_DEFAULT < 2. It should upgrade the value to 2 in that case.
+
+---
+
+## 7. Implementation Order
+
+**Phase 1 — Foundation**
+- Database layer (schema + aiosqlite access class)
+- Configuration loader
+- Nostr Handler (connect, send/receive DMs, listen for zaps)
+- Chain Monitor (UTXO lookup, fee estimate, broadcast)
+
+**Phase 2 — Core Logic (can be parallel)**
+- PSBT Manager (build, validate, combine)
+- Fee Engine (vsize, distribution, change rounding)
+- Lightning Handler (refund sending)
+
+**Phase 3 — Integration**
+- Coordinator (state machines, event loop, ghosting detection)
+- Wire all components together
+- Operator will test himself with 2+ of his nostr identities and with owned UTXOs
+
+**Phase 4 — Polish**
+- Ghost ping sequence (6h/12h/24h DMs)
+- Daily announcement scheduler
+- Blacklist enforcement
+- Error recovery and edge cases
+- README + deploy instructions
+
+---
+
+## 8. Testing Strategy
+
+- **Unit tests**: each component independently with mocked Nostr relays, LND, and mempool API
+- **Integration**: manual testing with Operator's own nostr accounts and UTXOs
+- **Privacy smoke test**: before a mix we will inspect the PSBT for subset-sum analysis on the transaction; verify at least N!/2 valid output partitionings exist. 
+
+
+
+## 9. Clarifications, if necessary
+
+1. All numbers above are examples and placeholders. Forumla are what holds true. For example (FEE_PER_ELEMENT * (input count + used output count)) is the fee, regardless of what the examples show.
+
+2. Users send us 2+ output addresses and we try to use as many as possible given the amount of BTC their inputs contain and the standardized size of the outputs for this mix.
+
+3. All values in the env template are examples. You do not need them during coding.
+
+4. Both inputs and outputs need be the same single type.
