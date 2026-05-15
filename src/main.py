@@ -50,16 +50,20 @@ async def main():
         fee_multiplier=cfg.FEE_MULTIPLIER,
     )
 
-    psbt_mgr = PSBTManager()
+    psbt_mgr = PSBTManager(
+        input_vsize_map=cfg.INPUT_VSIZE_BY_TYPE,
+        output_vsize_map=cfg.OUTPUT_VSIZE_BY_TYPE,
+        overhead=cfg.TX_OVERHEAD_VSIZE,
+    )
 
     fee_engine = FeeEngine(
         fee_per_element=cfg.FEE_PER_ELEMENT,
         min_fee_rate_sats=cfg.MIN_FEE_RATE_SATS,
         max_fee_rate_sats=cfg.MAX_FEE_RATE_SATS,
-        input_vsize=cfg.INPUT_VSIZE,
-        output_vsize=cfg.OUTPUT_VSIZE,
         overhead_vsize=cfg.TX_OVERHEAD_VSIZE,
         minimum_utxo_size=cfg.MINIMUM_UTXO_SIZE,
+        input_vsize_map=cfg.INPUT_VSIZE_BY_TYPE,
+        output_vsize_map=cfg.OUTPUT_VSIZE_BY_TYPE,
     )
 
     lightning = LightningHandler(cfg)

@@ -1,12 +1,13 @@
 """PSBT Manager — build, validate, combine PSBTs for coinjoin transactions.
 
 Uses python-bitcointx for PSBT operations (BIP-174).
+Per-script-type vbyte sizes for accurate vsize estimation.
 """
 
 from __future__ import annotations
 
 from typing import List, Dict, Optional, Tuple, Any
-from hashlib import sha256
+from collections import Counter
 
 from bitcointx.core import (
     b2x, CTxIn, CTxOut, COutPoint, CTransaction,
@@ -23,16 +24,39 @@ from bitcointx.core.psbt import (
 )
 
 
+# Default per-script-type vsize tables (from script-vbytesize.md)
+_DEFAULT_INPUT_VSIZE: Dict[str, int] = {
+    "p2pkh": 150,
+    "p2sh": 255,
+    "p2sh-p2wpkh": 95,
+    "p2wpkh": 70,
+    "p2wsh": 1455,
+    "p2tr": 70,
+}
+
+_DEFAULT_OUTPUT_VSIZE: Dict[str, int] = {
+    "p2pkh": 35,
+    "p2sh": 35,
+    "p2sh-p2wpkh": 35,
+    "p2wpkh": 35,
+    "p2wsh": 4,
+    "p2tr": 45,
+}
+
+
 class PSBTManager:
     """Build, validate, and combine PSBTs for coinjoin."""
 
     MAX_PSBT_HEX_SIZE = 50000  # 50KB relay concern
 
-    def __init__(self, network: str = "mainnet"):
+    def __init__(self, network: str = "mainnet",
+                 input_vsize_map: Optional[Dict[str, int]] = None,
+                 output_vsize_map: Optional[Dict[str, int]] = None,
+                 overhead: int = 10):
         self._network = network
-        self._input_vsize = 68
-        self._output_vsize = 31
-        self._overhead = 10
+        self._input_vsize_map = input_vsize_map or _DEFAULT_INPUT_VSIZE
+        self._output_vsize_map = output_vsize_map or _DEFAULT_OUTPUT_VSIZE
+        self._overhead = overhead
 
     def _parse_address(self, address: str) -> CBitcoinAddress:
         """Parse a bitcoin address."""
@@ -50,6 +74,32 @@ class PSBTManager:
         else:
             return "p2wpkh"
 
+    # --- Vsize estimation (per-script-type) ---
+
+    def input_vsize(self, script_type: str) -> int:
+        key = script_type.lower().replace("-", "")
+        for k, v in self._input_vsize_map.items():
+            if k.replace("-", "") == key:
+                return v
+        return self._input_vsize_map.get("p2wpkh", 70)
+
+    def output_vsize(self, script_type: str) -> int:
+        key = script_type.lower().replace("-", "")
+        for k, v in self._output_vsize_map.items():
+            if k.replace("-", "") == key:
+                return v
+        return self._output_vsize_map.get("p2wpkh", 35)
+
+    def estimate_vsize(self, inputs_by_type: Dict[str, int],
+                       outputs_by_type: Dict[str, int]) -> int:
+        """Estimate transaction vsize using per-script-type counts."""
+        total = self._overhead
+        for stype, count in inputs_by_type.items():
+            total += self.input_vsize(stype) * count
+        for stype, count in outputs_by_type.items():
+            total += self.output_vsize(stype) * count
+        return total
+
     # --- Build Skeleton PSBT ---
 
     def build_skeleton(self, inputs: List[Dict], outputs: List[Dict]) -> str:
@@ -61,35 +111,25 @@ class PSBTManager:
 
         Returns: hex-encoded PSBT.
         """
-        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction, PSBT_Input, PSBT_Output
-
         psbt_inps: List[PSBT_Input] = []
         psbt_outs: List[PSBT_Output] = []
 
         for inp in inputs:
             txid_hex = inp["txid"]
             vout = inp["vout"]
-            amount = inp["amount"]
-
-            # Create prevout
-            txid_bytes = bytes.fromhex(txid_hex)[::-1]  # reverse for internal (big endian)
+            txid_bytes = bytes.fromhex(txid_hex)[::-1]
             outpoint = COutPoint(txid_bytes, vout)
             txin = CMutableTxIn(outpoint)
-
             psbt_in = PSBT_Input(txin)
-            # Set the amount for use in signing
-            # In BIP-174, the amount is stored separately
-            psbt_in.sighash_type = 0x01  # SIGHASH_ALL
+            psbt_in.sighash_type = 0x01
             psbt_inps.append(psbt_in)
 
         for out in outputs:
             address = out["address"]
             amount = out["amount"]
-
             addr = self._parse_address(address)
             pay_script = addr.to_scriptpubkey()
             txout = CMutableTxOut(amount, pay_script)
-
             psbt_out = PSBT_Output(txout)
             psbt_outs.append(psbt_out)
 

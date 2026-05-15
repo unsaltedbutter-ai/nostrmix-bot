@@ -2,7 +2,7 @@
 
 import os
 import json
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 
 
 # Defaults matching the plan's env template
@@ -51,9 +51,23 @@ _DEFAULTS = {
     # Database
     "DB_PATH": "./bot.db",
 
-    # Input/output script type & vsize constants
-    "INPUT_VSIZE": 68,
-    "OUTPUT_VSIZE": 31,
+    # Per-script-type vbyte sizes (from script-vbytesize.md)
+    # Input vBytes
+    "P2PKH_INPUT_VSIZE": 150,
+    "P2SH_INPUT_VSIZE": 255,
+    "P2SH_P2WPKH_INPUT_VSIZE": 95,
+    "P2WPKH_INPUT_VSIZE": 70,
+    "P2WSH_INPUT_VSIZE": 1455,
+    "P2TR_INPUT_VSIZE": 70,
+    # Output vBytes
+    "P2PKH_OUTPUT_VSIZE": 35,
+    "P2SH_OUTPUT_VSIZE": 35,
+    "P2SH_P2WPKH_OUTPUT_VSIZE": 35,
+    "P2WPKH_OUTPUT_VSIZE": 35,
+    "P2WSH_OUTPUT_VSIZE": 4,
+    "P2TR_OUTPUT_VSIZE": 45,
+
+    # Transaction overhead
     "TX_OVERHEAD_VSIZE": 10,
 }
 
@@ -96,20 +110,10 @@ class BotConfig:
         relay_list = [r.strip() for r in raw.split(",") if r.strip()]
         self._values["_relays"] = relay_list
 
-        # Check required keys
-        missing = []
-        if not self.NOSTR_PRIVATE_KEY_NPUB:
-            missing.append("NOSTR_PRIVATE_KEY_NPUB")
-        if not self.ZAP_PROVIDER_PUBKEY_HEX:
-            missing.append("ZAP_PROVIDER_PUBKEY_HEX")
-
-        # BTCPay is optional for initial development
-        # but we'll warn if missing
-
-    # --- Properties ---
+    # --- Property helpers ---
 
     @property
-    def NOSTR_PRIVATE_KEY_NPUB(self) -> str:  # Actually nsec, will support both
+    def NOSTR_PRIVATE_KEY_NPUB(self) -> str:
         return self._values["NOSTR_PRIVATE_KEY_NPUB"]
 
     @property
@@ -229,16 +233,59 @@ class BotConfig:
         return self._values["DB_PATH"]
 
     @property
-    def INPUT_VSIZE(self) -> int:
-        return self._values["INPUT_VSIZE"]
-
-    @property
-    def OUTPUT_VSIZE(self) -> int:
-        return self._values["OUTPUT_VSIZE"]
-
-    @property
     def TX_OVERHEAD_VSIZE(self) -> int:
         return self._values["TX_OVERHEAD_VSIZE"]
+
+    # --- Per-script-type vbyte sizes ---
+
+    @property
+    def INPUT_VSIZE_BY_TYPE(self) -> Dict[str, int]:
+        """Return dict mapping script_type string -> input vbytes."""
+        return {
+            "p2pkh": self._values["P2PKH_INPUT_VSIZE"],
+            "p2sh": self._values["P2SH_INPUT_VSIZE"],
+            "p2sh-p2wpkh": self._values["P2SH_P2WPKH_INPUT_VSIZE"],
+            "p2wpkh": self._values["P2WPKH_INPUT_VSIZE"],
+            "p2wsh": self._values["P2WSH_INPUT_VSIZE"],
+            "p2tr": self._values["P2TR_INPUT_VSIZE"],
+        }
+
+    @property
+    def OUTPUT_VSIZE_BY_TYPE(self) -> Dict[str, int]:
+        """Return dict mapping script_type string -> output vbytes."""
+        return {
+            "p2pkh": self._values["P2PKH_OUTPUT_VSIZE"],
+            "p2sh": self._values["P2SH_OUTPUT_VSIZE"],
+            "p2sh-p2wpkh": self._values["P2SH_P2WPKH_OUTPUT_VSIZE"],
+            "p2wpkh": self._values["P2WPKH_OUTPUT_VSIZE"],
+            "p2wsh": self._values["P2WSH_OUTPUT_VSIZE"],
+            "p2tr": self._values["P2TR_OUTPUT_VSIZE"],
+        }
+
+    def input_vsize_for(self, script_type: str) -> int:
+        """Look up input vbytes for a given script type. Falls back to p2wpkh."""
+        mapping = self.INPUT_VSIZE_BY_TYPE
+        key = script_type.lower().replace("-", "_")
+        # Try direct match first, then normalized
+        if script_type.lower() in mapping:
+            return mapping[script_type.lower()]
+        # Normalize: strip hyphens, lowercase
+        norm = script_type.lower().replace("-", "")
+        for k, v in mapping.items():
+            if k.replace("-", "") == norm:
+                return v
+        return mapping["p2wpkh"]
+
+    def output_vsize_for(self, script_type: str) -> int:
+        """Look up output vbytes for a given script type. Falls back to p2wpkh."""
+        mapping = self.OUTPUT_VSIZE_BY_TYPE
+        if script_type.lower() in mapping:
+            return mapping[script_type.lower()]
+        norm = script_type.lower().replace("-", "")
+        for k, v in mapping.items():
+            if k.replace("-", "") == norm:
+                return v
+        return mapping["p2wpkh"]
 
     @property
     def profile(self) -> dict:

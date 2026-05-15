@@ -614,18 +614,38 @@ class Coordinator:
                         "amount": o["amount"],
                     })
 
+            # Count inputs by script type for this participant
+            ibt: Dict[str, int] = {}
+            for u in utxos:
+                st = u.get("script_type", "p2wpkh")
+                ibt[st] = ibt.get(st, 0) + 1
+
+            # Count outputs by script type (inferred from addresses)
+            obt: Dict[str, int] = {}
+            for o in outputs:
+                if o["amount"] > 0:
+                    addr_type = self.psbt_mgr._address_type(o["address"])
+                    obt[addr_type] = obt.get(addr_type, 0) + 1
+
             participant_details.append({
                 "pid": pid,
                 "num_inputs": len(utxos),
                 "total_sats": sum(u["amount"] for u in utxos),
-                "num_addresses": len(outputs),
+                "num_addresses": len([o for o in outputs if o["amount"] > 0]),
+                "inputs_by_type": ibt,
+                "outputs_by_type": obt if obt else {"p2wpkh": len([o for o in outputs if o["amount"] > 0])},
             })
 
-        # Calculate total vsize and fee
-        total_inputs = len(all_inputs)
-        total_outputs = len(all_outputs)
+        # Aggregate all input/output types for total vsize
+        agg_inputs: Dict[str, int] = {}
+        agg_outputs: Dict[str, int] = {}
+        for pd in participant_details:
+            for k, v in pd.get("inputs_by_type", {"p2wpkh": pd["num_inputs"]}).items():
+                agg_inputs[k] = agg_inputs.get(k, 0) + v
+            for k, v in pd.get("outputs_by_type", {"p2wpkh": pd["num_addresses"]}).items():
+                agg_outputs[k] = agg_outputs.get(k, 0) + v
 
-        total_vsize = self.psbt_mgr.estimate_vsize(total_inputs, total_outputs)
+        total_vsize = self.psbt_mgr.estimate_vsize(agg_inputs, agg_outputs)
         total_miner_fee = int(total_vsize * fee_rate)
 
         if total_miner_fee <= 0:

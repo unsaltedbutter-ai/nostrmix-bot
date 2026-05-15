@@ -69,3 +69,50 @@ class TestBotConfig:
         assert "wss://relay2.com" in cfg.NOSTR_RELAYS
         assert "wss://relay3.com" in cfg.NOSTR_RELAYS
         os.unlink(env_path)
+
+    def test_per_script_type_vsize_defaults(self):
+        """Test per-script-type vsize maps have correct defaults."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("ZAP_PROVIDER_PUBKEY_HEX=def...\n")
+            env_path = f.name
+
+        cfg = BotConfig(env_path)
+        ivm = cfg.INPUT_VSIZE_BY_TYPE
+        ovm = cfg.OUTPUT_VSIZE_BY_TYPE
+
+        # From script-vbytesize.md table
+        assert ivm["p2wpkh"] == 70
+        assert ivm["p2tr"] == 70
+        assert ivm["p2pkh"] == 150
+        assert ivm["p2sh"] == 255
+        assert ivm["p2sh-p2wpkh"] == 95
+        assert ivm["p2wsh"] == 1455
+
+        assert ovm["p2wpkh"] == 35
+        assert ovm["p2tr"] == 45
+        assert ovm["p2wsh"] == 4
+        assert ovm["p2pkh"] == 35
+
+        # Lookup methods
+        assert cfg.input_vsize_for("p2wpkh") == 70
+        assert cfg.input_vsize_for("p2tr") == 70
+        assert cfg.output_vsize_for("p2tr") == 45
+
+        os.unlink(env_path)
+
+    def test_per_script_type_vsize_override(self):
+        """Test that per-script-type values can be overridden in env."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("ZAP_PROVIDER_PUBKEY_HEX=def...\n")
+            f.write("P2WPKH_INPUT_VSIZE=80\n")
+            f.write("P2TR_OUTPUT_VSIZE=50\n")
+            env_path = f.name
+
+        cfg = BotConfig(env_path)
+        assert cfg.input_vsize_for("p2wpkh") == 80
+        assert cfg.output_vsize_for("p2tr") == 50
+        # Other types unchanged
+        assert cfg.input_vsize_for("p2pkh") == 150
+        os.unlink(env_path)
