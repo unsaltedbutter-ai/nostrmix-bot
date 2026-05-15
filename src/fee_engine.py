@@ -8,6 +8,8 @@ from __future__ import annotations
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 
+from .vsize import VsizeCalculator
+
 
 class FeeResult:
     """Result of fee calculation for one participant."""
@@ -25,24 +27,7 @@ class FeeResult:
         self.service_fee_sats = service_fee_sats
 
 
-# Default per-script-type vsize constants (p2wpkh)
-_DEFAULT_INPUT_VSIZE_MAP: Dict[str, int] = {
-    "p2pkh": 150,
-    "p2sh": 255,
-    "p2sh-p2wpkh": 95,
-    "p2wpkh": 70,
-    "p2wsh": 1455,
-    "p2tr": 70,
-}
-
-_DEFAULT_OUTPUT_VSIZE_MAP: Dict[str, int] = {
-    "p2pkh": 35,
-    "p2sh": 35,
-    "p2sh-p2wpkh": 35,
-    "p2wpkh": 35,
-    "p2wsh": 4,
-    "p2tr": 45,
-}
+# Vsize defaults and calculation are in vsize.py (shared by PSBTManager and FeeEngine)
 
 
 class FeeEngine:
@@ -65,28 +50,18 @@ class FeeEngine:
         self.fee_per_element = fee_per_element
         self._min_fee_rate_sats = min_fee_rate_sats
         self._max_fee_rate_sats = max_fee_rate_sats
-        self._overhead_vsize = overhead_vsize
         self._minimum_utxo_size = minimum_utxo_size
-        self._input_vsize_map = input_vsize_map or _DEFAULT_INPUT_VSIZE_MAP
-        self._output_vsize_map = output_vsize_map or _DEFAULT_OUTPUT_VSIZE_MAP
+        self._vsize = VsizeCalculator(input_vsize_map, output_vsize_map, overhead_vsize)
 
-    # --- Vsize helpers ---
+    # --- Vsize helpers — delegates to VsizeCalculator ---
 
     def input_vsize(self, script_type: str) -> int:
         """Look up input vbytes for a script type. Falls back to p2wpkh."""
-        key = script_type.lower().replace("-", "")
-        for k, v in self._input_vsize_map.items():
-            if k.replace("-", "") == key:
-                return v
-        return self._input_vsize_map.get("p2wpkh", 70)
+        return self._vsize.input_vsize(script_type)
 
     def output_vsize(self, script_type: str) -> int:
         """Look up output vbytes for a script type. Falls back to p2wpkh."""
-        key = script_type.lower().replace("-", "")
-        for k, v in self._output_vsize_map.items():
-            if k.replace("-", "") == key:
-                return v
-        return self._output_vsize_map.get("p2wpkh", 35)
+        return self._vsize.output_vsize(script_type)
 
     def vsize_of_input(self, script_type: str) -> int:
         """Alias for input_vsize."""
@@ -97,29 +72,17 @@ class FeeEngine:
         return self.output_vsize(script_type)
 
     def total_inputs_vsize(self, inputs_by_type: Dict[str, int]) -> int:
-        """Compute total input vsize from a count-per-type dict.
-
-        Args:
-            inputs_by_type: dict mapping script_type -> count (e.g. {"p2wpkh": 3, "p2tr": 1})
-        """
-        total = 0
-        for stype, count in inputs_by_type.items():
-            total += self.input_vsize(stype) * count
-        return total
+        """Compute total input vsize from a count-per-type dict."""
+        return self._vsize.total_inputs_vsize(inputs_by_type)
 
     def total_outputs_vsize(self, outputs_by_type: Dict[str, int]) -> int:
         """Compute total output vsize from a count-per-type dict."""
-        total = 0
-        for stype, count in outputs_by_type.items():
-            total += self.output_vsize(stype) * count
-        return total
+        return self._vsize.total_outputs_vsize(outputs_by_type)
 
     def estimate_total_vsize(self, inputs_by_type: Dict[str, int],
                               outputs_by_type: Dict[str, int]) -> int:
         """Estimate vsize for the entire transaction, per-script-type."""
-        return (self._overhead_vsize
-                + self.total_inputs_vsize(inputs_by_type)
-                + self.total_outputs_vsize(outputs_by_type))
+        return self._vsize.estimate_total_vsize(inputs_by_type, outputs_by_type)
 
     def compute_total_miner_fee(self, total_vsize: int, fee_rate: float) -> int:
         """Calculate the total miner fee in sats."""
@@ -132,9 +95,10 @@ class FeeEngine:
                                     total_input_vsize: int, total_output_vsize: int,
                                     total_vsize: int) -> float:
         """Compute a participant's proportional weight of the tx vsize."""
-        my_vsize = self.total_inputs_vsize(inputs_by_type) + self.total_outputs_vsize(outputs_by_type)
-        overhead_share = self._overhead_vsize / max(total_inputs_per_participant(inputs_by_type), 1)
-        return my_vsize + overhead_share
+        return self._vsize.compute_participant_weight(
+            inputs_by_type, outputs_by_type,
+            total_input_vsize, total_output_vsize, total_vsize,
+        )
 
     def compute_fee_share(self, my_weight: float, total_weight: float,
                           total_miner_fee: int) -> int:
@@ -265,7 +229,4 @@ class FeeEngine:
         return r
 
 
-# --- Module-level helper ---
 
-def total_inputs_per_participant(inputs_by_type: Dict[str, int]) -> int:
-    return sum(inputs_by_type.values())

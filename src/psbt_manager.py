@@ -16,32 +16,17 @@ from bitcointx.core import (
 from bitcointx.core.script import CScript
 from bitcointx.wallet import (
     CBitcoinAddress, P2PKHBitcoinAddress, P2SHBitcoinAddress,
-    P2WPKHBitcoinAddress, P2WPKHBitcoinAddress,
+    P2WPKHBitcoinAddress,
 )
+
+from .vsize import VsizeCalculator
 from bitcointx.core.psbt import (
     PartiallySignedBitcoinTransaction,
     PSBT_Input, PSBT_Output,
 )
 
 
-# Default per-script-type vsize tables (from script-vbytesize.md)
-_DEFAULT_INPUT_VSIZE: Dict[str, int] = {
-    "p2pkh": 150,
-    "p2sh": 255,
-    "p2sh-p2wpkh": 95,
-    "p2wpkh": 70,
-    "p2wsh": 1455,
-    "p2tr": 70,
-}
-
-_DEFAULT_OUTPUT_VSIZE: Dict[str, int] = {
-    "p2pkh": 35,
-    "p2sh": 35,
-    "p2sh-p2wpkh": 35,
-    "p2wpkh": 35,
-    "p2wsh": 4,
-    "p2tr": 45,
-}
+# Vsize defaults and calculation are in vsize.py (shared by PSBTManager and FeeEngine)
 
 
 class PSBTManager:
@@ -54,9 +39,7 @@ class PSBTManager:
                  output_vsize_map: Optional[Dict[str, int]] = None,
                  overhead: int = 10):
         self._network = network
-        self._input_vsize_map = input_vsize_map or _DEFAULT_INPUT_VSIZE
-        self._output_vsize_map = output_vsize_map or _DEFAULT_OUTPUT_VSIZE
-        self._overhead = overhead
+        self._vsize = VsizeCalculator(input_vsize_map, output_vsize_map, overhead)
 
     def _parse_address(self, address: str) -> CBitcoinAddress:
         """Parse a bitcoin address."""
@@ -74,31 +57,20 @@ class PSBTManager:
         else:
             return "p2wpkh"
 
-    # --- Vsize estimation (per-script-type) ---
+    # --- Vsize estimation (per-script-type) — delegates to VsizeCalculator ---
 
     def input_vsize(self, script_type: str) -> int:
-        key = script_type.lower().replace("-", "")
-        for k, v in self._input_vsize_map.items():
-            if k.replace("-", "") == key:
-                return v
-        return self._input_vsize_map.get("p2wpkh", 70)
+        """Look up input vbytes for a script type. Falls back to p2wpkh."""
+        return self._vsize.input_vsize(script_type)
 
     def output_vsize(self, script_type: str) -> int:
-        key = script_type.lower().replace("-", "")
-        for k, v in self._output_vsize_map.items():
-            if k.replace("-", "") == key:
-                return v
-        return self._output_vsize_map.get("p2wpkh", 35)
+        """Look up output vbytes for a script type. Falls back to p2wpkh."""
+        return self._vsize.output_vsize(script_type)
 
     def estimate_vsize(self, inputs_by_type: Dict[str, int],
                        outputs_by_type: Dict[str, int]) -> int:
         """Estimate transaction vsize using per-script-type counts."""
-        total = self._overhead
-        for stype, count in inputs_by_type.items():
-            total += self.input_vsize(stype) * count
-        for stype, count in outputs_by_type.items():
-            total += self.output_vsize(stype) * count
-        return total
+        return self._vsize.estimate_total_vsize(inputs_by_type, outputs_by_type)
 
     # --- Build Skeleton PSBT ---
 
@@ -246,11 +218,5 @@ class PSBTManager:
         return [psbt_hex[i:i + chunk_size] for i in range(0, len(psbt_hex), chunk_size)]
 
     # --- Vsize Estimation ---
-
-    def estimate_vsize(self, num_inputs: int, num_outputs: int,
-                       input_vsize: int = None, output_vsize: int = None,
-                       overhead: int = None) -> int:
-        iv = input_vsize or self._input_vsize
-        ov = output_vsize or self._output_vsize
-        oh = overhead or self._overhead
-        return oh + (num_inputs * iv) + (num_outputs * ov)
+    # Delegates to VsizeCalculator via the methods above.
+    # No legacy scalar implementation needed — all callers use per-type dicts.
