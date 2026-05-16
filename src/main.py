@@ -45,6 +45,7 @@ async def main():
     # 3. Initialize components
     chain = ChainMonitor(
         api_base=cfg.MEMPOOL_API,
+        api_backup=cfg.MEMPOOL_API_BACKUP or None,
         min_fee_rate=cfg.MIN_FEE_RATE_SATS,
         max_fee_rate=cfg.MAX_FEE_RATE_SATS,
         fee_multiplier=cfg.FEE_MULTIPLIER,

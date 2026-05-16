@@ -13,6 +13,7 @@ Uses real Database / FeeEngine / PSBTManager, with fake Nostr/Chain/Lightning
 handlers that record interactions rather than touching the network.
 """
 
+import json
 import os
 import sys
 import time
@@ -842,3 +843,350 @@ class TestAssemblePsbt:
             assert {r["round_num"] for r in rounds} == {1, 2}
         finally:
             await db.close()
+
+
+# --- #17 announcement clock alignment ---
+
+
+class TestAnnouncementScheduling:
+    @pytest.mark.asyncio
+    async def test_seconds_until_next_announcement_is_in_range(self):
+        coord, db, _, _, _ = await make_coord()
+        try:
+            secs = coord._seconds_until_next_announcement()
+            assert 0 < secs <= 86_400
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_seconds_honors_configured_hour(self):
+        import datetime as dt
+        coord, db, _, _, _ = await make_coord()
+        try:
+            now = dt.datetime.now(dt.timezone.utc)
+            # Schedule for the next 30 minutes — set ANNOUNCEMENT_HOUR_UTC to
+            # "now" if minutes > 30 we roll to next hour, otherwise this hour.
+            # Either way the wait should be well under an hour.
+            coord.cfg._values["ANNOUNCEMENT_HOUR_UTC"] = (now.hour + 1) % 24
+            secs = coord._seconds_until_next_announcement()
+            # At most ~1 hour ahead.
+            assert secs < 3700  # 1h + small slack
+        finally:
+            await db.close()
+
+
+# --- #9 per-participant pay deadline ---
+
+
+class TestPerParticipantPayTimeout:
+    @pytest.mark.asyncio
+    async def test_committed_past_deadline_is_cancelled(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await db.update_mix(mix_id, state="collecting",
+                                deadline_unix=int(time.time()) + 999_999)
+
+            npub = "npub_unpaid"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            # Backdate updated_at_unix past the pay deadline.
+            past = int(time.time()) - (coord.cfg.PAY_DEADLINE_HOURS * 3600 + 60)
+            await db._conn.execute(
+                "UPDATE participants SET updated_at_unix=? WHERE id=?",
+                (past, pid),
+            )
+            await db._conn.commit()
+
+            await coord._tick()
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "cancelled"
+            assert await db.get_utxos_by_participant(pid) == []
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_committed_within_deadline_survives_tick(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await db.update_mix(mix_id, state="collecting",
+                                deadline_unix=int(time.time()) + 999_999)
+            npub = "npub_recent"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+            # updated_at_unix is current (just got set above), well within deadline.
+
+            await coord._tick()
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "committed"
+        finally:
+            await db.close()
+
+
+# --- #6 one-at-a-time mix per npub ---
+
+
+class TestOneAtATimeMix:
+    @pytest.mark.asyncio
+    async def test_join_blocked_when_already_committed_elsewhere(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_busy"
+            pid = await db.add_participant(mix_a, npub, "")
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_join_mix(FakeCtx(npub), mix_b)
+
+            # No new participant row created.
+            allp = await db.get_participants_by_npub(npub)
+            assert len(allp) == 1
+
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "before joining another" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_join_blocked_when_interested_elsewhere(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_interested"
+            await db.add_participant(mix_a, npub, "")  # default state 'interested'
+
+            await coord._cmd_join_mix(FakeCtx(npub), mix_b)
+
+            allp = await db.get_participants_by_npub(npub)
+            assert len(allp) == 1
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "send /commit and /addresses" in joined.lower() or "before joining another" in joined
+        finally:
+            await db.close()
+
+
+# --- #7 per-mix input/output type lock ---
+
+
+class TestPerMixTypeLock:
+    @pytest.mark.asyncio
+    async def test_first_commit_locks_mix_input_type(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_first_commit"
+            await db.add_participant(mix_id, npub, "")
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000, script_type="p2wpkh")
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            mix = await db.get_mix(mix_id)
+            assert mix["input_type"] == "p2wpkh"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_second_participant_with_mismatched_type_rejected(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Widen the operator allowlist so the rejection comes from the
+            # per-mix lock, not the global allowlist.
+            coord.cfg._values["_accepted_input_types"] = {"p2wpkh", "p2tr"}
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await db.update_mix(mix_id, input_type="p2wpkh")
+
+            npub = "npub_mismatch"
+            await db.add_participant(mix_id, npub, "")
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000, script_type="p2tr")
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            pid = (await db.get_participants_by_npub(npub))[0]["id"]
+            assert await db.get_utxos_by_participant(pid) == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "locked to p2wpkh" in joined
+        finally:
+            await db.close()
+
+
+# --- #8 auto-mix-on-commit ---
+
+
+class TestAutoMixOnCommit:
+    @pytest.mark.asyncio
+    async def test_creates_new_mix_when_no_open_one_exists(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "npub_solo_commit"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000)
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+            new_mix = await db.get_mix(ps[0]["mix_id"])
+            assert new_mix is not None
+            assert new_mix["state"] == "collecting"
+            assert new_mix["input_type"] == "p2wpkh"
+            # Participant moved to 'committed' since the UTXO was registered.
+            assert ps[0]["state"] == "committed"
+            utxos = await db.get_utxos_by_participant(ps[0]["id"])
+            assert len(utxos) == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_joins_existing_open_mix_if_compatible(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            existing = await db.create_mix(output_size=1_000_000, min_participants=3,
+                                           max_participants=10)
+            await db.update_mix(existing, state="collecting", input_type="p2wpkh")
+
+            npub = "npub_auto_joiner"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000)
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+            assert ps[0]["mix_id"] == existing
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_skips_locked_incompatible_mix_creates_new(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Widen the allowlist so p2tr passes the gate.
+            coord.cfg._values["_accepted_input_types"] = {"p2wpkh", "p2tr"}
+            # Existing mix is locked to p2wpkh.
+            existing = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await db.update_mix(existing, state="collecting", input_type="p2wpkh")
+
+            npub = "npub_tr_seeker"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000, script_type="p2tr")
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+            # Should NOT have joined the p2wpkh mix.
+            assert ps[0]["mix_id"] != existing
+            # New mix locked to p2tr.
+            new_mix = await db.get_mix(ps[0]["mix_id"])
+            assert new_mix["input_type"] == "p2tr"
+        finally:
+            await db.close()
+
+
+# --- #11 /psbt_accept disambiguation across multiple signing mixes ---
+
+
+class TestPsbtAcceptDisambiguation:
+    """When a user is signing in two mixes simultaneously, /psbt_accept must
+    pick the right one. The participant's stored input_indices + the skeleton
+    structure tell validate_returned which mix this PSBT corresponds to."""
+
+    @pytest.mark.asyncio
+    async def test_picks_correct_mix_among_two_signing(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Two mixes, both with same npub (legal: one paid each).
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=2)
+            await db.update_mix(mix_a, state="assembling", fee_rate=30)
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=2)
+            await db.update_mix(mix_b, state="assembling", fee_rate=30)
+
+            # In each mix, the npub is paired with one other participant so
+            # _assemble_psbt has min_participants=2 to work with.
+            our_npub = "npub_two_mix"
+            other_npub_a = "npub_other_a"
+            other_npub_b = "npub_other_b"
+
+            async def _seed(mix_id, our_pid_holder, other_npub, our_txid, our_outs, other_txid, other_outs):
+                pid_a = await db.add_participant(mix_id, our_npub, "")
+                pid_b = await db.add_participant(mix_id, other_npub, "")
+                await db.update_participant(pid_a, state="paid", fee_paid=500)
+                await db.update_participant(pid_b, state="paid", fee_paid=500)
+                await db.add_utxo(pid_a, our_txid, 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                await db.add_utxo(pid_b, other_txid, 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                for addr in our_outs:
+                    await db.add_output(pid_a, addr, 1_000_000)
+                for addr in other_outs:
+                    await db.add_output(pid_b, addr, 1_000_000)
+                our_pid_holder[0] = pid_a
+
+            our_pid_a = [None]
+            our_pid_b = [None]
+            await _seed(mix_a, our_pid_a, other_npub_a,
+                        TXID[0], P2WPKH_ADDRS[0:3], TXID[1], P2WPKH_ADDRS[3:6])
+            await _seed(mix_b, our_pid_b, other_npub_b,
+                        TXID[2], P2WPKH_ADDRS[1:4], TXID[3], P2WPKH_ADDRS[4:7])
+
+            # Assemble each — moves participants to 'signing' with stored
+            # skeletons and input_indices.
+            for mid in (mix_a, mix_b):
+                mix_row = await db.get_mix(mid)
+                active = await db.get_participants_by_mix(mid)
+                await coord._assemble_psbt(mix_row, active)
+
+            # Pull the mix-A skeleton — that's what our_npub is "returning."
+            round_a = await db.get_psbt_round(mix_a, our_pid_a[0], 1)
+            assert round_a and round_a["psbt_sent"]
+
+            # We don't actually have private keys to produce a valid signed
+            # PSBT, and bitcointx's serializer rejects fake partial_sigs.
+            # The dispatch logic (#11) is independent of signature crypto —
+            # we mock validate_returned so it returns True only when the
+            # caller passes mix_a's skeleton. The coordinator should then
+            # land on mix_a and ignore mix_b.
+            original = coord.psbt_mgr.validate_returned
+
+            def fake_validate(skeleton_hex, returned_hex, **kwargs):
+                if skeleton_hex == returned_hex and skeleton_hex == round_a["psbt_sent"]:
+                    return (True, "valid")
+                return (False, "no match")
+
+            coord.psbt_mgr.validate_returned = fake_validate
+
+            # Confirm both participants are in 'signing' state from the assembly.
+            our_a = await db.get_participant(our_pid_a[0])
+            our_b = await db.get_participant(our_pid_b[0])
+            assert our_a["state"] == "signing"
+            assert our_b["state"] == "signing"
+
+            try:
+                await coord._cmd_accept_psbt(
+                    FakeCtx(our_npub), our_npub, round_a["psbt_sent"],
+                )
+            finally:
+                coord.psbt_mgr.validate_returned = original
+
+            our_a_after = await db.get_participant(our_pid_a[0])
+            our_b_after = await db.get_participant(our_pid_b[0])
+            assert our_a_after["state"] == "signed", "mix_a should have matched"
+            assert our_b_after["state"] == "signing", "mix_b should be untouched"
+        finally:
+            await db.close()
+
+
+# --- #12 strict per-input signature validation (unit-tested in test_psbt_manager.py) ---

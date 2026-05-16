@@ -16,6 +16,9 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import httpx
+import respx
+
 from src.chain_monitor import ChainMonitor, _normalize_script_type
 from src.vsize import VsizeCalculator
 
@@ -340,3 +343,130 @@ class TestVsizeAccuracy:
         assert actual <= estimate <= int(actual * self.UPPER_BOUND_FACTOR), (
             f"p2tr {found_tx['txid']}: estimate {estimate} vs actual {actual}"
         )
+
+
+# Use a deliberately unreachable hostname so the live tests are guaranteed
+# offline. respx will intercept before httpx makes a real request.
+_OFFLINE_API = "https://test-mempool-offline.invalid/api"
+_OFFLINE_BACKUP = "https://test-mempool-backup-offline.invalid/api"
+
+
+def _offline_monitor() -> ChainMonitor:
+    return ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+
+
+class TestBroadcastErrorPaths:
+    """Mocked broadcast paths — covers the audit's #16 coverage gap.
+
+    The bot's _combine_and_broadcast gates on broadcast_tx returning a non-None
+    txid. If we ever flip its semantics by accident, real failures would look
+    like successes and the mix would advance to 'broadcast' state with a junk
+    txid. These tests pin down all the failure modes.
+    """
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_400_non_final_returns_none(self):
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            return_value=httpx.Response(400, text="non-final")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            return_value=httpx.Response(400, text="non-final")
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("aabbccdd")
+        finally:
+            await cm.close()
+        assert result is None
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_409_mempool_conflict_returns_none(self):
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            return_value=httpx.Response(409, text="txn-mempool-conflict")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            return_value=httpx.Response(409, text="txn-mempool-conflict")
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("aabbccdd")
+        finally:
+            await cm.close()
+        assert result is None
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_500_on_primary_falls_through_to_backup(self):
+        """Primary 5xx → try backup. If backup succeeds, we return its txid."""
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            return_value=httpx.Response(500, text="upstream error")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            return_value=httpx.Response(200, text="abc123txid")
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("aabbccdd")
+        finally:
+            await cm.close()
+        assert result == "abc123txid"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_timeout_falls_through_to_backup(self):
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            side_effect=httpx.ReadTimeout("timed out")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            return_value=httpx.Response(200, text="backup_txid_ok")
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("aabbccdd")
+        finally:
+            await cm.close()
+        assert result == "backup_txid_ok"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_both_endpoints_unreachable_returns_none(self):
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("aabbccdd")
+        finally:
+            await cm.close()
+        assert result is None
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_lookup_txout_falls_back_to_secondary(self):
+        respx.get(f"{_OFFLINE_API}/tx/abc").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        respx.get(f"{_OFFLINE_BACKUP}/tx/abc").mock(
+            return_value=httpx.Response(200, json={
+                "vout": [{
+                    "value": 500_000,
+                    "scriptpubkey": "0014" + "00" * 20,
+                    "scriptpubkey_type": "v0_p2wpkh",
+                    "scriptpubkey_address": "bc1q...",
+                }],
+                "status": {"confirmed": True},
+            })
+        )
+        cm = _offline_monitor()
+        try:
+            result = await cm.lookup_txout("abc", 0)
+        finally:
+            await cm.close()
+        assert result is not None
+        assert result["value"] == 500_000
+        assert result["scriptpubkey_type"] == "p2wpkh"

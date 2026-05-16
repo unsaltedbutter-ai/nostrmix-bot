@@ -28,16 +28,19 @@ class PrivacyCheck:
             # goes through from_binary.
             psbt_obj = PartiallySignedBitcoinTransaction.from_binary(psbt_bytes)
 
-            outputs = psbt_obj.outputs
-            if len(outputs) < num_participants:
+            # bitcointx's PSBT_Output objects carry derivation paths and the
+            # like — NOT amounts. The actual output values live on the
+            # unsigned transaction's vout list.
+            vouts = psbt_obj.unsigned_tx.vout if psbt_obj.unsigned_tx else []
+            if len(vouts) < num_participants:
                 return False, (
-                    f"Too few outputs: {len(outputs)} for {num_participants} participants. "
+                    f"Too few outputs: {len(vouts)} for {num_participants} participants. "
                     f"Need at least {num_participants}."
                 )
 
-            # Group outputs by amount
+            # Group outputs by amount (nValue on CTxOut).
             from collections import Counter
-            amount_counts = Counter(out.amount for out in outputs)
+            amount_counts = Counter(o.nValue for o in vouts)
             largest_group = max(amount_counts.values()) if amount_counts else 0
 
             if largest_group < num_participants:

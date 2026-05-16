@@ -82,12 +82,10 @@ class LightningHandler:
         # Fallback: use LNURL payer
         if self._lnurl_payer and amount_sats > 0:
             try:
-                # Use default fee policy with refund minimum check
-                fee_policy = FeePolicy(
-                    operator_contribution_sats=0,
-                    marker_percent=5,
-                    retries=3,
-                )
+                # FeePolicy: refunds aren't operator-contributed (the participant
+                # already paid us a service fee that absorbs Lightning routing).
+                # Use the SDK default fee_budgets_sats — graduated 1..10 sats.
+                fee_policy = FeePolicy(operator_contribution_sats=0)
                 result = await self._lnurl_payer.pay(
                     lud16=lud16,
                     amount_sats=amount_sats,

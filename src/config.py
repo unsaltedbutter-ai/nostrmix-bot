@@ -46,6 +46,9 @@ _DEFAULTS = {
     "DEFAULT_MIX_USER_COUNT": 3,
 
     "BROADCAST_CHECK_INTERVAL_HOURS": 24,
+    # Hour-of-day (UTC) at which the daily announcement post fires. 14 UTC =
+    # morning Americas / evening Europe / late-night Asia. Range 0–23.
+    "ANNOUNCEMENT_HOUR_UTC": 14,
 
     # Operator allowlist for script types. Comma-separated. Drives both /commit
     # (input UTXO acceptance) and /addresses (output address acceptance). Keeping
@@ -56,6 +59,9 @@ _DEFAULTS = {
 
     # Bitcoin API
     "MEMPOOL_API": "https://mempool.space/api",
+    # Backup Esplora-compatible mirror; tried if primary 5xx's or times out.
+    # Set blank to disable.
+    "MEMPOOL_API_BACKUP": "https://blockstream.info/api",
 
     # Database
     "DB_PATH": "./bot.db",
@@ -249,6 +255,10 @@ class BotConfig:
         return self._values["BROADCAST_CHECK_INTERVAL_HOURS"]
 
     @property
+    def ANNOUNCEMENT_HOUR_UTC(self) -> int:
+        return self._values["ANNOUNCEMENT_HOUR_UTC"]
+
+    @property
     def ACCEPTED_INPUT_TYPES(self) -> set:
         return self._values["_accepted_input_types"]
 
@@ -259,6 +269,10 @@ class BotConfig:
     @property
     def MEMPOOL_API(self) -> str:
         return self._values["MEMPOOL_API"]
+
+    @property
+    def MEMPOOL_API_BACKUP(self) -> str:
+        return self._values["MEMPOOL_API_BACKUP"]
 
     @property
     def DB_PATH(self) -> str:

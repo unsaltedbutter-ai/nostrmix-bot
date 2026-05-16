@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import json
 import time
 import logging
 from typing import Optional, Dict, List, Any, Callable, Tuple
@@ -153,7 +155,24 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, "You have been blacklisted from this bot.")
             return
 
-        # Check MAX_PENDING_MIXES
+        # One-at-a-time pre-paid mix per npub. The plan permits being in
+        # multiple PAID mixes simultaneously, but the pre-payment phase
+        # (interested/committed) must be finished before starting another —
+        # otherwise /commit and /addresses pick the wrong mix.
+        participants_for_npub = await self.db.get_participants_by_npub(npub_hex)
+        unfinished = [p for p in participants_for_npub if p["state"] in ("interested", "committed")]
+        if unfinished:
+            blocking = unfinished[0]
+            if blocking["state"] == "interested":
+                msg = (f"Finish sending /commit and /addresses for "
+                       f"{blocking['mix_id']} before joining another mix.")
+            else:  # committed
+                msg = (f"Zap the service fee for {blocking['mix_id']} "
+                       f"before joining another mix.")
+            await self.nostr.send_dm(npub_hex, msg)
+            return
+
+        # Check MAX_PENDING_MIXES (counts paid+ mixes the user is in)
         active_count = await self.db.count_active_participant_mixes(npub_hex)
         if active_count >= self.cfg.MAX_PENDING_MIXES:
             await self.nostr.send_dm(npub_hex, self.parser.format_max_mixes(self.cfg.MAX_PENDING_MIXES))
@@ -186,6 +205,35 @@ class Coordinator:
             f"/addresses <addr1> <addr2> ..."
         )
 
+    async def _find_or_create_mix_for(self, input_type: str) -> Optional[str]:
+        """Find an open mix matching input_type (or unlocked) with capacity,
+        creating one with DEFAULT_* settings if none exists. Used by the
+        auto-mix-on-commit flow (plan section 3g)."""
+        open_mixes = await self.db.get_mixes_by_state("announced", "collecting")
+        for m in open_mixes:
+            locked = m.get("input_type")
+            if locked and locked != input_type:
+                continue
+            cap = m.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
+            cnt = await self.db.count_participants_by_mix(
+                m["id"], exclude_states=["cancelled", "ghosted"],
+            )
+            if cnt >= cap:
+                continue
+            return m["id"]
+        # None compatible — spin up a fresh DEFAULT_MIX_USER_COUNT mix.
+        deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        mid = await self.db.create_mix(
+            output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
+            min_participants=self.cfg.DEFAULT_MIX_USER_COUNT,
+            max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
+            fee_per_element=self.cfg.FEE_PER_ELEMENT,
+            deadline_unix=deadline,
+        )
+        await self.db.update_mix(mid, state="collecting", input_type=input_type)
+        logger.info(f"Auto-created mix {mid} for input_type={input_type}")
+        return mid
+
     async def _cmd_commit_utxos(self, ctx: SenderContext, npub_hex: str, utxos: List[Dict]):
         """Handle /commit <txid:vout> ... — register UTXOs."""
         if not utxos:
@@ -198,11 +246,54 @@ class Coordinator:
         active = [p for p in participants if p["state"] in ("interested", "committed")]
 
         if not active:
-            await self.nostr.send_dm(npub_hex, "You haven't joined any open mixes. Try /list or /join <mix_name>")
-            return
+            # Auto-mix-on-commit (plan section 3g): peek at the first UTXO to
+            # learn the user's input type, then find or create a compatible
+            # open mix and add the user as 'interested'.
+            first = utxos[0]
+            peek = await self.chain.lookup_txout(first["txid"], first["vout"])
+            if peek is None:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Could not look up {first['txid']}:{first['vout']}. "
+                    f"Try /list to see open mixes, or /join one.",
+                )
+                return
+            peek_type = peek.get("scriptpubkey_type", "p2wpkh")
+            if peek_type not in self.cfg.ACCEPTED_INPUT_TYPES:
+                accepted = ", ".join(sorted(self.cfg.ACCEPTED_INPUT_TYPES))
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Your UTXO is {peek_type}; we only accept {accepted} inputs right now.",
+                )
+                return
+            if await self.db.is_blacklisted(npub_hex):
+                await self.nostr.send_dm(npub_hex, "You have been blacklisted from this bot.")
+                return
+            chosen_mix = await self._find_or_create_mix_for(peek_type)
+            if chosen_mix is None:
+                await self.nostr.send_dm(
+                    npub_hex, "No compatible mix available — try /list and /join.",
+                )
+                return
+            identity = await self.nostr.get_identity(npub_hex)
+            lud16 = identity["lud16"] if identity else ""
+            await self.db.add_participant(chosen_mix, npub_hex, lud16)
+            await self.nostr.send_dm(
+                npub_hex,
+                f"Added you to mix {chosen_mix} ({peek_type}). Processing your UTXOs...",
+            )
+            participants = await self.db.get_participants_by_npub(npub_hex)
+            active = [p for p in participants if p["state"] in ("interested", "committed")]
+            if not active:
+                return  # defensive
 
         pid = active[0]["id"]
         mix_id = active[0]["mix_id"]
+        mix = await self.db.get_mix(mix_id)
+        # Mix-level type lock. None means "first commit sets it"; once set,
+        # later UTXOs must match.
+        locked_input_type: Optional[str] = mix.get("input_type") if mix else None
+        candidate_lock_type: Optional[str] = locked_input_type
 
         # Validate UTXOs on chain
         total_sats = 0
@@ -249,6 +340,18 @@ class Coordinator:
                 )
                 continue
 
+            # Per-mix type lock: first valid UTXO sets the lock; later UTXOs
+            # in this commit (and from other participants) must match it.
+            if candidate_lock_type is None:
+                candidate_lock_type = script_type
+            elif script_type != candidate_lock_type:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"UTXO {txid}:{vout} is {script_type}, but this mix is locked to "
+                    f"{candidate_lock_type}. Send only {candidate_lock_type} UTXOs.",
+                )
+                continue
+
             # Reject dust below MINIMUM_UTXO_SIZE — these can't realistically
             # carry an equal output through mixing and only inflate vsize.
             if amount < self.cfg.MINIMUM_UTXO_SIZE:
@@ -270,6 +373,10 @@ class Coordinator:
         if not valid_utxos:
             await self.nostr.send_dm(npub_hex, "No valid UTXOs registered.")
             return
+
+        # Persist the mix-level input type lock if this commit set it.
+        if locked_input_type is None and candidate_lock_type is not None:
+            await self.db.update_mix(mix_id, input_type=candidate_lock_type)
 
         # Update participant state
         await self.db.update_participant(pid, state="committed")
@@ -309,24 +416,65 @@ class Coordinator:
             )
             return
 
-        # Find active participant. We accept 'paid' here as well as 'committed'
-        # so that ghost-recovery survivors can re-submit addresses without
-        # re-paying the service fee.
+        # Find the mix this /addresses applies to. Eligible candidates:
+        #   - state='committed' (the normal flow: UTXOs registered, no addresses yet)
+        #   - state='paid' AND no stored outputs (ghost-recovery resubmission)
+        # The one-at-a-time rule in /join means there's at most one 'committed'
+        # row per npub, so the only multi-candidate case is multiple paid mixes
+        # in simultaneous ghost-recovery.
         participants = await self.db.get_participants_by_npub(npub_hex)
-        active = [p for p in participants if p["state"] in ("committed", "paid")]
+        candidates = []
+        for p in participants:
+            if p["state"] == "committed":
+                candidates.append(p)
+            elif p["state"] == "paid":
+                outs = await self.db.get_outputs_by_participant(p["id"])
+                if not outs:
+                    candidates.append(p)
 
-        if not active:
+        if not candidates:
             await self.nostr.send_dm(npub_hex, "You haven't committed UTXOs yet. Start with /commit")
             return
+        if len(candidates) > 1:
+            names = ", ".join(c["mix_id"] for c in candidates)
+            await self.nostr.send_dm(
+                npub_hex,
+                f"You're awaiting addresses in multiple mixes: {names}. "
+                f"Please /cancel one before resubmitting addresses for the other.",
+            )
+            return
 
-        pid = active[0]["id"]
-        mix_id = active[0]["mix_id"]
-        already_paid = active[0]["state"] == "paid"
+        pid = candidates[0]["id"]
+        mix_id = candidates[0]["mix_id"]
+        already_paid = candidates[0]["state"] == "paid"
         mix = await self.db.get_mix(mix_id)
 
         if not mix:
             await self.nostr.send_dm(npub_hex, f"Mix {mix_id} not found.")
             return
+
+        # Per-mix output type lock. First /addresses sets it; subsequent must
+        # match. Combined with the allowlist gate above, this prevents mixed-type
+        # outputs from fragmenting the anonymity set.
+        locked_output_type: Optional[str] = mix.get("output_type")
+        if locked_output_type:
+            mismatched = []
+            for addr in addrs:
+                try:
+                    t = self.psbt_mgr._address_type(addr)
+                except Exception:
+                    mismatched.append((addr, "unparseable"))
+                    continue
+                if t != locked_output_type:
+                    mismatched.append((addr, t))
+            if mismatched:
+                sample = ", ".join(a for a, _ in mismatched[:3])
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"This mix is locked to {locked_output_type} addresses. "
+                    f"These don't match: {sample}",
+                )
+                return
 
         # Get participant's UTXOs to calculate fee
         utxos = await self.db.get_utxos_by_participant(pid)
@@ -386,6 +534,14 @@ class Coordinator:
         # Preserve 'paid' across resubmission; only move 'committed' rows forward.
         new_state = "paid" if already_paid else "committed"
         await self.db.update_participant(pid, state=new_state, change_amount=chg_amt)
+
+        # Set the mix-level output lock if this was the first /addresses.
+        if not locked_output_type and addrs:
+            try:
+                first_type = self.psbt_mgr._address_type(addrs[0])
+                await self.db.update_mix(mix_id, output_type=first_type)
+            except Exception:
+                pass  # allowlist already validated parseability; best-effort
         # Move mix to collecting if not already; set deadline if unset
         if mix["state"] == "announced":
             deadline = mix.get("deadline_unix")
@@ -409,51 +565,60 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, "No signing request pending for you.")
             return
 
-        pid = signing[0]["id"]
-        mix_id = signing[0]["mix_id"]
+        # Try matching the returned PSBT against each signing-state mix's
+        # skeleton (#11). The participant's stored input_indices nail down
+        # which inputs they were supposed to sign (#12); whichever skeleton's
+        # signature pattern matches identifies the mix this PSBT belongs to.
+        last_reason = "no signing requests found"
+        chosen: Optional[Tuple[Dict, Dict, Dict, List[int]]] = None
+        for cand in signing:
+            cand_mix_id = cand["mix_id"]
+            cand_mix = await self.db.get_mix(cand_mix_id)
+            if not cand_mix:
+                continue
+            cand_round_num = cand_mix.get("ghost_retries", 0) + 1
+            cand_round = await self.db.get_psbt_round(cand_mix_id, cand["id"], cand_round_num)
+            if not cand_round or not cand_round.get("psbt_sent"):
+                continue
+            try:
+                indices = json.loads(cand_round.get("input_indices") or "[]")
+            except Exception:
+                indices = []
+            expected_addr_rows = await self.db.get_outputs_by_participant(cand["id"])
+            expected_addr_list = [o["address"] for o in expected_addr_rows]
+            ok, reason = self.psbt_mgr.validate_returned(
+                cand_round["psbt_sent"], psbt_hex,
+                participant_input_count=len(indices) if indices else 0,
+                expected_output_addresses=expected_addr_list,
+                participant_input_indices=indices if indices else None,
+            )
+            if ok:
+                chosen = (cand, cand_mix, cand_round, indices)
+                break
+            last_reason = reason
 
-        # Look up the active PSBT round. Each ghost-recovery pass increments
-        # the round number, so we ask for whichever round was emitted by the
-        # most recent _assemble_psbt for this mix.
-        mix_row = await self.db.get_mix(mix_id)
-        round_num = (mix_row.get("ghost_retries", 0) + 1) if mix_row else 1
-        round_data = await self.db.get_psbt_round(mix_id, pid, round_num)
-        if not round_data:
-            await self.nostr.send_dm(npub_hex, "No PSBT record found. Please wait for the signing request.")
+        if chosen is None:
+            await self.nostr.send_dm(
+                npub_hex,
+                f"PSBT didn't match any pending signing request ({last_reason}). "
+                f"Please re-check and re-submit.",
+            )
             return
 
-        # Validate the returned PSBT
-        skeleton_hex = round_data["psbt_sent"]
-        if not skeleton_hex:
-            await self.nostr.send_dm(npub_hex, "Internal error: No skeleton PSBT recorded.")
-            return
+        matched_p, matched_mix, matched_round, _ = chosen
+        pid = matched_p["id"]
+        mix_id = matched_p["mix_id"]
 
-        participant_utxos = await self.db.get_utxos_by_participant(pid)
-        input_count = len(participant_utxos)
-
-        expected_addrs = await self.db.get_outputs_by_participant(pid)
-        expected_addr_list = [o["address"] for o in expected_addrs]
-
-        is_valid, reason = self.psbt_mgr.validate_returned(
-            skeleton_hex, psbt_hex, input_count, expected_addr_list
-        )
-
-        if not is_valid:
-            await self.nostr.send_dm(npub_hex, f"PSBT rejected: {reason}. Please re-check and re-submit.")
-            return
-
-        # Store the returned PSBT
         await self.db.update_psbt_round(
-            round_data["id"],
+            matched_round["id"],
             psbt_returned=psbt_hex,
             psbt_returned_at_unix=int(time.time()),
             psbt_valid=True,
         )
-
-        # Update participant state
         await self.db.update_participant(pid, state="signed")
-
-        await self.nostr.send_dm(npub_hex, "PSBT accepted. Waiting for all participants to sign.")
+        await self.nostr.send_dm(
+            npub_hex, f"PSBT for {mix_id} accepted. Waiting for all participants to sign.",
+        )
 
     async def _cmd_accept_psbt_chunk(self, ctx: SenderContext, npub_hex: str,
                                       chunk_idx: int, chunk_total: int, chunk_hex: str):
@@ -663,16 +828,48 @@ class Coordinator:
                 pass
 
             case "collecting":
-                # Check deadline
+                # Per-participant pay-deadline: any 'committed' participant
+                # who hasn't paid within PAY_DEADLINE_HOURS is removed. They
+                # paid nothing on-chain, so no refund — just clean up their
+                # UTXO/output rows and DM them.
+                pay_seconds = self.cfg.PAY_DEADLINE_HOURS * 3600
+                for p in list(active):
+                    if p["state"] != "committed":
+                        continue
+                    age = now - int(p.get("updated_at_unix") or 0)
+                    if age <= pay_seconds:
+                        continue
+                    logger.info(
+                        f"Participant {_bech32_npub(p['npub_hex'])} never paid "
+                        f"for {mix_id} after {self.cfg.PAY_DEADLINE_HOURS}h — removing"
+                    )
+                    await self.db.delete_utxos_by_participant(p["id"])
+                    await self.db.delete_outputs_by_participant(p["id"])
+                    await self.db.update_participant(p["id"], state="cancelled")
+                    p["state"] = "cancelled"  # sync in-memory for filters below
+                    try:
+                        await self.nostr.send_dm(
+                            p["npub_hex"],
+                            f"Your slot in {mix_id} expired (no payment within "
+                            f"{self.cfg.PAY_DEADLINE_HOURS}h). Use /join {mix_id} to retry.",
+                        )
+                    except Exception:
+                        pass
+
+                # Re-filter active after the pay-timeout sweep.
+                active = [p for p in active if p["state"] not in ("cancelled", "ghosted", "completed")]
+
+                # Mix-level deadline
                 deadline = mix.get("deadline_unix")
                 if deadline and now >= deadline:
-                    # Timeout
-                    if len(active) < 2:
+                    # Only paid participants count toward the proceed-or-cancel decision.
+                    paid = [p for p in active if p["state"] == "paid"]
+                    if len(paid) < 2:
                         await self._cancel_and_refund(mix, "not enough participants")
-                    elif len(active) < mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT):
+                    elif len(paid) < mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT):
                         await self._cancel_and_refund(mix, "not enough participants")
                     else:
-                        await self._proceed_to_assembling(mix, active)
+                        await self._proceed_to_assembling(mix, paid)
 
             case "assembling":
                 await self._assemble_psbt(mix, active)
@@ -721,6 +918,9 @@ class Coordinator:
         all_inputs: List[Dict] = []
         participants_data: List[Dict] = []  # for calculate_all_fees
         addrs_by_pid: Dict[str, List[str]] = {}
+        # Per-participant indices into all_inputs, so /psbt_accept can later
+        # verify the participant signed THEIR inputs and nobody else's.
+        input_indices_by_pid: Dict[str, List[int]] = {}
 
         for p in active:
             pid = p["id"]
@@ -729,6 +929,7 @@ class Coordinator:
             addrs_in_order = [o["address"] for o in stored_outputs]
             total_sats = sum(u["amount"] for u in utxos)
 
+            start_idx = len(all_inputs)
             for u in utxos:
                 all_inputs.append({
                     "txid": u["txid"],
@@ -737,6 +938,7 @@ class Coordinator:
                     "script_type": u.get("script_type", "p2wpkh"),
                     "scriptpubkey": u.get("scriptpubkey", ""),
                 })
+            input_indices_by_pid[pid] = list(range(start_idx, start_idx + len(utxos)))
 
             ibt: Dict[str, int] = {}
             for u in utxos:
@@ -816,7 +1018,12 @@ class Coordinator:
         for p in active:
             pid = p["id"]
             round_id = await self.db.add_psbt_round(mix_id, pid, round_num=round_num)
-            await self.db.update_psbt_round(round_id, psbt_sent=psbt_hex, psbt_sent_at_unix=now_ts)
+            await self.db.update_psbt_round(
+                round_id,
+                psbt_sent=psbt_hex,
+                psbt_sent_at_unix=now_ts,
+                input_indices=json.dumps(input_indices_by_pid.get(pid, [])),
+            )
 
             # Send PSBT to participant
             # Check if chunking needed
@@ -1068,11 +1275,37 @@ class Coordinator:
 
     # --- Announcement Scheduler ---
 
+    def _seconds_until_next_announcement(self) -> float:
+        """Wall-clock seconds until the next ANNOUNCEMENT_HOUR_UTC boundary.
+
+        Always returns > 0 — if we're already past today's hour we roll to
+        tomorrow. Pulled out for testability.
+        """
+        now = dt.datetime.now(dt.timezone.utc)
+        target_hour = max(0, min(23, self.cfg.ANNOUNCEMENT_HOUR_UTC))
+        target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target = target + dt.timedelta(days=1)
+        return (target - now).total_seconds()
+
     async def _announcement_task_loop(self):
-        """Post daily announcements for open mixes."""
+        """Post one announcement per UTC day at ANNOUNCEMENT_HOUR_UTC.
+
+        Replaces the older naive `sleep(86400)` loop which drifted with
+        bot uptime — announcements would fire at whatever hour the bot
+        happened to start.
+        """
         while self._running:
-            await asyncio.sleep(86400)  # Once per day
-            await self._post_daily_announcement()
+            wait_s = self._seconds_until_next_announcement()
+            try:
+                await asyncio.sleep(wait_s)
+            except asyncio.CancelledError:
+                return
+            if self._running:
+                try:
+                    await self._post_daily_announcement()
+                except Exception as e:
+                    logger.error(f"Daily announcement failed: {e}", exc_info=True)
 
     async def _post_daily_announcement(self):
         """Post a daily announcement of open mixes."""

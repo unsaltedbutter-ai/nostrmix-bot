@@ -13,6 +13,8 @@ CREATE TABLE mixes (
     deadline_unix   INTEGER,
     broadcast_txid  TEXT,
     broadcast_tx_hex TEXT,                    -- raw signed tx hex, kept so _broadcast_sweep can re-push if needed
+    input_type      TEXT,                     -- locked at first /commit; all subsequent commits must match
+    output_type     TEXT,                     -- locked at first /addresses; all subsequent must match
     ghost_retries   INTEGER DEFAULT 0,
     max_ghost_retries INTEGER DEFAULT 3,
     created_at_unix INTEGER NOT NULL,
@@ -66,6 +68,7 @@ CREATE TABLE psbt_rounds (
     psbt_returned   TEXT,                        -- hex of signed PSBT
     psbt_returned_at_unix INTEGER,
     psbt_valid      BOOLEAN,
+    input_indices   TEXT,                      -- JSON list of vin indices the participant must sign
     created_at_unix INTEGER,
     updated_at_unix INTEGER,
     UNIQUE(mix_id, participant_id, round_num)

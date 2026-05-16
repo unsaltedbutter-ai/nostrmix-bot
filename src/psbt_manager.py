@@ -151,13 +151,20 @@ class PSBTManager:
 
     def validate_returned(self, skeleton_hex: str, returned_hex: str,
                           participant_input_count: int,
-                          expected_output_addresses: List[str]) -> Tuple[bool, str]:
+                          expected_output_addresses: List[str],
+                          participant_input_indices: Optional[List[int]] = None,
+                          ) -> Tuple[bool, str]:
         """Validate a returned (signed) PSBT.
 
         Checks:
-        - No outputs changed
-        - No inputs removed or added
-        - Participant has signed their inputs
+        - Input and output counts match the skeleton
+        - No output amounts or scriptPubKeys were altered
+        - The participant signed the inputs they were supposed to sign
+          - If participant_input_indices is provided: those exact indices have
+            partial_sigs AND nothing outside those indices has new partial_sigs
+            (defends against a participant signing someone else's input)
+          - If participant_input_indices is None: legacy fallback — only the
+            count of signed inputs is verified
 
         Returns: (is_valid, reason)
         """
@@ -185,12 +192,26 @@ class PSBTManager:
                 if ret_out.script_pubkey != skel_out.script_pubkey:
                     return False, f"Output #{i} address changed"
 
-            # Check participant has signed at least their input count
-            # NOTE: for coinjoin we cannot verify WHICH inputs they signed
-            # because we don't know their pubkey. We only check count.
-            signed_count = sum(1 for inp in returned_psbt.inputs if inp.partial_sigs)
-            if signed_count < participant_input_count:
-                return False, f"Only {signed_count}/{participant_input_count} inputs signed"
+            # Check signatures.
+            if participant_input_indices is None:
+                # Legacy: only count signed inputs (can be fooled by signing
+                # a peer's input).
+                signed_count = sum(1 for inp in returned_psbt.inputs if inp.partial_sigs)
+                if signed_count < participant_input_count:
+                    return False, f"Only {signed_count}/{participant_input_count} inputs signed"
+            else:
+                # Strict: each expected index must carry partial_sigs that
+                # weren't there in the skeleton; no other index may have new
+                # partial_sigs added by this participant.
+                expected = set(participant_input_indices)
+                for i, (skel_in, ret_in) in enumerate(zip(skeleton_psbt.inputs, returned_psbt.inputs)):
+                    skel_sigs = set(skel_in.partial_sigs.keys()) if skel_in.partial_sigs else set()
+                    ret_sigs = set(ret_in.partial_sigs.keys()) if ret_in.partial_sigs else set()
+                    added = ret_sigs - skel_sigs
+                    if i in expected and not added:
+                        return False, f"Input #{i} (yours) was not signed"
+                    if i not in expected and added:
+                        return False, f"Input #{i} (not yours) was signed — refusing"
 
             return True, "valid"
 

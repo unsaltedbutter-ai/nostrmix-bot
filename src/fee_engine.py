@@ -123,7 +123,11 @@ class FeeEngine:
 
         Returns: (num_equal_outputs, num_change_outputs, equal_output_sats, change_output_sats)
         """
-        available = input_total_sats - estimated_fee_share - estimated_service_fee
+        # Per the plan, the service fee is a Lightning zap — it does NOT come
+        # out of the on-chain inputs. Only the miner fee_share reduces what's
+        # available for outputs. The estimated_service_fee parameter is kept
+        # for callers' convenience but no longer affects the math.
+        available = input_total_sats - estimated_fee_share
 
         if available <= 0:
             return (0, 0, 0, 0)

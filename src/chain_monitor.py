@@ -3,9 +3,10 @@
 All networking uses httpx.AsyncClient so it never blocks the asyncio event loop.
 """
 import httpx
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 _DEFAULT_API = "https://mempool.space/api"
+_DEFAULT_BACKUP_API = "https://blockstream.info/api"  # API-compatible Esplora mirror
 
 # Esplora reports segwit/taproot with version prefixes. Map to the bare names
 # used elsewhere in the project (config.py vsize maps, vsize.py defaults).
@@ -26,8 +27,15 @@ class ChainMonitor:
     """Bitcoin blockchain monitor via mempool.space API — fully async."""
 
     def __init__(self, api_base: str = _DEFAULT_API, min_fee_rate: float = 1.5,
-                 max_fee_rate: float = 510, fee_multiplier: float = 1.5):
+                 max_fee_rate: float = 510, fee_multiplier: float = 1.5,
+                 api_backup: Optional[str] = _DEFAULT_BACKUP_API):
         self._api_base = api_base.rstrip("/")
+        self._api_backup = api_backup.rstrip("/") if api_backup else None
+        # Endpoints tried in order. The primary is always first; the backup is
+        # only consulted on a network/HTTP failure of the primary.
+        self._endpoints: List[str] = [self._api_base]
+        if self._api_backup and self._api_backup != self._api_base:
+            self._endpoints.append(self._api_backup)
         self._min_fee_rate = min_fee_rate
         self._max_fee_rate = max_fee_rate
         self._fee_multiplier = fee_multiplier
@@ -37,6 +45,19 @@ class ChainMonitor:
         await self._client.aclose()
 
     # --- UTXO Lookup ---
+
+    async def _get_json(self, path: str) -> Optional[Any]:
+        """GET <endpoint>/<path> as JSON, falling back through self._endpoints."""
+        last_exc: Optional[Exception] = None
+        for base in self._endpoints:
+            try:
+                r = await self._client.get(f"{base}{path}")
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last_exc = e
+                continue
+        return None
 
     async def lookup_txout(self, txid: str, vout: int) -> Optional[Dict]:
         """Look up a prevout by txid:vout.
@@ -48,26 +69,23 @@ class ChainMonitor:
         This does NOT tell you whether the output is unspent — use is_utxo_spent
         for that.
         """
-        try:
-            r = await self._client.get(f"{self._api_base}/tx/{txid}")
-            r.raise_for_status()
-            tx_data = r.json()
-            if "vout" not in tx_data or vout >= len(tx_data["vout"]):
-                return None
-            prevout = tx_data["vout"][vout]
-            return {
-                "txid": txid,
-                "vout": vout,
-                "status": tx_data.get("status", {}).get("confirmed", False),
-                "value": prevout.get("value", 0),
-                "scriptpubkey": prevout.get("scriptpubkey", ""),
-                "scriptpubkey_type": _normalize_script_type(
-                    prevout.get("scriptpubkey_type", "")
-                ),
-                "address": prevout.get("scriptpubkey_address", ""),
-            }
-        except Exception:
+        tx_data = await self._get_json(f"/tx/{txid}")
+        if tx_data is None:
             return None
+        if "vout" not in tx_data or vout >= len(tx_data["vout"]):
+            return None
+        prevout = tx_data["vout"][vout]
+        return {
+            "txid": txid,
+            "vout": vout,
+            "status": tx_data.get("status", {}).get("confirmed", False),
+            "value": prevout.get("value", 0),
+            "scriptpubkey": prevout.get("scriptpubkey", ""),
+            "scriptpubkey_type": _normalize_script_type(
+                prevout.get("scriptpubkey_type", "")
+            ),
+            "address": prevout.get("scriptpubkey_address", ""),
+        }
 
     async def is_utxo_spent(self, txid: str, vout: int) -> bool:
         """Check whether a specific output (txid:vout) has been spent on-chain.
@@ -79,24 +97,14 @@ class ChainMonitor:
         would still fail if the UTXO were actually spent, so the realistic risk
         is wasting a participant's service fee.
         """
-        try:
-            r = await self._client.get(
-                f"{self._api_base}/tx/{txid}/outspend/{vout}"
-            )
-            r.raise_for_status()
-            data = r.json()
-            return bool(data.get("spent", False))
-        except Exception:
+        data = await self._get_json(f"/tx/{txid}/outspend/{vout}")
+        if data is None:
             return False
+        return bool(data.get("spent", False))
 
     async def lookup_tx(self, txid: str) -> Optional[Dict]:
         """Get full transaction data."""
-        try:
-            r = await self._client.get(f"{self._api_base}/tx/{txid}")
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            return None
+        return await self._get_json(f"/tx/{txid}")
 
     # --- Fee Estimation ---
 
@@ -106,30 +114,25 @@ class ChainMonitor:
         Returns the rate * FEE_MULTIPLIER, clamped to [MIN_FEE_RATE, MAX_FEE_RATE].
         """
         try:
-            r = await self._client.get(f"{self._api_base}/v1/fees/mempool-blocks")
-            r.raise_for_status()
-            data = r.json()
-
+            data = await self._get_json("/v1/fees/mempool-blocks")
             rates = []
-            for block in data[:4]:  # last 4 blocks
-                if "feeRange" in block and len(block["feeRange"]) > 0:
-                    rates.append(block["feeRange"][0])  # lowest fee in block
+            if data:
+                for block in data[:4]:  # last 4 blocks
+                    if "feeRange" in block and len(block["feeRange"]) > 0:
+                        rates.append(block["feeRange"][0])  # lowest fee in block
             if not rates:
-                # Fallback to /v1/fees/recommended
-                r2 = await self._client.get(f"{self._api_base}/v1/fees/recommended")
-                r2.raise_for_status()
-                rec = r2.json()
-                rates = [rec.get("minimumFee", 30)]
+                rec = await self._get_json("/v1/fees/recommended")
+                if rec:
+                    rates = [rec.get("minimumFee", 30)]
+            if not rates:
+                return max(self._min_fee_rate, 30)
 
             avg = sum(rates) / max(len(rates), 1)
-            # Clamp
             final = max(avg * self._fee_multiplier, self._min_fee_rate)
             if self._max_fee_rate > 0:
                 final = min(final, self._max_fee_rate)
             return final
-
         except Exception:
-            # Return conservative default
             return max(self._min_fee_rate, 30)
 
     # --- Broadcast ---
@@ -137,32 +140,35 @@ class ChainMonitor:
     async def broadcast_tx(self, tx_hex: str) -> Optional[str]:
         """Submit a raw transaction to mempool.space.
 
-        Returns the txid string on success, None on failure.
+        Returns the txid string on success, None on failure. Tries the backup
+        endpoint if the primary fails (network error or non-2xx).
         """
-        try:
-            r = await self._client.post(
-                f"{self._api_base}/tx",
-                data=tx_hex,
-                headers={"Content-Type": "text/plain"},
-            )
-            if r.status_code == 200:
-                return r.text.strip()
-            else:
-                return None
-        except Exception:
-            return None
+        for base in self._endpoints:
+            try:
+                r = await self._client.post(
+                    f"{base}/tx",
+                    content=tx_hex,
+                    headers={"Content-Type": "text/plain"},
+                )
+                if r.status_code == 200:
+                    return r.text.strip()
+                # Non-200: log enough to diagnose but try the next endpoint.
+                # Mempool errors (insufficient fee, non-standard, etc.) tend to
+                # be returned identically by both Esplora mirrors, so falling
+                # through usually doesn't help, but a 5xx on one mirror might
+                # succeed on the other.
+            except Exception:
+                continue
+        return None
 
     # --- Confirmation Check ---
 
     async def is_confirmed(self, txid: str) -> bool:
         """Check if a txid is confirmed (has at least 1 confirmation)."""
-        try:
-            r = await self._client.get(f"{self._api_base}/tx/{txid}/status")
-            r.raise_for_status()
-            data = r.json()
-            return data.get("confirmed", False)
-        except Exception:
+        data = await self._get_json(f"/tx/{txid}/status")
+        if data is None:
             return False
+        return bool(data.get("confirmed", False))
 
     # --- Re-broadcast ---
 
