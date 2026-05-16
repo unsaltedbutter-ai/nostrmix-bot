@@ -82,6 +82,12 @@ CREATE TABLE announcements (
     posted_at_unix  INTEGER NOT NULL
 );
 
+-- Simple key-value settings table (hackable: sqlite3 bot.db "UPDATE settings SET value='0' WHERE key='last_broadcast_check_unix'")
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- Indices for common query patterns
 CREATE INDEX idx_participants_mix ON participants(mix_id);
 CREATE INDEX idx_participants_npub ON participants(npub_hex);

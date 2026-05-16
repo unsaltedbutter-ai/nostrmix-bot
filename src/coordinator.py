@@ -562,6 +562,10 @@ class Coordinator:
             logger.info(f"Cleaning up stale PSBT chunks for {key}")
             del self._psbt_chunks[key]
 
+        # Broadcast sweep — checks confirmed mixes on an N-hour interval
+        # rather than polling every 60s.
+        await self._broadcast_sweep(now)
+
     async def _process_mix(self, mix: Dict, now: int):
         """Process a single mix's state."""
         mix_id = mix["id"]
@@ -594,7 +598,9 @@ class Coordinator:
                 await self._handle_signing(mix, active, now)
 
             case "broadcast":
-                await self._handle_broadcast(mix)
+                # No per-tick processing — handled by _broadcast_sweep
+                # on an N-hour interval instead.
+                pass
 
             case "completed":
                 # Clean up old completed mixes
@@ -849,30 +855,65 @@ class Coordinator:
         else:
             await self._cancel_and_refund(mix, "broadcast failed")
 
-    async def _handle_broadcast(self, mix: Dict):
-        """Check confirmation of broadcast transaction."""
-        mix_id = mix["id"]
-        txid = mix.get("broadcast_txid")
+    async def _broadcast_sweep(self, now: float):
+        """Sweep all broadcast-pending mixes and check confirmation.
 
-        if not txid:
+        Runs on an N-hour interval (BROADCAST_CHECK_INTERVAL_HOURS from env)
+        rather than polling every 60s. Tracks last-check timestamp in the
+        settings table so you can force a manual check with:
+          sqlite3 bot.db "UPDATE settings SET value='0' WHERE key='last_broadcast_check_unix'"
+        """
+        interval_hours = self.cfg.BROADCAST_CHECK_INTERVAL_HOURS
+        interval_seconds = interval_hours * 3600
+
+        raw = await self.db.get_setting("last_broadcast_check_unix", "0")
+        last_check_str = raw if raw is not None else "0"
+        try:
+            last_check = int(last_check_str)
+        except (ValueError, TypeError):
+            last_check = 0
+
+        if now - last_check < interval_seconds:
+            return  # Not yet time for the next sweep
+
+        # Mark sweep as done (even if it fails — retry next interval)
+        await self.db.set_setting("last_broadcast_check_unix", str(int(now)))
+
+        # Find all mixes in broadcast state
+        broadcast_mixes = await self.db.get_mixes_by_state("broadcast")
+        if not broadcast_mixes:
             return
 
-        # Check confirmation
-        if await self.chain.is_confirmed(txid):
-            await self.db.update_mix(mix_id, state="completed")
-            # Notify participants
+        for mix in broadcast_mixes:
+            mix_id = mix["id"]
+            txid = mix.get("broadcast_txid")
+            if not txid:
+                await self.db.update_mix(mix_id, state="cancelled")
+                continue
+
+            try:
+                confirmed = await self.chain.is_confirmed(txid)
+            except Exception:
+                confirmed = False
+
+            if not confirmed:
+                logger.info(f"Mix {mix_id} broadcast tx {txid} not yet confirmed (checked at {now})")
+                continue
+
+            # Confirmed! Notify remaining participants, then destroy all trace.
             participants = await self.db.get_participants_by_mix(mix_id)
             for p in participants:
                 if p["state"] in ("signed", "broadcast"):
-                    await self.nostr.send_dm(
-                        p["npub_hex"],
-                        f"Mix {mix_id} confirmed on-chain: {txid}",
-                    )
-            # Clean up is handled by completed state
-        else:
-            # Re-broadcast if not confirmed within 1 hour
-            # We just log for now — re-broadcast can be added
-            logger.info(f"Mix {mix_id} not yet confirmed, txid={txid}")
+                    try:
+                        await self.nostr.send_dm(
+                            p["npub_hex"],
+                            f"Mix {mix_id} confirmed on-chain: {txid}",
+                        )
+                    except Exception:
+                        pass
+
+            await self.db.destroy_mix_data(mix_id)
+            logger.info(f"Mix {mix_id} confirmed and all data destroyed (txid={txid})")
 
     # --- Announcement Scheduler ---
 

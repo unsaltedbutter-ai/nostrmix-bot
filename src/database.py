@@ -354,10 +354,50 @@ class Database:
     # --- Utility ---
 
     async def get_active_mixes(self) -> List[Dict]:
+        """Mixes that still need interactive processing — excludes broadcast
+        because those are handled via the N-hour sweep in _broadcast_sweep."""
         return await self.get_mixes_by_state(
-            "announced", "collecting", "assembling", "signing", "broadcast"
+            "announced", "collecting", "assembling", "signing"
         )
 
     async def resume_unfinished(self) -> List[Dict]:
-        """Return unfinished mixes for crash recovery."""
-        return await self.get_active_mixes()
+        """Return unfinished mixes for crash recovery — includes broadcast
+        so the sweep picks them up on its next interval."""
+        active = await self.get_active_mixes()
+        broadcast = await self.get_mixes_by_state("broadcast")
+        active.extend(broadcast)
+        return active
+
+    # --- Settings (key-value) ---
+
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Get a setting value by key. Hackable: sqlite3 bot.db 'SELECT value FROM settings WHERE key=\"...\"'"""
+        row = await self._fetchone("SELECT value FROM settings WHERE key=?", (key,))
+        if row:
+            return row["value"]
+        return default
+
+    async def set_setting(self, key: str, value: str):
+        """Upsert a setting. Convenient for hacking: sqlite3 bot.db \"UPDATE settings SET value='...' WHERE key='...'\" """
+        await self._execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        await self._conn.commit()
+
+    # --- Full cleanup of a completed mix ---
+
+    async def destroy_mix_data(self, mix_id: str):
+        """Delete all data for a confirmed mix. No trace besides blacklist remains (per plan)."""
+        # Delete participant-owned records first
+        pids = await self._fetchall("SELECT id FROM participants WHERE mix_id=?", (mix_id,))
+        for p in pids:
+            pid = p["id"]
+            await self._execute("DELETE FROM outputs WHERE participant_id=?", (pid,))
+            await self._execute("DELETE FROM utxos WHERE participant_id=?", (pid,))
+            await self._execute("DELETE FROM psbt_rounds WHERE participant_id=?", (pid,))
+        # Then participants, announcements, and the mix itself
+        await self._execute("DELETE FROM participants WHERE mix_id=?", (mix_id,))
+        await self._execute("DELETE FROM announcements WHERE mix_id=?", (mix_id,))
+        await self._execute("DELETE FROM mixes WHERE id=?", (mix_id,))
+        await self._conn.commit()

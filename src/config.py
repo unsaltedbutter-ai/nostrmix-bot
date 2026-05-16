@@ -45,6 +45,8 @@ _DEFAULTS = {
     "DEFAULT_MIX_OUTPUT_COUNT": 4,
     "DEFAULT_MIX_USER_COUNT": 3,
 
+    "BROADCAST_CHECK_INTERVAL_HOURS": 24,
+
     # Bitcoin API
     "MEMPOOL_API": "https://mempool.space/api",
 
@@ -223,6 +225,10 @@ class BotConfig:
     @property
     def DEFAULT_MIX_USER_COUNT(self) -> int:
         return self._values["DEFAULT_MIX_USER_COUNT"]
+
+    @property
+    def BROADCAST_CHECK_INTERVAL_HOURS(self) -> int:
+        return self._values["BROADCAST_CHECK_INTERVAL_HOURS"]
 
     @property
     def MEMPOOL_API(self) -> str:
