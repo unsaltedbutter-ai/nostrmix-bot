@@ -44,8 +44,10 @@ class Coordinator:
         self._event_loop_task: Optional[asyncio.Task] = None
         self._session_ctx: Optional[Any] = None  # SenderContext reference from NostrBot
 
-        # For chunked PSBT reassembly
-        self._psbt_chunks: Dict[str, Dict[int, str]] = {}  # npub_hex -> {chunk_idx: hex}
+        # For chunked PSBT reassembly — keyed per (npub_hex, mix_id) so same
+        # participant in multiple mixes doesn't collide chunks.
+        # Value is tuple: (chunk_total, dict[int,str], timestamp_of_first_chunk)
+        self._psbt_chunks: Dict[str, dict] = {}  # "<npub_hex>:<mix_id>" -> {"chunks": {idx: hex}, "total": int, "started": float}
 
     async def init(self, nostr: NostrHandler, chain: ChainMonitor,
                    psbt_mgr: PSBTManager, fee_engine: FeeEngine,
@@ -206,7 +208,7 @@ class Coordinator:
                 continue
 
             # Look up on-chain
-            txout = self.chain.lookup_txout(txid, vout)
+            txout = await self.chain.lookup_txout(txid, vout)
             if txout is None:
                 await self.nostr.send_dm(npub_hex, f"Could not find UTXO {txid}:{vout} on chain.")
                 continue
@@ -372,22 +374,33 @@ class Coordinator:
 
     async def _cmd_accept_psbt_chunk(self, ctx: SenderContext, npub_hex: str,
                                       chunk_idx: int, chunk_total: int, chunk_hex: str):
-        """Handle chunked PSBT reassembly."""
-        # Initialize chunk storage for this npub if needed
-        if npub_hex not in self._psbt_chunks:
-            self._psbt_chunks[npub_hex] = {}
+        """Handle chunked PSBT reassembly — keyed per (npub_hex, mix_id)."""
+        # Find the participant's active signing mix so we can key correctly
+        participants = await self.db.get_participants_by_npub(npub_hex)
+        signing = [p for p in participants if p["state"] == "signing"]
+        if not signing:
+            await self.nostr.send_dm(npub_hex, "No signing request pending for you.")
+            return
+        mix_id = signing[0]["mix_id"]
 
-        self._psbt_chunks[npub_hex][chunk_idx] = chunk_hex
+        # Key the chunk storage per (npub_hex, mix_id) to avoid collision when
+        # the same npub is in multiple mixes simultaneously.
+        key = f"{npub_hex}:{mix_id}"
+        if key not in self._psbt_chunks:
+            self._psbt_chunks[key] = {"chunks": {}, "total": chunk_total, "started": time.time()}
+
+        record = self._psbt_chunks[key]
+        record["chunks"][chunk_idx] = chunk_hex
 
         # Check if all chunks received
-        chunks = self._psbt_chunks[npub_hex]
-        if len(chunks) == chunk_total:
+        chunks_dict = record["chunks"]
+        if len(chunks_dict) == chunk_total:
             # Reassemble
             reassembled = ""
-            for idx in sorted(chunks.keys()):
-                reassembled += chunks[idx]
+            for idx in sorted(chunks_dict.keys()):
+                reassembled += chunks_dict[idx]
             # Clean up chunks
-            del self._psbt_chunks[npub_hex]
+            del self._psbt_chunks[key]
             # Forward to accept_psbt handler
             await self._cmd_accept_psbt(ctx, npub_hex, reassembled)
         else:
@@ -527,6 +540,8 @@ class Coordinator:
                 logger.error(f"Event loop tick error: {e}", exc_info=True)
             await asyncio.sleep(60)  # Check every 60 seconds
 
+    STALE_CHUNK_TIMEOUT = 3600  # 1 hour — discard incomplete chunk sets
+
     async def _tick(self):
         """One tick of the state machine."""
         now = time.time()
@@ -537,6 +552,15 @@ class Coordinator:
                 await self._process_mix(mix, now)
             except Exception as e:
                 logger.error(f"Error processing mix {mix['id']}: {e}")
+
+        # Stale chunk cleanup — discard chunk sets that started >1h ago
+        stale_keys = [
+            k for k, rec in self._psbt_chunks.items()
+            if now - rec.get("started", 0) > self.STALE_CHUNK_TIMEOUT
+        ]
+        for key in stale_keys:
+            logger.info(f"Cleaning up stale PSBT chunks for {key}")
+            del self._psbt_chunks[key]
 
     async def _process_mix(self, mix: Dict, now: int):
         """Process a single mix's state."""
@@ -816,7 +840,7 @@ class Coordinator:
             return
 
         # Broadcast
-        txid = self.chain.broadcast_tx(raw_tx_hex)
+        txid = await self.chain.broadcast_tx(raw_tx_hex)
         if txid:
             await self.db.update_mix(mix_id, state="broadcast", broadcast_txid=txid)
             # Notify participants
@@ -834,7 +858,7 @@ class Coordinator:
             return
 
         # Check confirmation
-        if self.chain.is_confirmed(txid):
+        if await self.chain.is_confirmed(txid):
             await self.db.update_mix(mix_id, state="completed")
             # Notify participants
             participants = await self.db.get_participants_by_mix(mix_id)
@@ -961,4 +985,7 @@ class Coordinator:
         if self._announcement_task:
             self._announcement_task.cancel()
         await self.nostr.stop()
+        # Close async HTTP client — prevents hanging connections on exit
+        if self.chain:
+            await self.chain.close()
         await self.db.close()
