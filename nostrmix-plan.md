@@ -34,7 +34,7 @@ Some basics:
 
 ```
 nostrbot-sdk                    # user's wrapper around nostr-sdk (NIP-17, NIP-57, relays)
-python-bitcoinlib               # PSBT building, validation, combination
+python-bitcointx                # PSBT building, validation, combination (maintained fork of python-bitcoinlib with first-class BIP-174 support)
 httpx                           # mempool.space API calls (UTXO lookup, fee estimates, broadcast)
 aiosqlite                       # async SQLite for state storage
 python-dotenv                   # env config
@@ -58,8 +58,11 @@ CREATE TABLE mixes (
     -- announced | collecting | assembling | signing | broadcast | completed | cancelled
     deadline_unix   INTEGER,
     broadcast_txid  TEXT,
-    ghost_retries   INTEGER DEFAULT 0,          -- how many times this round has restarted due to ghosting
-    max_ghost_retries INTEGER DEFAULT 3,        -- after this, cancel and refund everyone
+    broadcast_tx_hex TEXT,                     -- raw signed tx hex; kept so the broadcast sweep can re-push if it falls out of mempool
+    input_type      TEXT,                      -- locked at first /commit; all subsequent commits must match
+    output_type     TEXT,                      -- locked at first /addresses; all subsequent must match
+    ghost_retries   INTEGER DEFAULT 0,         -- how many times this round has restarted due to ghosting
+    max_ghost_retries INTEGER DEFAULT 3,       -- after this, cancel and refund everyone
     created_at_unix INTEGER NOT NULL,
     updated_at_unix INTEGER NOT NULL
 );
@@ -104,12 +107,15 @@ CREATE TABLE psbt_rounds (
     id              TEXT PRIMARY KEY,
     mix_id          TEXT NOT NULL REFERENCES mixes(id),
     participant_id  TEXT NOT NULL REFERENCES participants(id),
-    round_num       INTEGER DEFAULT 1,
+    round_num       INTEGER DEFAULT 1,          -- ghost recovery bumps this; derived as mix.ghost_retries + 1 at assembly time
     psbt_sent_at_unix INTEGER,
     psbt_sent       TEXT,                        -- hex of skeleton PSBT
     psbt_returned   TEXT,                        -- hex of signed PSBT
     psbt_returned_at_unix INTEGER,
     psbt_valid      BOOLEAN,
+    input_indices   TEXT,                        -- JSON list of vin indices the participant must sign; used by validate_returned's strict per-input check
+    created_at_unix INTEGER,
+    updated_at_unix INTEGER,
     UNIQUE(mix_id, participant_id, round_num)
 );
 
@@ -147,7 +153,7 @@ Uses `nostrbot-sdk` for all transport. Handles:
 - **Outgoing DMs**: send structured messages to participants
 - **Zap monitoring**: listen for kind 9735 (zap receipt) events on relays; match sender npub + amount to pending participant
 - **Profile lookup**: fetch kind 0 for lightning address (refund path)
-- **Daily announcements**: for each open mix, post a kind 1 note to configured relays
+- **Daily announcements**: once per day at `ANNOUNCEMENT_HOUR_UTC` (default 14:00 UTC), post a single combined kind 1 note listing all currently-open mixes. If no mixes are open, auto-create one with `DEFAULT_OUTPUT_SIZE` / `DEFAULT_MIX_USER_COUNT`.
 - **Ghosting pings**: graduated DMs at 1/8 of signing time, 1/4 of signing time, 1/2 of signing time after PSBT sent
 
 Command protocol — rigid, no NL parsing required. The bot responds with structured text:
@@ -456,11 +462,20 @@ If there are other flows that are required, a best guess is appropriate as long 
 - Bot says: we've added you to <east-gate> and resumes the "Signup to mix" script just after the txid,vout,address phase
 - - this let's users join the closest to completed mix quickly and easily.
 - - this needs to be atomic so we don't over-subscribe to a mix.
-- If there is no open mix, the Bot creates a DEFAULT_MIX_USER_COUNT person mix and calculates the correct output size by taking the sum of the inputs and dividing by DEFAULT_MIX_OUTPUT_COUNT, rounding to the nearest 0.025
+- If there is no open mix, the Bot creates a `DEFAULT_MIX_USER_COUNT` person mix with `output_size = DEFAULT_OUTPUT_SIZE`. (Earlier drafts of this plan computed the output size per-user from the sum of their inputs divided by `DEFAULT_MIX_OUTPUT_COUNT`; that was abandoned because per-user output sizes fragment the anonymity set. A single shared `DEFAULT_OUTPUT_SIZE` keeps all participants in the same mix on the same size band. `DEFAULT_MIX_OUTPUT_COUNT` is therefore currently unused.)
 
 
 If user sends the wrong output address type for the mix, the bot should reject by saying:
 - "For this mix we're only accepting <address_type> addresses."
+
+### 3h. Script-type policy
+
+Two layers of script-type enforcement, both implemented:
+
+1. **Operator allowlist** (env: `ACCEPTED_INPUT_TYPES`, `ACCEPTED_OUTPUT_TYPES`) — comma-separated, default `p2wpkh`. `/commit` rejects UTXOs whose normalized script type isn't on the input list; `/addresses` rejects addresses whose type isn't on the output list.
+2. **Per-mix lock** (columns: `mixes.input_type`, `mixes.output_type`) — set by the first successful `/commit` and first `/addresses` to that mix. Subsequent commits/addresses must match the lock. This keeps the anonymity set within a mix to one type even when the operator allowlist permits multiple.
+
+The MVP keeps the allowlist single-entry (`p2wpkh`), which makes the per-mix lock redundant but already in place for the day the allowlist is widened.
 
 ---
 
@@ -584,11 +599,46 @@ SIGNING_DEADLINE_HOURS=48
 PAY_DEADLINE_HOURS=12
 MAX_GHOST_RETRIES=3
 MINIMUM_UTXO_SIZE=10000
-DEFAULT_MIX_OUTPUT_COUNT=4
+DEFAULT_MIX_OUTPUT_COUNT=4         # currently unused — see section 3g
 DEFAULT_MIX_USER_COUNT=3
+
+# Operator script-type allowlist (comma-separated). Gates which UTXO types
+# the bot will accept at /commit and which output address types at /addresses.
+# Default is single-type (p2wpkh) — widening past one entry requires the
+# per-mix input_type/output_type lock to keep anonymity sets coherent.
+ACCEPTED_INPUT_TYPES=p2wpkh
+ACCEPTED_OUTPUT_TYPES=p2wpkh
+
+# Daily announcement scheduling
+ANNOUNCEMENT_HOUR_UTC=14           # 0..23; fires at this wall-clock hour each day
+
+# Broadcast-sweep cadence (re-broadcast unconfirmed txs + confirm checks)
+BROADCAST_CHECK_INTERVAL_HOURS=24
 
 # Bitcoin API (mempool.space — free, no key needed)
 MEMPOOL_API=https://mempool.space/api
+# Esplora-compatible backup mirror — tried if MEMPOOL_API 5xx's or times out.
+# Set blank to disable fallback.
+MEMPOOL_API_BACKUP=https://blockstream.info/api
+
+# Per-script-type vbyte sizes. Calibrated against real mainnet transactions
+# (see nostrmix-status.md vsize-accuracy fixtures) and rounded up to nearest
+# 5 for a small fee buffer. Operators rarely need to override these; the
+# defaults are the consensus values for single-sig spends and a conservative
+# 2-of-3 figure for p2sh / p2wsh.
+P2PKH_INPUT_VSIZE=150
+P2SH_INPUT_VSIZE=135
+P2SH_P2WPKH_INPUT_VSIZE=95
+P2WPKH_INPUT_VSIZE=70
+P2WSH_INPUT_VSIZE=100
+P2TR_INPUT_VSIZE=60
+P2PKH_OUTPUT_VSIZE=35
+P2SH_OUTPUT_VSIZE=35
+P2SH_P2WPKH_OUTPUT_VSIZE=35
+P2WPKH_OUTPUT_VSIZE=35
+P2WSH_OUTPUT_VSIZE=45
+P2TR_OUTPUT_VSIZE=45
+TX_OVERHEAD_VSIZE=10
 
 # Database
 DB_PATH=./bot.db
