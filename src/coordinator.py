@@ -269,23 +269,35 @@ class Coordinator:
             if await self.db.is_blacklisted(npub_hex):
                 await self.nostr.send_dm(npub_hex, "You have been blacklisted from this bot.")
                 return
-            chosen_mix = await self._find_or_create_mix_for(peek_type)
-            if chosen_mix is None:
+
+            # S1 race guard: a concurrent /commit (or this same npub's
+            # second DM) may have inserted an 'interested' / 'committed'
+            # row while we were awaiting the chain RPC above. If so, do
+            # NOT spin up a fresh participant — let the main path attach
+            # the UTXOs to the existing row instead.
+            race_participants = await self.db.get_participants_by_npub(npub_hex)
+            race_active = [p for p in race_participants
+                           if p["state"] in ("interested", "committed")]
+            if race_active:
+                active = race_active
+            else:
+                chosen_mix = await self._find_or_create_mix_for(peek_type)
+                if chosen_mix is None:
+                    await self.nostr.send_dm(
+                        npub_hex, "No compatible mix available — try /list and /join.",
+                    )
+                    return
+                identity = await self.nostr.get_identity(npub_hex)
+                lud16 = identity["lud16"] if identity else ""
+                await self.db.add_participant(chosen_mix, npub_hex, lud16)
                 await self.nostr.send_dm(
-                    npub_hex, "No compatible mix available — try /list and /join.",
+                    npub_hex,
+                    f"Added you to mix {chosen_mix} ({peek_type}). Processing your UTXOs...",
                 )
-                return
-            identity = await self.nostr.get_identity(npub_hex)
-            lud16 = identity["lud16"] if identity else ""
-            await self.db.add_participant(chosen_mix, npub_hex, lud16)
-            await self.nostr.send_dm(
-                npub_hex,
-                f"Added you to mix {chosen_mix} ({peek_type}). Processing your UTXOs...",
-            )
-            participants = await self.db.get_participants_by_npub(npub_hex)
-            active = [p for p in participants if p["state"] in ("interested", "committed")]
-            if not active:
-                return  # defensive
+                participants = await self.db.get_participants_by_npub(npub_hex)
+                active = [p for p in participants if p["state"] in ("interested", "committed")]
+                if not active:
+                    return  # defensive
 
         pid = active[0]["id"]
         mix_id = active[0]["mix_id"]

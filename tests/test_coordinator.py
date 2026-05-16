@@ -1581,3 +1581,440 @@ class TestBroadcast409TreatedAsSuccess:
             finally:
                 await cm.close()
         assert result is None
+
+
+# ============================================================================
+# Wave 4 — coverage backfill (state-machine paths that nothing else exercised)
+# ============================================================================
+#
+# Up to this point most coordinator tests stop at the boundary of PSBT signing
+# because we couldn't easily produce real signed PSBTs. Wave 3 added the
+# libsecp256k1 bridge + KeyStore-based signing helpers, so the broadcast,
+# sweep, and chunked-reassembly paths are now reachable end-to-end without
+# mocking psbt_mgr.
+
+
+async def _seed_signed_mix(coord, db, *, mix_id: str, signing_keys: list,
+                           output_size: int = 100_000):
+    """Run _assemble_psbt for the given mix, then for each participant
+    sign the resulting skeleton with their key and store as psbt_returned.
+    Mirrors the on-chain flow: assembly → distribute → each signs → returns.
+
+    Returns the list of participant ids in the same order as signing_keys."""
+    from bitcointx.core import b2x
+    from bitcointx.core.key import KeyStore
+    from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+
+    active = await db.get_participants_by_mix(mix_id)
+    pid_order = [p["id"] for p in active]
+    await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+    for pid, k in zip(pid_order, signing_keys):
+        rd = await db.get_psbt_round(mix_id, pid, 1)
+        assert rd and rd["psbt_sent"], f"no skeleton stored for {pid}"
+        psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(rd["psbt_sent"]))
+        psbt.sign(KeyStore.from_iterable([k]))
+        signed_hex = b2x(psbt.serialize())
+        await db.update_psbt_round(rd["id"], psbt_returned=signed_hex, psbt_valid=True)
+        await db.update_participant(pid, state="signed")
+    return pid_order
+
+
+async def _make_2p_signing_mix(coord, db):
+    """Bootstrap a 2-participant mix in 'assembling' state with real keys
+    and one p2wpkh input + 2 output addresses each. Returns
+    (mix_id, [pid_a, pid_b], [key_a, key_b])."""
+    from bitcointx.core.key import CKey
+    from bitcointx.wallet import P2WPKHBitcoinAddress
+
+    k_a = CKey(b"\x10" * 32)
+    k_b = CKey(b"\x20" * 32)
+    spk_a = P2WPKHBitcoinAddress.from_pubkey(k_a.pub).to_scriptPubKey().hex()
+    spk_b = P2WPKHBitcoinAddress.from_pubkey(k_b.pub).to_scriptPubKey().hex()
+
+    mix_id = await db.create_mix(
+        output_size=100_000, min_participants=2,
+        max_participants=10, fee_per_element=100,
+    )
+    await db.update_mix(
+        mix_id, state="assembling", fee_rate=30,
+        input_type="p2wpkh", output_type="p2wpkh",
+    )
+
+    pid_a = await db.add_participant(mix_id, "npub_bc_a", "a@x")
+    await db.update_participant(pid_a, state="paid", fee_paid=500)
+    await db.add_utxo(pid_a, "aa" * 32, 0, 250_000, "p2wpkh", spk_a)
+    for addr in P2WPKH_ADDRS[0:2]:
+        await db.add_output(pid_a, addr, 100_000)
+
+    pid_b = await db.add_participant(mix_id, "npub_bc_b", "b@x")
+    await db.update_participant(pid_b, state="paid", fee_paid=500)
+    await db.add_utxo(pid_b, "bb" * 32, 0, 250_000, "p2wpkh", spk_b)
+    for addr in P2WPKH_ADDRS[2:4]:
+        await db.add_output(pid_b, addr, 100_000)
+
+    return mix_id, [pid_a, pid_b], [k_a, k_b]
+
+
+# --- _combine_and_broadcast: real PSBTs, real combine+finalize, mocked chain ---
+
+
+class TestCombineAndBroadcast:
+    @pytest.mark.asyncio
+    async def test_happy_path_marks_mix_broadcast_and_dms_signers(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = "real_txid_abcd0123"
+
+            signed = await db.get_participants_by_mix(mix_id)
+            signed = [p for p in signed if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "broadcast"
+            assert mix_after["broadcast_txid"] == "real_txid_abcd0123"
+            assert mix_after["broadcast_tx_hex"], "raw tx hex not persisted"
+            # broadcast_tx was called with the finalized hex
+            assert len(chain.broadcast_calls) == 1
+            assert chain.broadcast_calls[0] == mix_after["broadcast_tx_hex"]
+            # Both signers got the broadcast DM with the txid
+            for npub in ("npub_bc_a", "npub_bc_b"):
+                dms = [m for r, m in nostr.sent_dms if r == npub]
+                assert any("real_txid_abcd0123" in m for m in dms), (
+                    f"no broadcast DM to {npub}: {dms}"
+                )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_chain_broadcast_returning_none_cancels_and_refunds(self):
+        """If chain.broadcast_tx returns None (all endpoints exhausted with
+        non-recoverable errors), the mix must cancel and refund. Verifies
+        we DON'T mark broadcast state without a txid."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = None  # simulate hard failure
+
+            signed = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "cancelled"
+            assert mix_after["broadcast_txid"] is None
+            # Refunds attempted for both
+            assert {r[0] for r in lightning.refunds} == {"a@x", "b@x"}
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unsigned_participant_blocks_finalize_and_cancels(self):
+        """If even one participant's psbt_returned doesn't actually have a
+        signature (e.g. they replayed the skeleton), finalize returns None
+        and the mix cancels — verifying we don't broadcast a junk tx."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            # Sign only with key_a; pid_b's "psbt_returned" will be the
+            # skeleton (no sig). _seed_signed_mix sees both pids; bypass it.
+            from bitcointx.core import b2x
+            from bitcointx.core.key import KeyStore
+            from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+            for pid, k in zip(pids, keys):
+                rd = await db.get_psbt_round(mix_id, pid, 1)
+                if k is keys[0]:
+                    psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(rd["psbt_sent"]))
+                    psbt.sign(KeyStore.from_iterable([k]))
+                    await db.update_psbt_round(
+                        rd["id"], psbt_returned=b2x(psbt.serialize()), psbt_valid=True,
+                    )
+                else:
+                    # Return the skeleton unchanged — no sig.
+                    await db.update_psbt_round(
+                        rd["id"], psbt_returned=rd["psbt_sent"], psbt_valid=True,
+                    )
+                await db.update_participant(pid, state="signed")
+
+            signed = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "cancelled"
+            assert chain.broadcast_calls == [], "broadcast must not be attempted"
+        finally:
+            await db.close()
+
+
+# --- _broadcast_sweep ---
+
+
+class TestBroadcastSweep:
+    @pytest.mark.asyncio
+    async def test_confirmed_tx_triggers_destroy_mix_data(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Mix is in broadcast state with a known txid.
+            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            await db.update_mix(
+                mix_id, state="broadcast",
+                broadcast_txid="finaltxid_xyz",
+                broadcast_tx_hex="deadbeef" * 8,
+            )
+            pid = await db.add_participant(mix_id, "npub_signed", "")
+            await db.update_participant(pid, state="signed")
+            await db.add_utxo(pid, TXID[0], 0, 100_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+
+            chain.confirmed["finaltxid_xyz"] = True
+
+            # Force the sweep window to be open.
+            await db.set_setting("last_broadcast_check_unix", "0")
+            await coord._broadcast_sweep(int(time.time()))
+
+            # All trace gone except blacklist (which we didn't add to).
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after is None, "mix should be wiped after confirmation"
+            assert await db.get_participant(pid) is None
+            assert await db.get_utxos_by_participant(pid) == []
+            # And the signer got a confirmation DM.
+            dms = [m for r, m in nostr.sent_dms if r == "npub_signed"]
+            assert any("finaltxid_xyz" in m for m in dms)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_triggers_rebroadcast(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            await db.update_mix(
+                mix_id, state="broadcast",
+                broadcast_txid="pending_txid",
+                broadcast_tx_hex="cafef00d" * 8,
+            )
+
+            chain.confirmed["pending_txid"] = False
+
+            await db.set_setting("last_broadcast_check_unix", "0")
+            await coord._broadcast_sweep(int(time.time()))
+
+            # State stays 'broadcast' (we're still waiting), and the chain
+            # was asked to re-broadcast the same hex.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "broadcast"
+            assert len(chain.broadcast_calls) == 1
+            assert chain.broadcast_calls[0] == "cafef00d" * 8
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sweep_throttled_by_interval(self):
+        """The sweep tracks last-check in the settings table and only runs
+        once per BROADCAST_CHECK_INTERVAL_HOURS. If the interval hasn't
+        elapsed, the sweep is a no-op even if there's a pending broadcast."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            await db.update_mix(
+                mix_id, state="broadcast",
+                broadcast_txid="any", broadcast_tx_hex="00" * 16,
+            )
+            chain.confirmed["any"] = True
+
+            # Set last-check to "just now" — well within the interval.
+            now = int(time.time())
+            await db.set_setting("last_broadcast_check_unix", str(now - 60))
+            await coord._broadcast_sweep(now)
+
+            # No confirmation check or destroy happened.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after is not None
+            assert mix_after["state"] == "broadcast"
+        finally:
+            await db.close()
+
+
+# --- _post_daily_announcement happy path (S3 covered the empty-mix case) ---
+
+
+class TestDailyAnnouncementWithExistingMixes:
+    @pytest.mark.asyncio
+    async def test_existing_mixes_each_get_an_announcement_row(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            ids = []
+            for _ in range(2):
+                mid = await db.create_mix(output_size=100_000, min_participants=3)
+                await db.update_mix(mid, state="collecting")
+                ids.append(mid)
+
+            await coord._post_daily_announcement()
+
+            for mid in ids:
+                anns = await db.get_announcements_for_mix(mid)
+                assert len(anns) == 1, f"mix {mid} missing announcement"
+        finally:
+            await db.close()
+
+
+# --- _cmd_exit_mix plan-§3g coverage (single-mix refund + 0-mix done) ---
+
+
+class TestExitMixSingleAndNone:
+    @pytest.mark.asyncio
+    async def test_single_mix_paid_refunds_and_dms(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000, min_participants=3)
+            pid = await db.add_participant(mix_id, "npub_solo", "solo@x")
+            await db.update_participant(pid, state="paid", fee_paid=1000)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_solo"), "npub_solo", None)
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "cancelled"
+            # Refund was attempted for the participant's lud16.
+            assert any(r[0] == "solo@x" for r in lightning.refunds)
+            dms = [m for r, m in nostr.sent_dms if r == "npub_solo"]
+            assert any("refund" in m.lower() or "sorry" in m.lower() for m in dms)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_not_in_any_mix_says_done(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await coord._cmd_exit_mix(FakeCtx("npub_orphan"), "npub_orphan", None)
+            dms = [m for r, m in nostr.sent_dms if r == "npub_orphan"]
+            assert dms == ["Done."], f"expected single 'Done.' DM, got {dms}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_mix_with_matching_id_exits_just_that_one(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=100_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=100_000, min_participants=3)
+            pid_a = await db.add_participant(mix_a, "npub_mm", "mm@x")
+            pid_b = await db.add_participant(mix_b, "npub_mm", "mm@x")
+            await db.update_participant(pid_a, state="paid", fee_paid=500)
+            await db.update_participant(pid_b, state="paid", fee_paid=500)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_mm"), "npub_mm", mix_a)
+
+            # Only the named mix's participant is cancelled.
+            assert (await db.get_participant(pid_a))["state"] == "cancelled"
+            assert (await db.get_participant(pid_b))["state"] == "paid"
+        finally:
+            await db.close()
+
+
+# --- chunked PSBT reassembly end-to-end ---
+
+
+class TestChunkedReassembly:
+    @pytest.mark.asyncio
+    async def test_two_chunks_assemble_and_get_accepted(self):
+        """Submit a real signed PSBT in two halves via /psbt_chunk. The
+        reassembled hex should be accepted as a normal /psbt_accept and
+        the participant should advance to 'signed'."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            from bitcointx.core import b2x
+            from bitcointx.core.key import CKey, KeyStore
+            from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+            from bitcointx.wallet import P2WPKHBitcoinAddress
+
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            # Roll the participants back to 'signing' so /psbt_accept can
+            # advance them; clear their stored psbt_returned so the test
+            # exercises the reassembly + accept flow fresh.
+            for pid in pids:
+                rd = await db.get_psbt_round(mix_id, pid, 1)
+                await db.update_psbt_round(rd["id"], psbt_returned=None, psbt_valid=None)
+                await db.update_participant(pid, state="signing")
+
+            # Construct the signed PSBT for participant A on the fly so we
+            # have its hex to chunk.
+            rd_a = await db.get_psbt_round(mix_id, pids[0], 1)
+            psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(rd_a["psbt_sent"]))
+            psbt.sign(KeyStore.from_iterable([keys[0]]))
+            signed_hex = b2x(psbt.serialize())
+
+            mid = len(signed_hex) // 2
+            chunks = [signed_hex[:mid], signed_hex[mid:]]
+
+            # Chunk 1: just buffered.
+            await coord._cmd_accept_psbt_chunk(
+                FakeCtx("npub_bc_a"), "npub_bc_a", 1, 2, chunks[0],
+            )
+            assert (await db.get_participant(pids[0]))["state"] == "signing"
+
+            # Chunk 2: triggers reassembly → /psbt_accept → 'signed'.
+            await coord._cmd_accept_psbt_chunk(
+                FakeCtx("npub_bc_a"), "npub_bc_a", 2, 2, chunks[1],
+            )
+            assert (await db.get_participant(pids[0]))["state"] == "signed"
+        finally:
+            await db.close()
+
+
+# --- S1: auto-mix-on-commit must re-check during the chain.lookup_txout await ---
+
+
+class TestAutoMixRaceGuard:
+    """S1: the auto-mix-on-commit branch in _cmd_commit_utxos awaits
+    chain.lookup_txout BEFORE adding the participant. During that await,
+    a concurrent handler (or this same npub's second DM) could insert
+    an 'interested' / 'committed' participant. Without a re-check the
+    branch would happily add a second participant for the same npub,
+    bypassing the one-at-a-time invariant that /join enforces.
+
+    Verified by intercepting lookup_txout to insert a competing
+    participant mid-await — what a true asyncio race would look like."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_participant_insertion_does_not_duplicate(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "auto_mix_race"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000)
+
+            # Wrap lookup_txout to inject a competing participant
+            # during the await — simulating a concurrent /commit handler
+            # that ran while our handler was waiting on the chain RPC.
+            original_lookup = chain.lookup_txout
+            injected = {"done": False}
+
+            async def race_lookup(txid, vout):
+                if not injected["done"]:
+                    injected["done"] = True
+                    other_mix = await db.create_mix(
+                        output_size=1_000_000, min_participants=3,
+                    )
+                    await db.add_participant(other_mix, npub, "")
+                return await original_lookup(txid, vout)
+
+            chain.lookup_txout = race_lookup
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            # Exactly one participant row should exist for npub.
+            allp = await db.get_participants_by_npub(npub)
+            assert len(allp) == 1, (
+                f"S1 regression: auto-mix added a duplicate participant. "
+                f"Rows: {[(p['mix_id'], p['state']) for p in allp]}"
+            )
+        finally:
+            await db.close()
