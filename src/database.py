@@ -181,14 +181,15 @@ class Database:
     # --- UTXO CRUD ---
 
     async def add_utxo(self, participant_id: str, txid: str, vout: int,
-                       amount: int, script_type: str = "p2wpkh") -> str:
+                       amount: int, script_type: str = "p2wpkh",
+                       scriptpubkey: str = "") -> str:
         uid = _hex_id()
         now = _now()
         await self._execute(
             """INSERT INTO utxos (id, participant_id, txid, vout, amount,
-               script_type, created_at_unix)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (uid, participant_id, txid, vout, amount, script_type, now),
+               script_type, scriptpubkey, created_at_unix)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (uid, participant_id, txid, vout, amount, script_type, scriptpubkey, now),
         )
         await self._conn.commit()
         return uid

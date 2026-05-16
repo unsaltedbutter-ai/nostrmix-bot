@@ -2,6 +2,15 @@
 
 Uses python-bitcointx for PSBT operations (BIP-174).
 Per-script-type vbyte sizes for accurate vsize estimation.
+
+CRITICAL ARCHITECTURE NOTES:
+- build_skeleton creates the unsigned CTransaction with ALL inputs/outputs in one
+  CMutableTransaction, then wraps each input in a PSBT_Input with its prevout UTXO
+  (CTxOut) so that extract_transaction() can finalize the combine.
+- Participants receive the skeleton, sign their OWN inputs, return a PSBT with
+  partial_sigs. combine() merges partial_sigs per-input across all returned PSBTs.
+- finalize() calls extract_transaction() which internally signs using the combined
+  partial_sigs and returns a spendable CTransaction hex for broadcast.
 """
 
 from __future__ import annotations
@@ -26,9 +35,6 @@ from bitcointx.core.psbt import (
 )
 
 
-# Vsize defaults and calculation are in vsize.py (shared by PSBTManager and FeeEngine)
-
-
 class PSBTManager:
     """Build, validate, and combine PSBTs for coinjoin."""
 
@@ -42,7 +48,7 @@ class PSBTManager:
         self._vsize = VsizeCalculator(input_vsize_map, output_vsize_map, overhead)
 
     def _parse_address(self, address: str) -> CBitcoinAddress:
-        """Parse a bitcoin address."""
+        """Parse a bitcoin address from string."""
         return CBitcoinAddress(address)
 
     def _address_type(self, address: str) -> str:
@@ -57,55 +63,72 @@ class PSBTManager:
         else:
             return "p2wpkh"
 
-    # --- Vsize estimation (per-script-type) — delegates to VsizeCalculator ---
+    # --- Vsize estimation — delegates to VsizeCalculator ---
 
     def input_vsize(self, script_type: str) -> int:
-        """Look up input vbytes for a script type. Falls back to p2wpkh."""
         return self._vsize.input_vsize(script_type)
 
     def output_vsize(self, script_type: str) -> int:
-        """Look up output vbytes for a script type. Falls back to p2wpkh."""
         return self._vsize.output_vsize(script_type)
 
     def estimate_vsize(self, inputs_by_type: Dict[str, int],
                        outputs_by_type: Dict[str, int]) -> int:
-        """Estimate transaction vsize using per-script-type counts."""
         return self._vsize.estimate_total_vsize(inputs_by_type, outputs_by_type)
 
     # --- Build Skeleton PSBT ---
 
     def build_skeleton(self, inputs: List[Dict], outputs: List[Dict]) -> str:
-        """Build a skeleton PSBT.
+        """Build a skeleton PSBT with prevout UTXO for each input.
 
         Args:
-            inputs: list with keys: txid, vout, amount, script_type
+            inputs: list with keys: txid, vout, amount, script_type, scriptpubkey
+                The scriptpubkey hex is the actual prevout script from chain
+                lookup. Required so participants can sign (they need the
+                prevout script for sighash) and finalize can extract.
             outputs: list with keys: address, amount
 
         Returns: hex-encoded PSBT.
+
+        NOTE: The PSBT constructor creates PSBT_Input/PSBT_Output automatically
+        from the unsigned_tx. We set UTXOs on inputs separately via set_utxo()
+        so extract_transaction() can finalize the combined PSBT.
         """
-        psbt_inps: List[PSBT_Input] = []
-        psbt_outs: List[PSBT_Output] = []
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 
+        # 1. Build the unsigned transaction (CMutableTransaction).
+        #    This is the transaction skeleton — all inputs (vin) with prevout
+        #    references and outputs (vout) with amounts + recipient scripts.
+        vin = []
         for inp in inputs:
-            txid_hex = inp["txid"]
-            vout = inp["vout"]
-            txid_bytes = bytes.fromhex(txid_hex)[::-1]
-            outpoint = COutPoint(txid_bytes, vout)
-            txin = CMutableTxIn(outpoint)
-            psbt_in = PSBT_Input(txin)
-            psbt_in.sighash_type = 0x01
-            psbt_inps.append(psbt_in)
+            txid_bytes = bytes.fromhex(inp["txid"])[::-1]
+            vin.append(CMutableTxIn(COutPoint(txid_bytes, inp["vout"])))
 
+        vout = []
         for out in outputs:
-            address = out["address"]
-            amount = out["amount"]
-            addr = self._parse_address(address)
-            pay_script = addr.to_scriptpubkey()
-            txout = CMutableTxOut(amount, pay_script)
-            psbt_out = PSBT_Output(txout)
-            psbt_outs.append(psbt_out)
+            addr = self._parse_address(out["address"])
+            vout.append(CMutableTxOut(out["amount"], addr.to_scriptpubkey()))
 
-        psbt = PartiallySignedBitcoinTransaction(psbt_inps, psbt_outs)
+        unsigned_tx = CMutableTransaction(vin, vout)
+
+        # 2. Build PSBT from unsigned_tx — constructor creates PSBT_Input and
+        #    PSBT_Output objects for each vin/vout entry automatically.
+        psbt = PartiallySignedBitcoinTransaction(unsigned_tx=unsigned_tx)
+
+        # 3. Set the actual prevout UTXO on each input so that:
+        #    - participants can sign (need prevout script to compute sighash)
+        #    - finalize (extract_transaction) can convert partial_sigs to final
+        #    The prevout script comes from the chain lookup at /commit time,
+        #    stored in utxos.scriptpubkey via the coordinator.
+        for i, inp_data in enumerate(inputs):
+            scriptpubkey_hex = inp_data.get("scriptpubkey", "")
+            if scriptpubkey_hex:
+                prevout_script = CScript(bytes.fromhex(scriptpubkey_hex))
+                psbt.inputs[i].set_utxo(
+                    CTxOut(inp_data["amount"], prevout_script),
+                    unsigned_tx,
+                )
+            psbt.inputs[i].sighash_type = 0x01
+
         return b2x(psbt.serialize())
 
     # --- Validate Returned PSBT ---
@@ -125,17 +148,17 @@ class PSBTManager:
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 
         try:
-            skeleton_bytes = bytes.fromhex(skeleton_hex)
-            skeleton_psbt = PartiallySignedBitcoinTransaction(skeleton_bytes)
+            skeleton_psbt = PartiallySignedBitcoinTransaction.from_binary(
+                bytes.fromhex(skeleton_hex)
+            )
+            returned_psbt = PartiallySignedBitcoinTransaction.from_binary(
+                bytes.fromhex(returned_hex)
+            )
 
-            returned_bytes = bytes.fromhex(returned_hex)
-            returned_psbt = PartiallySignedBitcoinTransaction(returned_bytes)
-
-            # Check input count matches
+            # Check input/output counts match
             if len(returned_psbt.inputs) != len(skeleton_psbt.inputs):
                 return False, f"Input count changed: {len(returned_psbt.inputs)} vs {len(skeleton_psbt.inputs)}"
 
-            # Check output count matches
             if len(returned_psbt.outputs) != len(skeleton_psbt.outputs):
                 return False, f"Output count changed: {len(returned_psbt.outputs)} vs {len(skeleton_psbt.outputs)}"
 
@@ -143,11 +166,12 @@ class PSBTManager:
             for i, (skel_out, ret_out) in enumerate(zip(skeleton_psbt.outputs, returned_psbt.outputs)):
                 if ret_out.amount != skel_out.amount:
                     return False, f"Output #{i} amount changed: {ret_out.amount} vs {skel_out.amount}"
-
                 if ret_out.script_pubkey != skel_out.script_pubkey:
                     return False, f"Output #{i} address changed"
 
-            # Check participant has signed their inputs
+            # Check participant has signed at least their input count
+            # NOTE: for coinjoin we cannot verify WHICH inputs they signed
+            # because we don't know their pubkey. We only check count.
             signed_count = sum(1 for inp in returned_psbt.inputs if inp.partial_sigs)
             if signed_count < participant_input_count:
                 return False, f"Only {signed_count}/{participant_input_count} inputs signed"
@@ -162,48 +186,53 @@ class PSBTManager:
     def combine_psbts(self, psbt_hexes: List[str]) -> str:
         """Combine multiple signed PSBTs into one final PSBT.
 
-        Uses bitcointx's built-in PSBT combine/merge to aggregate
-        partial signatures from all participants.
+        Uses bitcointx's built-in .combine() which clones the base PSBT
+        and merges partial_sigs from each subsequent PSBT per-input.
 
         Args:
             psbt_hexes: hex-encoded PSBTs from each participant
 
-        Returns: hex-encoded final PSBT
+        Returns: hex-encoded combined PSBT
         """
-        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
-
         if not psbt_hexes:
             return ""
 
-        # Parse first PSBT as base
-        base_bytes = bytes.fromhex(psbt_hexes[0])
-        base_psbt = PartiallySignedBitcoinTransaction(base_bytes)
+        # Parse first PSBT as base (use from_binary — constructor is keyword-only)
+        base_psbt = PartiallySignedBitcoinTransaction.from_binary(
+            bytes.fromhex(psbt_hexes[0])
+        )
 
-        # Combine subsequent PSBTs into the base using .combine() which
-        # clones self and merges the other, returning a new combined PSBT
-        # with all partial signatures aggregated.
+        # Combine subsequent PSBTs into the base
         combined = base_psbt
         for hex_str in psbt_hexes[1:]:
-            other_bytes = bytes.fromhex(hex_str)
-            other_psbt = PartiallySignedBitcoinTransaction(other_bytes)
+            other_psbt = PartiallySignedBitcoinTransaction.from_binary(
+                bytes.fromhex(hex_str)
+            )
             combined = combined.combine(other_psbt)
 
         return b2x(combined.serialize())
 
-    # --- Finalize & Extract ---
+    # --- Finalize & Extract Raw Transaction ---
 
     def finalize(self, combined_psbt_hex: str) -> Optional[str]:
-        """Finalize the PSBT and extract raw transaction hex.
+        """Finalize the combined PSBT and extract the raw transaction hex.
+
+        Internally calls extract_transaction() which:
+        1. Verifies all inputs have complete partial_sigs (converted to final)
+        2. Copies final_script_sig/final_script_witness to the tx
+        3. Returns the immutable CTransaction
 
         Returns: hex-encoded raw transaction, or None on failure.
         """
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 
         try:
-            combined_bytes = bytes.fromhex(combined_psbt_hex)
-            combined_psbt = PartiallySignedBitcoinTransaction(combined_bytes)
-            return b2x(combined_psbt.serialize())
-        except Exception:
+            combined_psbt = PartiallySignedBitcoinTransaction.from_binary(
+                bytes.fromhex(combined_psbt_hex)
+            )
+            final_tx = combined_psbt.extract_transaction()
+            return b2x(final_tx.serialize())
+        except Exception as e:
             return None
 
     # --- Chunking ---
@@ -216,7 +245,3 @@ class PSBTManager:
             return [psbt_hex]
         chunk_size = self.MAX_PSBT_HEX_SIZE
         return [psbt_hex[i:i + chunk_size] for i in range(0, len(psbt_hex), chunk_size)]
-
-    # --- Vsize Estimation ---
-    # Delegates to VsizeCalculator via the methods above.
-    # No legacy scalar implementation needed — all callers use per-type dicts.

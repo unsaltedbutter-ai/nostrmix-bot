@@ -41,6 +41,7 @@ CREATE TABLE utxos (
     vout            INTEGER NOT NULL,
     amount          INTEGER NOT NULL,           -- sats
     script_type     TEXT,                        -- p2wpkh | p2tr | p2pkh
+    scriptpubkey    TEXT,                        -- hex of the prevout script (from chain lookup)
     is_used         BOOLEAN DEFAULT 0,
     created_at_unix INTEGER NOT NULL
 );

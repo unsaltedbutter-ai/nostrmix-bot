@@ -215,14 +215,16 @@ class Coordinator:
 
             amount = txout.get("value", 0)
             script_type = txout.get("scriptpubkey_type", "p2wpkh")
+            scriptpubkey = txout.get("scriptpubkey", "")
 
             # Verify address type matches mix
             mix = await self.db.get_mix(mix_id)
             # For now we only accept p2wpkh
 
-            # Add UTXO to database
-            await self.db.add_utxo(pid, txid, vout, amount, script_type)
-            valid_utxos.append({"txid": txid, "vout": vout, "amount": amount, "script_type": script_type})
+            # Add UTXO to database — include the actual prevout script hex
+            # so build_skeleton can create a valid CTxOut for the PSBT input.
+            await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
+            valid_utxos.append({"txid": txid, "vout": vout, "amount": amount, "script_type": script_type, "scriptpubkey": scriptpubkey})
             total_sats += amount
 
         if not valid_utxos:
@@ -640,6 +642,7 @@ class Coordinator:
                     "vout": u["vout"],
                     "amount": u["amount"],
                     "script_type": u.get("script_type", "p2wpkh"),
+                    "scriptpubkey": u.get("scriptpubkey", ""),
                 })
 
             for o in outputs:
