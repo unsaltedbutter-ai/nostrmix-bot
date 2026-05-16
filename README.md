@@ -16,6 +16,7 @@ python src/main.py
 ## Prerequisites
 
 - Python 3.12+ (uses Homebrew on macOS)
+- `libsecp256k1` (system library — see Install)
 - Nostr keypair (nsec) for the bot
 - LNURL provider pubkey for zap validation
 - BTCPay Server (optional, for refunds)
@@ -23,6 +24,13 @@ python src/main.py
 ## Install
 
 ```bash
+# 1. System dep — libsecp256k1. Needed by the test suite (real ECDSA
+#    signing of PSBTs); the bot's runtime doesn't strictly need it but
+#    it's harmless to install regardless.
+brew install secp256k1                  # macOS
+# or: sudo apt install libsecp256k1-dev # debian/ubuntu
+
+# 2. Python deps
 cd ~/Documents/nostrmix-bot
 python3.12 -m venv venv
 source venv/bin/activate

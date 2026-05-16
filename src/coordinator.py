@@ -683,12 +683,14 @@ class Coordinator:
                     mix = m
                     break
             else:
-                # No match — list the mixes they're in
+                # No match — list the mixes they're in. Use the first as the
+                # example mix-id in the prompt so the user has something
+                # concrete to copy/paste.
                 names = [p["mix_id"] for p in active]
                 await self.nostr.send_dm(
                     npub_hex,
                     f"You are a part of {len(active)} mixes: {' & '.join(names)}. "
-                    f"Say /cancel {name} to exit one."
+                    f"Say /cancel {names[0]} (or another mix name) to exit one."
                 )
                 return
         else:
@@ -697,7 +699,7 @@ class Coordinator:
             await self.nostr.send_dm(
                 npub_hex,
                 f"You are a part of {len(active)} mixes: {' & '.join(names)}. "
-                f"Say /cancel {name} to exit one."
+                f"Say /cancel {names[0]} (or another mix name) to exit one."
             )
             return
 
@@ -732,7 +734,14 @@ class Coordinator:
         awaiting = [p for p in participants if p["state"] == "committed"]
 
         if not awaiting:
-            # No pending fee — maybe a donation, ignore
+            # No pending fee — could be a donation, a late zap after we already
+            # marked the participant paid, or a zap from an npub we've never
+            # met. Log so the operator can audit the bot's Lightning inflows
+            # against expected service fees.
+            logger.info(
+                "Unmatched zap from %s for %d sats — no committed participant; ignored",
+                _bech32_npub(npub_hex), amount_sats,
+            )
             return
 
         pid = awaiting[0]["id"]
@@ -898,28 +907,22 @@ class Coordinator:
                 self.parser.format_psbt_request(mix_id, self.cfg.SIGNING_DEADLINE_HOURS),
             )
 
-    async def _assemble_psbt(self, mix: Dict, active: List[Dict]):
-        """Build the PSBT skeleton and send to all paid participants.
+    async def _gather_assembly_data(self, active: List[Dict]) -> Tuple[
+            List[Dict], List[Dict], Dict[str, List[str]], Dict[str, List[int]]]:
+        """Build the four parallel structures _assemble_psbt needs:
 
-        Each participant's outputs are sized as:
-            equal_outputs:  num_equal * output_size  (size set by the mix)
-            change_output:  total_inputs - num_equal*output_size - fee_share
+        - all_inputs: positional list fed to build_skeleton
+        - participants_data: list fed to fee_engine.calculate_all_fees
+        - addrs_by_pid: each participant's addresses (used to lay out outputs)
+        - input_indices_by_pid: which vin indices each participant must sign
+          (used by /psbt_accept's strict per-input check)
 
-        fee_share is each participant's proportional slice of the total miner
-        fee, computed from their input+output vsize contribution. The miner
-        fee is what makes (sum of inputs) > (sum of outputs); it must be left
-        on the table, not handed back as change.
+        Kept as a helper so the under-funded-drop retry path (C2) can re-build
+        these for the surviving participants without duplicating logic.
         """
-        mix_id = mix["id"]
-        output_size = mix["output_size"]
-        fee_rate = mix.get("fee_rate") or 30
-
-        # Gather inputs and per-participant fee-engine input.
         all_inputs: List[Dict] = []
-        participants_data: List[Dict] = []  # for calculate_all_fees
+        participants_data: List[Dict] = []
         addrs_by_pid: Dict[str, List[str]] = {}
-        # Per-participant indices into all_inputs, so /psbt_accept can later
-        # verify the participant signed THEIR inputs and nobody else's.
         input_indices_by_pid: Dict[str, List[int]] = {}
 
         for p in active:
@@ -961,7 +964,79 @@ class Coordinator:
             })
             addrs_by_pid[pid] = addrs_in_order
 
-        # Compute per-participant fee shares with the actual fee_rate.
+        return all_inputs, participants_data, addrs_by_pid, input_indices_by_pid
+
+    async def _drop_underfunded(self, p: Dict, mix_id: str):
+        """Refund + DM a participant whose allocation collapsed to 0 equal
+        outputs once the real miner fee was applied. C2 fix — the old code
+        cancelled the whole mix in this case."""
+        fee_paid = int(p.get("fee_paid") or 0)
+        lud16 = p.get("lightning_addr", "")
+        npub = p["npub_hex"]
+        if fee_paid > 0 and lud16:
+            refund_sats = max(
+                fee_paid * (100 - self.cfg.REFUND_KEEP_PERCENT) // 100,
+                max(fee_paid - self.cfg.REFUND_KEEP_MIN_SATS, 0),
+            )
+            await self.lightning.send_refund(lud16, refund_sats, reason="underfunded_dropped")
+            await self.db.update_participant(p["id"], state="refunded")
+            await self.nostr.send_dm(
+                npub,
+                f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
+                f"output plus your share of the miner fee. Refunded {refund_sats} sats.",
+            )
+        elif fee_paid > 0:
+            logger.error(
+                "Cannot refund dropped participant %s in mix %s: fee_paid=%d but "
+                "no lightning_addr. Sats stranded; operator must reconcile.",
+                _bech32_npub(npub), mix_id, fee_paid,
+            )
+            await self.db.update_participant(p["id"], state="cancelled")
+            await self.nostr.send_dm(
+                npub,
+                f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
+                f"output plus miner fees. We can't refund automatically (no Lightning "
+                f"address on file) — contact the operator to reclaim your {fee_paid} sats.",
+            )
+        else:
+            await self.db.update_participant(p["id"], state="cancelled")
+            await self.nostr.send_dm(
+                npub,
+                f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
+                f"output plus miner fees.",
+            )
+
+    async def _assemble_psbt(self, mix: Dict, active: List[Dict]):
+        """Build the PSBT skeleton and send to all paid participants.
+
+        Each participant's outputs are sized as:
+            equal_outputs:  num_equal * output_size  (size set by the mix)
+            change_output:  total_inputs - num_equal*output_size - fee_share
+
+        fee_share is each participant's proportional slice of the total miner
+        fee, computed from their input+output vsize contribution. The miner
+        fee is what makes (sum of inputs) > (sum of outputs); it must be left
+        on the table, not handed back as change.
+
+        Under-funded participants (those whose proportional fee_share would
+        push them below one equal output) are dropped + refunded, and the
+        fee math is re-run with the survivors. If too many drops would push
+        the mix below min_participants, fall back to cancelling the whole mix.
+        """
+        mix_id = mix["id"]
+        output_size = mix["output_size"]
+        fee_rate = mix.get("fee_rate") or 30
+
+        # Defensive: only assemble paid (or already-signing, for crash-resume)
+        # participants. The caller's `active` filter is loose ("not cancelled,
+        # not ghosted") — without this guard, a participant whose pay-timeout
+        # hasn't fired yet would be included with no zap on file.
+        active = [p for p in active if p["state"] in ("paid", "signing")]
+        min_part = mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT)
+
+        # First pass: gather + fee math.
+        all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
+            await self._gather_assembly_data(active)
         total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
             participants_data, output_size, fee_rate,
         )
@@ -970,17 +1045,52 @@ class Coordinator:
             await self._cancel_and_refund(mix, "invalid fee calculation")
             return
 
+        # C2: identify participants whose share would zero out their outputs.
+        # Drop them, refund, and retry with the survivors. One retry only —
+        # if survivors are STILL under-funded the situation is pathological
+        # (or the mix was misconfigured) and we cancel everyone.
+        underfunded_pids = {
+            rec["pid"] for rec, fr in zip(participants_data, fee_results)
+            if fr.num_equal_outputs == 0
+        }
+        if underfunded_pids:
+            survivors_active = []
+            for p in active:
+                if p["id"] in underfunded_pids:
+                    await self._drop_underfunded(p, mix_id)
+                else:
+                    survivors_active.append(p)
+
+            if len(survivors_active) < min_part:
+                # The whole mix can't proceed — fall back to the existing
+                # cancel-and-refund path for the survivors.
+                await self._cancel_and_refund(
+                    mix, "not enough participants after dropping under-funded",
+                )
+                return
+
+            # Rebuild with survivors and re-run the fee math.
+            active = survivors_active
+            all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
+                await self._gather_assembly_data(active)
+            total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
+                participants_data, output_size, fee_rate,
+            )
+
+            if total_miner_fee <= 0 or any(fr.num_equal_outputs == 0 for fr in fee_results):
+                # Still bad after one drop pass — give up to avoid a
+                # potentially-infinite cascade. Operator can dig into logs.
+                await self._cancel_and_refund(
+                    mix, "still under-funded after pruning",
+                )
+                return
+
         # Build all_outputs with the corrected per-participant amounts. Each
         # participant's change is reduced by their fee_share; if change drops
         # below MINIMUM_UTXO_SIZE it's dropped entirely (those sats become
         # additional miner fee, per the plan).
         all_outputs: List[Dict] = []
         for rec, fr in zip(participants_data, fee_results):
-            if fr.num_equal_outputs == 0:
-                await self._cancel_and_refund(
-                    mix, f"participant {rec['pid']} can't cover one equal output after fees",
-                )
-                return
             addrs = addrs_by_pid[rec["pid"]]
             for i in range(fr.num_equal_outputs):
                 all_outputs.append({"address": addrs[i], "amount": output_size})
@@ -1332,7 +1442,15 @@ class Coordinator:
         full_text = f"🌟 Open Mixes:\n\n{msg}\n\nUse /join <mix_name> to participate."
         event_id = await self.nostr.post_announcement(full_text)
 
-        for m in available:
+        # If we just auto-created a mix above, `available` was empty when we
+        # snapshotted it — make sure we record an announcement row for it too,
+        # otherwise the audit trail loses the very first announcement.
+        recorded_mixes = list(available)
+        if not recorded_mixes:
+            fresh = await self.db.get_mixes_by_state("collecting")
+            recorded_mixes = fresh
+
+        for m in recorded_mixes:
             await self.db.add_announcement(m["id"], event_id)
 
     # --- Cancel and Refund ---
@@ -1356,6 +1474,24 @@ class Coordinator:
                 await self.lightning.send_refund(p["lightning_addr"], refund_sats, reason=reason)
                 await self.db.update_participant(p["id"], state="refunded")
                 await self.nostr.send_dm(p["npub_hex"], f"Mix {mix_id} cancelled ({reason}). Refunded {refund_sats} sats.")
+            elif fee_paid > 0:
+                # Paid the service fee but we have no lud16 to refund to.
+                # Log loudly and DM the user so they know to contact us
+                # rather than silently writing off their sats.
+                logger.error(
+                    "Cannot refund participant %s for mix %s: fee_paid=%d but "
+                    "no lightning_addr on record. Sats are stranded; operator "
+                    "must reconcile manually.",
+                    _bech32_npub(p["npub_hex"]), mix_id, fee_paid,
+                )
+                await self.db.update_participant(p["id"], state="cancelled")
+                await self.nostr.send_dm(
+                    p["npub_hex"],
+                    f"Mix {mix_id} cancelled: {reason}. We can't refund "
+                    f"automatically because we don't have a Lightning address "
+                    f"for you. Please contact the operator to reclaim your "
+                    f"{fee_paid} sats.",
+                )
             else:
                 await self.db.update_participant(p["id"], state="cancelled")
                 await self.nostr.send_dm(p["npub_hex"], f"Mix {mix_id} cancelled: {reason}.")

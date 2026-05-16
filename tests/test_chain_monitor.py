@@ -355,6 +355,20 @@ def _offline_monitor() -> ChainMonitor:
     return ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
 
 
+def _real_tx_hex_and_txid():
+    """Build a minimal parseable tx (1 dummy input → 1 p2wpkh output).
+
+    Used by broadcast tests: after the C3 fix, broadcast_tx computes the
+    txid locally from the raw hex, so the input must actually deserialize."""
+    from bitcointx.core import CMutableTransaction, CTxIn, CTxOut, COutPoint, b2x
+    from bitcointx.core.script import CScript
+    tx = CMutableTransaction(
+        [CTxIn(COutPoint(b"\x11" * 32, 0))],
+        [CTxOut(50_000, CScript(b"\x00\x14" + b"\x00" * 20))],
+    )
+    return b2x(tx.serialize()), b2x(tx.GetTxid()[::-1])
+
+
 class TestBroadcastErrorPaths:
     """Mocked broadcast paths — covers the audit's #16 coverage gap.
 
@@ -367,71 +381,78 @@ class TestBroadcastErrorPaths:
     @pytest.mark.asyncio
     @respx.mock
     async def test_400_non_final_returns_none(self):
+        """400 is a hard rejection from the API; the backup will give the
+        same answer, so we don't waste a round-trip — return None."""
+        raw, _ = _real_tx_hex_and_txid()
         respx.post(f"{_OFFLINE_API}/tx").mock(
             return_value=httpx.Response(400, text="non-final")
         )
-        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
-            return_value=httpx.Response(400, text="non-final")
-        )
+        # No mock on backup; if we hit it, respx will raise.
         cm = _offline_monitor()
         try:
-            result = await cm.broadcast_tx("aabbccdd")
+            result = await cm.broadcast_tx(raw)
         finally:
             await cm.close()
         assert result is None
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_409_mempool_conflict_returns_none(self):
+    async def test_409_mempool_conflict_returns_local_txid(self):
+        """C3 contract: 409 means 'already in mempool' (typically OUR own
+        tx, e.g. a re-broadcast). Return the locally-computed txid so the
+        coordinator's sweep can confirm it instead of refunding participants."""
+        raw, expected_txid = _real_tx_hex_and_txid()
         respx.post(f"{_OFFLINE_API}/tx").mock(
-            return_value=httpx.Response(409, text="txn-mempool-conflict")
-        )
-        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
             return_value=httpx.Response(409, text="txn-mempool-conflict")
         )
         cm = _offline_monitor()
         try:
-            result = await cm.broadcast_tx("aabbccdd")
+            result = await cm.broadcast_tx(raw)
         finally:
             await cm.close()
-        assert result is None
+        assert result == expected_txid
 
     @pytest.mark.asyncio
     @respx.mock
     async def test_500_on_primary_falls_through_to_backup(self):
-        """Primary 5xx → try backup. If backup succeeds, we return its txid."""
+        """Primary 5xx → try backup. If backup succeeds with a body, use it;
+        otherwise fall back to the local txid (some Esplora variants return
+        an empty body on success)."""
+        raw, expected_txid = _real_tx_hex_and_txid()
         respx.post(f"{_OFFLINE_API}/tx").mock(
             return_value=httpx.Response(500, text="upstream error")
         )
         respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
-            return_value=httpx.Response(200, text="abc123txid")
+            return_value=httpx.Response(200, text=expected_txid)
         )
         cm = _offline_monitor()
         try:
-            result = await cm.broadcast_tx("aabbccdd")
+            result = await cm.broadcast_tx(raw)
         finally:
             await cm.close()
-        assert result == "abc123txid"
+        assert result == expected_txid
 
     @pytest.mark.asyncio
     @respx.mock
     async def test_timeout_falls_through_to_backup(self):
+        raw, expected_txid = _real_tx_hex_and_txid()
         respx.post(f"{_OFFLINE_API}/tx").mock(
             side_effect=httpx.ReadTimeout("timed out")
         )
         respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
-            return_value=httpx.Response(200, text="backup_txid_ok")
+            return_value=httpx.Response(200, text=expected_txid)
         )
         cm = _offline_monitor()
         try:
-            result = await cm.broadcast_tx("aabbccdd")
+            result = await cm.broadcast_tx(raw)
         finally:
             await cm.close()
-        assert result == "backup_txid_ok"
+        assert result == expected_txid
 
     @pytest.mark.asyncio
     @respx.mock
     async def test_both_endpoints_unreachable_returns_none(self):
+        raw, _ = _real_tx_hex_and_txid()
         respx.post(f"{_OFFLINE_API}/tx").mock(
             side_effect=httpx.ConnectError("dns")
         )
@@ -440,7 +461,18 @@ class TestBroadcastErrorPaths:
         )
         cm = _offline_monitor()
         try:
-            result = await cm.broadcast_tx("aabbccdd")
+            result = await cm.broadcast_tx(raw)
+        finally:
+            await cm.close()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_tx_hex_returns_none(self):
+        """Defensive: if we can't even parse our own tx_hex (caller passed
+        garbage), bail without contacting the network."""
+        cm = _offline_monitor()
+        try:
+            result = await cm.broadcast_tx("not-real-hex")
         finally:
             await cm.close()
         assert result is None

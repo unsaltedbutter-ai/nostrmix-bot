@@ -178,36 +178,76 @@ class PSBTManager:
                 bytes.fromhex(returned_hex)
             )
 
+            # NOTE: bitcointx's PSBT_BitcoinInput / PSBT_BitcoinOutput objects
+            # carry metadata (witness UTXOs, derivation paths) but NOT the
+            # outpoints or output amounts — those live on the unsigned_tx.
+            # Reading PSBT_Output.amount or .script_pubkey raises
+            # AttributeError, which the outer try/except would mask as a
+            # generic "Validation error". Use unsigned_tx.vin / vout.
+            skel_tx = skeleton_psbt.unsigned_tx
+            ret_tx = returned_psbt.unsigned_tx
+            if skel_tx is None or ret_tx is None:
+                return False, "Missing unsigned_tx on PSBT"
+
             # Check input/output counts match
-            if len(returned_psbt.inputs) != len(skeleton_psbt.inputs):
-                return False, f"Input count changed: {len(returned_psbt.inputs)} vs {len(skeleton_psbt.inputs)}"
+            if len(ret_tx.vin) != len(skel_tx.vin):
+                return False, f"Input count changed: {len(ret_tx.vin)} vs {len(skel_tx.vin)}"
 
-            if len(returned_psbt.outputs) != len(skeleton_psbt.outputs):
-                return False, f"Output count changed: {len(returned_psbt.outputs)} vs {len(skeleton_psbt.outputs)}"
+            if len(ret_tx.vout) != len(skel_tx.vout):
+                return False, f"Output count changed: {len(ret_tx.vout)} vs {len(skel_tx.vout)}"
 
-            # Check output addresses and amounts
-            for i, (skel_out, ret_out) in enumerate(zip(skeleton_psbt.outputs, returned_psbt.outputs)):
-                if ret_out.amount != skel_out.amount:
-                    return False, f"Output #{i} amount changed: {ret_out.amount} vs {skel_out.amount}"
-                if ret_out.script_pubkey != skel_out.script_pubkey:
+            # S7: each input must point at the same outpoint as the skeleton.
+            # A malicious participant could otherwise return a PSBT whose vin
+            # references a different prevout — combine_psbts wouldn't notice
+            # because it uses self's structure, but extract_transaction would
+            # later fail with no actionable error. Catch it up front.
+            for i, (skel_in, ret_in) in enumerate(zip(skel_tx.vin, ret_tx.vin)):
+                if (ret_in.prevout.hash != skel_in.prevout.hash
+                        or ret_in.prevout.n != skel_in.prevout.n):
+                    return False, f"Input #{i} outpoint changed"
+
+            # Check output amounts and scripts haven't been tampered with.
+            for i, (skel_out, ret_out) in enumerate(zip(skel_tx.vout, ret_tx.vout)):
+                if ret_out.nValue != skel_out.nValue:
+                    return False, f"Output #{i} amount changed: {ret_out.nValue} vs {skel_out.nValue}"
+                if ret_out.scriptPubKey != skel_out.scriptPubKey:
                     return False, f"Output #{i} address changed"
 
-            # Check signatures.
+            # Check signatures. Treat an input as "signed" either when new
+            # partial_sigs have appeared OR when the PSBT input has been
+            # finalized (bitcointx auto-finalizes per-input once it has all
+            # the sigs for that input — partial_sigs gets cleared and the
+            # final_script_witness / final_script_sig is set instead).
+            def _has_new_signature(skel_in, ret_in) -> bool:
+                skel_sigs = set(skel_in.partial_sigs.keys()) if skel_in.partial_sigs else set()
+                ret_sigs = set(ret_in.partial_sigs.keys()) if ret_in.partial_sigs else set()
+                if ret_sigs - skel_sigs:
+                    return True
+                # Finalized inputs surface as final_script_witness (segwit) or
+                # final_script_sig (legacy). Both are stronger than partial_sigs.
+                if getattr(ret_in, "final_script_witness", None) and not getattr(skel_in, "final_script_witness", None):
+                    return True
+                if getattr(ret_in, "final_script_sig", None) and not getattr(skel_in, "final_script_sig", None):
+                    return True
+                return False
+
             if participant_input_indices is None:
                 # Legacy: only count signed inputs (can be fooled by signing
                 # a peer's input).
-                signed_count = sum(1 for inp in returned_psbt.inputs if inp.partial_sigs)
+                signed_count = sum(
+                    1 for skel_in, ret_in
+                    in zip(skeleton_psbt.inputs, returned_psbt.inputs)
+                    if _has_new_signature(skel_in, ret_in)
+                )
                 if signed_count < participant_input_count:
                     return False, f"Only {signed_count}/{participant_input_count} inputs signed"
             else:
-                # Strict: each expected index must carry partial_sigs that
-                # weren't there in the skeleton; no other index may have new
-                # partial_sigs added by this participant.
+                # Strict: each expected index must carry a new signature (or
+                # be finalized); no other index may have a new signature added
+                # by this participant.
                 expected = set(participant_input_indices)
                 for i, (skel_in, ret_in) in enumerate(zip(skeleton_psbt.inputs, returned_psbt.inputs)):
-                    skel_sigs = set(skel_in.partial_sigs.keys()) if skel_in.partial_sigs else set()
-                    ret_sigs = set(ret_in.partial_sigs.keys()) if ret_in.partial_sigs else set()
-                    added = ret_sigs - skel_sigs
+                    added = _has_new_signature(skel_in, ret_in)
                     if i in expected and not added:
                         return False, f"Input #{i} (yours) was not signed"
                     if i not in expected and added:

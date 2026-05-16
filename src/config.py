@@ -124,6 +124,16 @@ class BotConfig:
         if self.MIN_PARTICIPANTS_DEFAULT < 2:
             self._values["MIN_PARTICIPANTS_DEFAULT"] = 2
 
+        # DEFAULT_OUTPUT_SIZE must be >= MINIMUM_UTXO_SIZE — otherwise every
+        # equal output we produce is below Bitcoin's standardness dust limit
+        # and no wallet would later be able to spend them.
+        if self.DEFAULT_OUTPUT_SIZE < self.MINIMUM_UTXO_SIZE:
+            raise ValueError(
+                f"DEFAULT_OUTPUT_SIZE ({self.DEFAULT_OUTPUT_SIZE}) must be "
+                f">= MINIMUM_UTXO_SIZE ({self.MINIMUM_UTXO_SIZE}); otherwise "
+                f"the mix would build dust equal-outputs."
+            )
+
         # Parse relay URLs
         raw = self._values.get("NOSTR_RELAYS", "")
         relay_list = [r.strip() for r in raw.split(",") if r.strip()]

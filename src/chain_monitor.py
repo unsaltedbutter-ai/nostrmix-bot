@@ -142,7 +142,30 @@ class ChainMonitor:
 
         Returns the txid string on success, None on failure. Tries the backup
         endpoint if the primary fails (network error or non-2xx).
+
+        Semantics by HTTP response:
+          - 200: success. Use the body if present, otherwise compute the txid
+                 locally from the raw hex.
+          - 409: 'already in mempool' or 'mempool conflict'. If it's OUR tx
+                 (which we can verify by comparing the local txid against any
+                 subsequent confirm check), treat as success. Returning None
+                 here would let the caller refund participants while the tx
+                 is sitting in mempool — money at risk.
+          - 4xx (other) / 5xx: actual rejection or transient server error.
+                 Try the backup endpoint; on full exhaustion, return None.
         """
+        local_txid: Optional[str] = None
+        try:
+            from bitcointx.core import CTransaction, b2x
+            tx = CTransaction.deserialize(bytes.fromhex(tx_hex))
+            # bitcoin txids are little-endian internally but displayed as
+            # big-endian (reverse the bytes).
+            local_txid = b2x(tx.GetTxid()[::-1])
+        except Exception:
+            # If we can't even parse our own tx, bail — broadcast won't work.
+            return None
+
+        rejecting_4xx = False
         for base in self._endpoints:
             try:
                 r = await self._client.post(
@@ -151,12 +174,18 @@ class ChainMonitor:
                     headers={"Content-Type": "text/plain"},
                 )
                 if r.status_code == 200:
-                    return r.text.strip()
-                # Non-200: log enough to diagnose but try the next endpoint.
-                # Mempool errors (insufficient fee, non-standard, etc.) tend to
-                # be returned identically by both Esplora mirrors, so falling
-                # through usually doesn't help, but a 5xx on one mirror might
-                # succeed on the other.
+                    body = r.text.strip()
+                    return body or local_txid
+                if r.status_code == 409:
+                    # Already in mempool. Either ours or a conflict; downstream
+                    # is_confirmed will tell us which on the next sweep.
+                    return local_txid
+                if 400 <= r.status_code < 500:
+                    # Hard rejection from the API (bad format, missing inputs).
+                    # Both mirrors will agree — no point trying the backup.
+                    rejecting_4xx = True
+                    break
+                # 5xx → try the next endpoint.
             except Exception:
                 continue
         return None

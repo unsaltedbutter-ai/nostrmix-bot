@@ -171,3 +171,32 @@ class TestDatabase:
             assert count == 2
         finally:
             await db.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_to_existing_db_file_does_not_crash(self):
+        """C1 regression guard: schema.sql historically used CREATE TABLE
+        without IF NOT EXISTS, which made the bot crash on every restart
+        once bot.db existed. Verified-failing-then-fixed."""
+        import tempfile
+        import src.database as db_mod
+        schema_path = os.path.join(os.path.dirname(__file__), "..", "src", "schema.sql")
+        db_mod.SCHEMA_PATH = schema_path
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            path = f.name
+        _db_paths.append(path)
+
+        db1 = db_mod.Database(path)
+        await db1.connect()
+        # Write some state so we can also verify it survives across reconnects.
+        mid = await db1.create_mix(output_size=1_000_000, min_participants=3)
+        await db1.close()
+
+        # The historically-broken path: connect again to the same file.
+        db2 = db_mod.Database(path)
+        await db2.connect()  # must not raise
+        try:
+            survived = await db2.get_mix(mid)
+            assert survived is not None, "data didn't survive the reconnect"
+        finally:
+            await db2.close()

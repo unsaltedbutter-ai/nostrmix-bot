@@ -1190,3 +1190,394 @@ class TestPsbtAcceptDisambiguation:
 
 
 # --- #12 strict per-input signature validation (unit-tested in test_psbt_manager.py) ---
+
+
+# --- Wave 1: critical + quick-fix significant items (regression guards) ---
+
+
+class TestExitMixTypoMultiMix:
+    """M6: /cancel with a typo while user is in 2+ mixes referenced an
+    undefined `name` variable (local was `names`). The handler's outer
+    try/except would have papered over it with 'Error processing your
+    message'. This guard catches both the NameError regression AND the
+    user-visible message format."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_typo_with_multiple_active_mixes(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_two_paid"
+            pid_a = await db.add_participant(mix_a, npub, "")
+            pid_b = await db.add_participant(mix_b, npub, "")
+            await db.update_participant(pid_a, state="paid", fee_paid=500)
+            await db.update_participant(pid_b, state="paid", fee_paid=500)
+
+            await coord._cmd_exit_mix(FakeCtx(npub), npub, "nonexistent-mix")
+
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "you are a part of 2 mixes" in joined
+            # Outer try/except in _on_dm would surface a NameError as this:
+            assert "error processing" not in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_no_mix_with_multiple_active_mixes(self):
+        """Same broken f-string path, hit via /cancel with no mix_id at all."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_two_paid2"
+            pid_a = await db.add_participant(mix_a, npub, "")
+            pid_b = await db.add_participant(mix_b, npub, "")
+            await db.update_participant(pid_a, state="paid", fee_paid=500)
+            await db.update_participant(pid_b, state="paid", fee_paid=500)
+
+            await coord._cmd_exit_mix(FakeCtx(npub), npub, None)
+
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "you are a part of 2 mixes" in joined
+            assert "error processing" not in joined
+        finally:
+            await db.close()
+
+
+class TestSilentZapNoLongerSilent:
+    """S6: zaps not matched to any committed participant were dropped with
+    no log or DM. Operator-visibility regression."""
+
+    @pytest.mark.asyncio
+    async def test_unmatched_zap_logs_at_info(self, caplog):
+        import logging
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # No participants for this npub at all.
+            class FakeZap:
+                sender_hex = "npub_donor"
+                amount_sats = 1234
+
+            with caplog.at_level(logging.INFO, logger="src.coordinator"):
+                await coord._on_zap(FakeZap(), FakeCtx("npub_donor"))
+
+            messages = " ".join(r.message.lower() for r in caplog.records)
+            assert "unmatched zap" in messages or "no pending fee" in messages
+            assert "1234" in messages
+        finally:
+            await db.close()
+
+
+class TestAssemblePsbtFiltersToPaid:
+    """S8: _assemble_psbt iterated whatever 'active' list it was handed. In
+    a crash-recovery scenario the mix could be in 'assembling' state with
+    a participant still 'committed' (paid timeout hasn't fired). That
+    participant's inputs would be added to the PSBT but they'd never sign.
+    Filter defensively to 'paid' / 'signing' (signing for resumes)."""
+
+    @pytest.mark.asyncio
+    async def test_assemble_skips_committed_participant(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30)
+
+            # Two participants — one paid, one stuck in 'committed'.
+            pid_paid = await db.add_participant(mix_id, "npub_paid", "")
+            await db.update_participant(pid_paid, state="paid", fee_paid=500)
+            await db.add_utxo(pid_paid, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(pid_paid, addr, 1_000_000)
+
+            pid_unpaid = await db.add_participant(mix_id, "npub_unpaid", "")
+            await db.update_participant(pid_unpaid, state="committed")
+            await db.add_utxo(pid_unpaid, TXID[1], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:6]:
+                await db.add_output(pid_unpaid, addr, 1_000_000)
+
+            # Add a second paid participant so the min_participants=2 check holds.
+            pid_paid2 = await db.add_participant(mix_id, "npub_paid2", "")
+            await db.update_participant(pid_paid2, state="paid", fee_paid=500)
+            await db.add_utxo(pid_paid2, TXID[2], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[6:8] + [P2WPKH_ADDRS[0]]:
+                await db.add_output(pid_paid2, addr, 1_000_000)
+
+            mix_row = await db.get_mix(mix_id)
+            # Pass the "wrong" active list that includes the unpaid participant
+            # (this is what _process_mix does today in the 'assembling' case).
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(mix_row, active)
+
+            # Only 2 psbt_round rows should exist (one per PAID participant).
+            rounds = await db.get_psbt_rounds_by_mix(mix_id)
+            pid_set = {r["participant_id"] for r in rounds}
+            assert pid_unpaid not in pid_set, "unpaid participant was included in assembly"
+            assert pid_paid in pid_set and pid_paid2 in pid_set
+        finally:
+            await db.close()
+
+
+class TestOutputSizeMinimumValidation:
+    """S11: A mix with output_size < MINIMUM_UTXO_SIZE would build dust
+    equal-outputs that no wallet would later spend. Catch at config load."""
+
+    def test_config_rejects_output_size_below_minimum_utxo_size(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("DEFAULT_OUTPUT_SIZE=5000\n")
+            f.write("MINIMUM_UTXO_SIZE=10000\n")
+            env_path = f.name
+        try:
+            with pytest.raises((ValueError, AssertionError)):
+                BotConfig(env_path)
+        finally:
+            os.unlink(env_path)
+
+    def test_config_accepts_output_size_at_or_above_minimum(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("DEFAULT_OUTPUT_SIZE=10000\n")
+            f.write("MINIMUM_UTXO_SIZE=10000\n")
+            env_path = f.name
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.DEFAULT_OUTPUT_SIZE == 10000
+        finally:
+            os.unlink(env_path)
+
+
+class TestStrandedFeeFallback:
+    """S2: a participant who paid the service fee but whose Nostr profile
+    lacks a lud16 would land in the 'else' branch of _cancel_and_refund —
+    marked cancelled with NO refund attempt and NO DM mentioning their
+    stranded sats. Real-money UX bug."""
+
+    @pytest.mark.asyncio
+    async def test_paid_participant_without_lud16_gets_stranded_dm(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await db.update_mix(mix_id, state="collecting")
+
+            paid_npub = "npub_paid_no_lud16"
+            pid = await db.add_participant(mix_id, paid_npub, "")  # empty lud16
+            await db.update_participant(pid, state="paid", fee_paid=2_000)
+
+            await coord._cancel_and_refund(mix_row := await db.get_mix(mix_id),
+                                           "insufficient participants")
+
+            joined = " ".join(m for r, m in nostr.sent_dms if r == paid_npub).lower()
+            # The user should be told their refund is stranded and to contact us.
+            assert (
+                "couldn't refund" in joined
+                or "could not refund" in joined
+                or "contact" in joined
+                or "lightning address" in joined
+            ), f"DM didn't mention the stranded refund: {joined!r}"
+        finally:
+            await db.close()
+
+
+class TestDailyAnnouncementRecordsAutoCreatedMix:
+    """S3: when no mixes are open, _post_daily_announcement auto-creates one
+    but never inserts an 'announcements' row for it. Operator audit trail
+    missing."""
+
+    @pytest.mark.asyncio
+    async def test_auto_created_mix_gets_announcement_row(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # No mixes pre-existing.
+            await coord._post_daily_announcement()
+
+            mixes = await db.get_mixes_by_state("collecting")
+            assert len(mixes) == 1, "auto-create should have produced exactly one mix"
+            anns = await db.get_announcements_for_mix(mixes[0]["id"])
+            assert len(anns) == 1, "announcement row missing for the auto-created mix"
+        finally:
+            await db.close()
+
+
+class TestBroadcast409TreatedAsSuccess:
+    """C3: mempool.space returning 409 means 'this tx (or a conflict) is
+    already in mempool.' If it's OUR tx, that's a successful broadcast —
+    we should return the txid (computed locally from the raw hex) so the
+    caller doesn't refund participants while their tx is waiting to confirm.
+    The status doc spells out the money-at-risk path."""
+
+    @pytest.mark.asyncio
+    async def test_409_returns_txid_not_none(self):
+        import httpx, respx
+        from src.chain_monitor import ChainMonitor
+        OFFLINE = "https://offline-test-mempool.invalid/api"
+        OFFLINE_BACKUP = "https://offline-test-backup.invalid/api"
+
+        # A real (but tiny) raw tx hex. Doesn't need to be valid for any
+        # signature check — broadcast_tx never inspects it. Just needs to be
+        # parseable by python-bitcointx so we can compute its txid.
+        from bitcointx.core import CTransaction, CTxIn, CTxOut, COutPoint, CMutableTransaction, b2x
+        from bitcointx.core.script import CScript
+        tx = CMutableTransaction(
+            [CTxIn(COutPoint(b"\x11" * 32, 0))],
+            [CTxOut(50_000, CScript(b"\x00\x14" + b"\x00" * 20))],
+        )
+        raw_hex = b2x(tx.serialize())
+        expected_txid = b2x(tx.GetTxid()[::-1])  # bitcoin-style display order
+
+        with respx.mock:
+            respx.post(f"{OFFLINE}/tx").mock(
+                return_value=httpx.Response(409, text="txn-mempool-conflict")
+            )
+            respx.post(f"{OFFLINE_BACKUP}/tx").mock(
+                return_value=httpx.Response(409, text="txn-mempool-conflict")
+            )
+            cm = ChainMonitor(api_base=OFFLINE, api_backup=OFFLINE_BACKUP)
+            try:
+                result = await cm.broadcast_tx(raw_hex)
+            finally:
+                await cm.close()
+
+        assert result == expected_txid, (
+            f"409 should be treated as broadcast success and return the local "
+            f"txid; got {result!r}, expected {expected_txid!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drops_underfunded_participant_and_proceeds(self):
+        """C2: when one participant's allocation drops to 0 equal outputs
+        after applying the proportional miner fee, the old code cancelled
+        the whole mix. New behaviour: refund the under-funded participant,
+        notify them, and continue with the survivors if there are still
+        enough for min_participants."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
+                                         max_participants=10)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30)
+
+            # Two well-funded participants.
+            rich1 = await db.add_participant(mix_id, "rich1", "rich1@x")
+            await db.update_participant(rich1, state="paid", fee_paid=500)
+            await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(rich1, addr, 1_000_000)
+
+            rich2 = await db.add_participant(mix_id, "rich2", "rich2@x")
+            await db.update_participant(rich2, state="paid", fee_paid=500)
+            await db.add_utxo(rich2, TXID[1], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:6]:
+                await db.add_output(rich2, addr, 1_000_000)
+
+            # The under-funded one: exactly output_size sats. Passes the
+            # /addresses check (where estimated_fee_share=0) but fails at
+            # assembly once the proportional miner fee is applied.
+            poor = await db.add_participant(mix_id, "poor", "poor@x")
+            await db.update_participant(poor, state="paid", fee_paid=300)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            # The mix should have proceeded to 'signing' with the two
+            # remaining participants — not been cancelled wholesale.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "signing", (
+                f"mix should advance after dropping under-funded; got {mix_after['state']}"
+            )
+
+            # The under-funded participant should be marked refunded with a
+            # Lightning refund attempted, and DM'd that they were dropped.
+            poor_after = await db.get_participant(poor)
+            assert poor_after["state"] in ("refunded", "cancelled"), (
+                f"poor should be refunded/cancelled, got {poor_after['state']}"
+            )
+            assert any(r[0] == "poor@x" for r in lightning.refunds), (
+                f"poor should have gotten a Lightning refund; got {lightning.refunds}"
+            )
+            poor_dms = [m for r, m in nostr.sent_dms if r == "poor"]
+            assert poor_dms, "poor got no DM about being dropped"
+            assert any(
+                "dropped" in m.lower() or "couldn't cover" in m.lower()
+                or "insufficient" in m.lower() or "can't cover" in m.lower()
+                for m in poor_dms
+            ), f"DM didn't explain the drop reason: {poor_dms}"
+
+            # The survivors should be in signing state.
+            for pid in (rich1, rich2):
+                p = await db.get_participant(pid)
+                assert p["state"] == "signing", (
+                    f"survivor {pid} should be signing, got {p['state']}"
+                )
+
+            # And only 2 psbt_round rows (one per survivor).
+            rounds = await db.get_psbt_rounds_by_mix(mix_id)
+            pid_set = {r["participant_id"] for r in rounds}
+            assert pid_set == {rich1, rich2}, (
+                f"expected rounds for the two survivors only, got {pid_set}"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_dropping_drops_below_min_participants_cancels_whole_mix(self):
+        """C2 boundary: if dropping under-funded participants would leave
+        fewer than min_participants, fall back to cancelling the whole mix
+        (the prior behavior)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+                                         max_participants=10)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30)
+
+            # Two rich + one poor. Dropping poor leaves 2 < min=3.
+            rich1 = await db.add_participant(mix_id, "rich1m", "rich1m@x")
+            await db.update_participant(rich1, state="paid", fee_paid=500)
+            await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(rich1, addr, 1_000_000)
+
+            rich2 = await db.add_participant(mix_id, "rich2m", "rich2m@x")
+            await db.update_participant(rich2, state="paid", fee_paid=500)
+            await db.add_utxo(rich2, TXID[1], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:6]:
+                await db.add_output(rich2, addr, 1_000_000)
+
+            poor = await db.add_participant(mix_id, "poorm", "poorm@x")
+            await db.update_participant(poor, state="paid", fee_paid=300)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "cancelled", (
+                f"should cancel when survivors < min_participants; got {mix_after['state']}"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_400_still_returns_none(self):
+        """Regression guard: 400 means the tx was actually rejected (bad
+        format, missing inputs, etc.) — must still fail, not be papered
+        over as success."""
+        import httpx, respx
+        from src.chain_monitor import ChainMonitor
+        OFFLINE = "https://offline-test-mempool.invalid/api"
+        OFFLINE_BACKUP = "https://offline-test-backup.invalid/api"
+        with respx.mock:
+            respx.post(f"{OFFLINE}/tx").mock(
+                return_value=httpx.Response(400, text="bad-txns-inputs-missingorspent")
+            )
+            respx.post(f"{OFFLINE_BACKUP}/tx").mock(
+                return_value=httpx.Response(400, text="bad-txns-inputs-missingorspent")
+            )
+            cm = ChainMonitor(api_base=OFFLINE, api_backup=OFFLINE_BACKUP)
+            try:
+                result = await cm.broadcast_tx("deadbeef" * 8)
+            finally:
+                await cm.close()
+        assert result is None

@@ -1,7 +1,7 @@
 -- nostrmix-bot schema
 -- PSBT-based coinjoin mixer over Nostr NIP-17
 
-CREATE TABLE mixes (
+CREATE TABLE IF NOT EXISTS mixes (
     id              TEXT PRIMARY KEY,          -- human-readable name (east-gate)
     output_size     INTEGER NOT NULL,          -- sats per equal output
     min_participants INTEGER NOT NULL DEFAULT 3,
@@ -21,7 +21,7 @@ CREATE TABLE mixes (
     updated_at_unix INTEGER NOT NULL
 );
 
-CREATE TABLE participants (
+CREATE TABLE IF NOT EXISTS participants (
     id              TEXT PRIMARY KEY,
     mix_id          TEXT NOT NULL REFERENCES mixes(id),
     npub_hex        TEXT NOT NULL,
@@ -37,7 +37,7 @@ CREATE TABLE participants (
     updated_at_unix INTEGER NOT NULL
 );
 
-CREATE TABLE utxos (
+CREATE TABLE IF NOT EXISTS utxos (
     id              TEXT PRIMARY KEY,
     participant_id  TEXT NOT NULL REFERENCES participants(id),
     txid            TEXT NOT NULL,
@@ -49,7 +49,7 @@ CREATE TABLE utxos (
     created_at_unix INTEGER NOT NULL
 );
 
-CREATE TABLE outputs (
+CREATE TABLE IF NOT EXISTS outputs (
     id              TEXT PRIMARY KEY,
     participant_id  TEXT NOT NULL REFERENCES participants(id),
     address         TEXT NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE outputs (
     created_at_unix INTEGER NOT NULL
 );
 
-CREATE TABLE psbt_rounds (
+CREATE TABLE IF NOT EXISTS psbt_rounds (
     id              TEXT PRIMARY KEY,
     mix_id          TEXT NOT NULL REFERENCES mixes(id),
     participant_id  TEXT NOT NULL REFERENCES participants(id),
@@ -74,7 +74,7 @@ CREATE TABLE psbt_rounds (
     UNIQUE(mix_id, participant_id, round_num)
 );
 
-CREATE TABLE blacklist (
+CREATE TABLE IF NOT EXISTS blacklist (
     id              TEXT PRIMARY KEY,
     npub_hex        TEXT,
     utxo_txid_vout  TEXT,                        -- txid:vout string
@@ -82,7 +82,7 @@ CREATE TABLE blacklist (
     created_at_unix INTEGER NOT NULL
 );
 
-CREATE TABLE announcements (
+CREATE TABLE IF NOT EXISTS announcements (
     id              TEXT PRIMARY KEY,
     mix_id          TEXT NOT NULL REFERENCES mixes(id),
     event_id        TEXT,                        -- Nostr event ID
@@ -96,13 +96,13 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 -- Indices for common query patterns
-CREATE INDEX idx_participants_mix ON participants(mix_id);
-CREATE INDEX idx_participants_npub ON participants(npub_hex);
-CREATE INDEX idx_utxos_participant ON utxos(participant_id);
-CREATE INDEX idx_utxos_txid_vout ON utxos(txid, vout);
-CREATE INDEX idx_outputs_participant ON outputs(participant_id);
-CREATE INDEX idx_psbt_rounds_mix ON psbt_rounds(mix_id);
-CREATE INDEX idx_psbt_rounds_participant ON psbt_rounds(participant_id);
-CREATE INDEX idx_blacklist_npub ON blacklist(npub_hex);
-CREATE INDEX idx_announcements_mix ON announcements(mix_id);
-CREATE INDEX idx_mixes_state ON mixes(state);
+CREATE INDEX IF NOT EXISTS idx_participants_mix ON participants(mix_id);
+CREATE INDEX IF NOT EXISTS idx_participants_npub ON participants(npub_hex);
+CREATE INDEX IF NOT EXISTS idx_utxos_participant ON utxos(participant_id);
+CREATE INDEX IF NOT EXISTS idx_utxos_txid_vout ON utxos(txid, vout);
+CREATE INDEX IF NOT EXISTS idx_outputs_participant ON outputs(participant_id);
+CREATE INDEX IF NOT EXISTS idx_psbt_rounds_mix ON psbt_rounds(mix_id);
+CREATE INDEX IF NOT EXISTS idx_psbt_rounds_participant ON psbt_rounds(participant_id);
+CREATE INDEX IF NOT EXISTS idx_blacklist_npub ON blacklist(npub_hex);
+CREATE INDEX IF NOT EXISTS idx_announcements_mix ON announcements(mix_id);
+CREATE INDEX IF NOT EXISTS idx_mixes_state ON mixes(state);
