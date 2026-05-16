@@ -32,8 +32,8 @@ class TestFeeEngine:
         inp = {"p2wpkh": 2, "p2tr": 1, "p2pkh": 1}
         out = {"p2wpkh": 3, "p2tr": 2}
         vsize = self.engine.estimate_total_vsize(inp, out)
-        # overhead=10 + 2*70 + 1*70 + 1*150 + 3*35 + 2*45
-        expected = 10 + 140 + 70 + 150 + 105 + 90
+        # overhead=10 + 2*70 + 1*60 + 1*150 + 3*35 + 2*45
+        expected = 10 + 140 + 60 + 150 + 105 + 90
         assert vsize == expected
 
     def test_service_fee_simple(self):
@@ -57,7 +57,7 @@ class TestFeeEngine:
         """Test per-type input calculation."""
         inp = {"p2wpkh": 2, "p2tr": 1}
         total = self.engine.total_inputs_vsize(inp)
-        assert total == (2 * 70) + (1 * 70)
+        assert total == (2 * 70) + (1 * 60)
 
     def test_total_outputs_vsize(self):
         """Test per-type output calculation."""
@@ -68,15 +68,15 @@ class TestFeeEngine:
     def test_input_vsize_lookup(self):
         """Test individual script type lookup."""
         assert self.engine.input_vsize("p2wpkh") == 70
-        assert self.engine.input_vsize("p2tr") == 70
+        assert self.engine.input_vsize("p2tr") == 60
         assert self.engine.input_vsize("p2pkh") == 150
-        assert self.engine.input_vsize("p2sh") == 255
+        assert self.engine.input_vsize("p2sh") == 135
         assert self.engine.input_vsize("unknown") == 70  # fallback
 
     def test_output_vsize_lookup(self):
         assert self.engine.output_vsize("p2wpkh") == 35
         assert self.engine.output_vsize("p2tr") == 45
-        assert self.engine.output_vsize("p2wsh") == 4
+        assert self.engine.output_vsize("p2wsh") == 45
         assert self.engine.output_vsize("unknown") == 35  # fallback
 
     def test_compute_participant_weight(self):

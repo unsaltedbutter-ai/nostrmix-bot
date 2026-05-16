@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 from nostrbot_sdk import BtcPayWallet, LnurlPayer, PayoutResult, FeePolicy
 from nostr_sdk import Keys
+
+logger = logging.getLogger(__name__)
 
 
 class LightningHandler:
@@ -48,7 +51,8 @@ class LightningHandler:
             try:
                 balance = await self._btcpay_wallet.get_balance()
                 return balance
-            except Exception:
+            except Exception as e:
+                logger.warning("BTCPay get_balance failed: %s", e, exc_info=True)
                 return None
         return None
 
@@ -68,8 +72,12 @@ class LightningHandler:
             try:
                 result = await self._btcpay_wallet.send_to_lud16(lud16, amount_sats)
                 return result
-            except Exception:
-                pass
+            except Exception as e:
+                # Fall through to the LNURL payer rather than failing silently.
+                logger.warning(
+                    "BTCPay refund to %s for %d sats (reason=%s) failed: %s",
+                    lud16, amount_sats, reason, e, exc_info=True,
+                )
 
         # Fallback: use LNURL payer
         if self._lnurl_payer and amount_sats > 0:
@@ -87,9 +95,16 @@ class LightningHandler:
                     zap_request=None,  # not a zap, just a payment
                 )
                 return result
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(
+                    "LNURL refund to %s for %d sats (reason=%s) failed: %s",
+                    lud16, amount_sats, reason, e, exc_info=True,
+                )
 
+        logger.error(
+            "Refund to %s for %d sats (reason=%s) — no working backend",
+            lud16, amount_sats, reason,
+        )
         return None
 
     async def send_refund_to_lnurl(self, lud16: str, zap_amount_sats: int,

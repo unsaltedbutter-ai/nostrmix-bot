@@ -8,24 +8,27 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-# Default per-script-type input vsize tables (from script-vbytesize.md)
+# Default per-script-type input vsize tables. Calibrated against real
+# mainnet transactions and rounded up to nearest 5 for a small fee buffer.
+# See src/config.py for the same values exposed as env-overridable settings.
 DEFAULT_INPUT_VSIZE: Dict[str, int] = {
     "p2pkh": 150,
-    "p2sh": 255,
+    "p2sh": 135,          # p2sh-p2wsh 2-of-3 ≈ 131; bare p2sh-multisig heavier
     "p2sh-p2wpkh": 95,
     "p2wpkh": 70,
-    "p2wsh": 1455,
-    "p2tr": 70,
+    "p2wsh": 100,         # 2-of-2 ≈ 96; 2-of-3 ≈ 104; larger N-of-M heavier
+    "p2tr": 60,           # key-path ≈ 58; script-path heavier
 }
 
-# Default per-script-type output vsize tables
+# Default per-script-type output vsize tables. Outputs are structural:
+# value(8) + script_length(1) + scriptPubKey bytes.
 DEFAULT_OUTPUT_VSIZE: Dict[str, int] = {
-    "p2pkh": 35,
-    "p2sh": 35,
-    "p2sh-p2wpkh": 35,
-    "p2wpkh": 35,
-    "p2wsh": 4,
-    "p2tr": 45,
+    "p2pkh": 35,          # real 34
+    "p2sh": 35,           # real 32
+    "p2sh-p2wpkh": 35,    # real 32
+    "p2wpkh": 35,         # real 31
+    "p2wsh": 45,          # real 43 — was 4 (bug)
+    "p2tr": 45,           # real 43
 }
 
 

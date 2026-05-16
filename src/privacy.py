@@ -24,7 +24,9 @@ class PrivacyCheck:
 
         try:
             psbt_bytes = bytes.fromhex(psbt_hex)
-            psbt_obj = PartiallySignedBitcoinTransaction(psbt_bytes)
+            # The PSBT constructor is keyword-only; bytes deserialization
+            # goes through from_binary.
+            psbt_obj = PartiallySignedBitcoinTransaction.from_binary(psbt_bytes)
 
             outputs = psbt_obj.outputs
             if len(outputs) < num_participants:

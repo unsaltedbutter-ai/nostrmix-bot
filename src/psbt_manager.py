@@ -25,7 +25,7 @@ from bitcointx.core import (
 from bitcointx.core.script import CScript
 from bitcointx.wallet import (
     CBitcoinAddress, P2PKHBitcoinAddress, P2SHBitcoinAddress,
-    P2WPKHBitcoinAddress,
+    P2WPKHBitcoinAddress, P2WSHBitcoinAddress, P2TRBitcoinAddress,
 )
 
 from .vsize import VsizeCalculator
@@ -47,21 +47,37 @@ class PSBTManager:
         self._network = network
         self._vsize = VsizeCalculator(input_vsize_map, output_vsize_map, overhead)
 
-    def _parse_address(self, address: str) -> CBitcoinAddress:
-        """Parse a bitcoin address from string."""
-        return CBitcoinAddress(address)
+    def _parse_address(self, address: str):
+        """Parse a bitcoin address from string.
+
+        CBitcoinAddress handles base58 (p2pkh, p2sh) and bech32 v0
+        (p2wpkh, p2wsh), but raises on bech32m (p2tr). We fall back to
+        P2TRBitcoinAddress for taproot.
+        """
+        try:
+            return CBitcoinAddress(address)
+        except Exception:
+            return P2TRBitcoinAddress(address)
 
     def _address_type(self, address: str) -> str:
-        """Determine the type of an address."""
+        """Determine the type of an address. Raises if the format is unknown.
+
+        Checked in most-specific-first order: P2WPKHBitcoinAddress and
+        P2WSHBitcoinAddress are both bech32 v0 but distinguished by length
+        (20-byte vs 32-byte witness program), so their classes are distinct.
+        """
         addr = self._parse_address(address)
+        if isinstance(addr, P2TRBitcoinAddress):
+            return "p2tr"
         if isinstance(addr, P2WPKHBitcoinAddress):
             return "p2wpkh"
-        elif isinstance(addr, P2PKHBitcoinAddress):
+        if isinstance(addr, P2WSHBitcoinAddress):
+            return "p2wsh"
+        if isinstance(addr, P2PKHBitcoinAddress):
             return "p2pkh"
-        elif isinstance(addr, P2SHBitcoinAddress):
+        if isinstance(addr, P2SHBitcoinAddress):
             return "p2sh"
-        else:
-            return "p2wpkh"
+        raise ValueError(f"unrecognized address type: {address}")
 
     # --- Vsize estimation — delegates to VsizeCalculator ---
 
@@ -106,7 +122,7 @@ class PSBTManager:
         vout = []
         for out in outputs:
             addr = self._parse_address(out["address"])
-            vout.append(CMutableTxOut(out["amount"], addr.to_scriptpubkey()))
+            vout.append(CMutableTxOut(out["amount"], addr.to_scriptPubKey()))
 
         unsigned_tx = CMutableTransaction(vin, vout)
 

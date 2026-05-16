@@ -7,6 +7,20 @@ from typing import Optional, Dict, List
 
 _DEFAULT_API = "https://mempool.space/api"
 
+# Esplora reports segwit/taproot with version prefixes. Map to the bare names
+# used elsewhere in the project (config.py vsize maps, vsize.py defaults).
+_SCRIPT_TYPE_NORMALIZE = {
+    "v0_p2wpkh": "p2wpkh",
+    "v0_p2wsh": "p2wsh",
+    "v1_p2tr": "p2tr",
+}
+
+
+def _normalize_script_type(raw: str) -> str:
+    if not raw:
+        return "p2wpkh"
+    return _SCRIPT_TYPE_NORMALIZE.get(raw, raw)
+
 
 class ChainMonitor:
     """Bitcoin blockchain monitor via mempool.space API — fully async."""
@@ -27,33 +41,53 @@ class ChainMonitor:
     async def lookup_txout(self, txid: str, vout: int) -> Optional[Dict]:
         """Look up a prevout by txid:vout.
 
-        Returns dict with keys: txid, vout, status (confirmed|mempool), value (sats),
-        scriptpubkey, scriptpubkey_type, address, or None if not found.
+        Returns dict with: txid, vout, status (parent-tx confirmed bool),
+        value (sats), scriptpubkey (hex), scriptpubkey_type (normalized to the
+        project's vocab — 'p2wpkh', 'p2tr', etc.), address. None if not found.
+
+        This does NOT tell you whether the output is unspent — use is_utxo_spent
+        for that.
         """
         try:
-            r = await self._client.get(f"{self._api_base}/tx/{txid}/spend/{vout}")
+            r = await self._client.get(f"{self._api_base}/tx/{txid}")
             r.raise_for_status()
-            return r.json()
-        except (httpx.HTTPError, httpx.RequestError):
-            # Fallback: try the tx endpoint and parse outputs
-            try:
-                r = await self._client.get(f"{self._api_base}/tx/{txid}")
-                r.raise_for_status()
-                tx_data = r.json()
-                if "vout" in tx_data and vout < len(tx_data["vout"]):
-                    prevout = tx_data["vout"][vout]
-                    return {
-                        "txid": txid,
-                        "vout": vout,
-                        "status": tx_data.get("status", {}).get("confirmed", False),
-                        "value": prevout.get("value", 0),
-                        "scriptpubkey": prevout.get("scriptpubkey", ""),
-                        "scriptpubkey_type": prevout.get("scriptpubkeytype", "p2wpkh"),
-                        "address": prevout.get("scriptpubkey_address", ""),
-                    }
+            tx_data = r.json()
+            if "vout" not in tx_data or vout >= len(tx_data["vout"]):
                 return None
-            except Exception:
-                return None
+            prevout = tx_data["vout"][vout]
+            return {
+                "txid": txid,
+                "vout": vout,
+                "status": tx_data.get("status", {}).get("confirmed", False),
+                "value": prevout.get("value", 0),
+                "scriptpubkey": prevout.get("scriptpubkey", ""),
+                "scriptpubkey_type": _normalize_script_type(
+                    prevout.get("scriptpubkey_type", "")
+                ),
+                "address": prevout.get("scriptpubkey_address", ""),
+            }
+        except Exception:
+            return None
+
+    async def is_utxo_spent(self, txid: str, vout: int) -> bool:
+        """Check whether a specific output (txid:vout) has been spent on-chain.
+
+        Uses Esplora's /tx/:txid/outspend/:vout. Returns True if the output has
+        been spent, False if unspent OR if the API call failed.
+
+        Fail-open: an API outage looks like 'unspent'. The downstream broadcast
+        would still fail if the UTXO were actually spent, so the realistic risk
+        is wasting a participant's service fee.
+        """
+        try:
+            r = await self._client.get(
+                f"{self._api_base}/tx/{txid}/outspend/{vout}"
+            )
+            r.raise_for_status()
+            data = r.json()
+            return bool(data.get("spent", False))
+        except Exception:
+            return False
 
     async def lookup_tx(self, txid: str) -> Optional[Dict]:
         """Get full transaction data."""

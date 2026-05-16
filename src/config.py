@@ -47,26 +47,37 @@ _DEFAULTS = {
 
     "BROADCAST_CHECK_INTERVAL_HOURS": 24,
 
+    # Operator allowlist for script types. Comma-separated. Drives both /commit
+    # (input UTXO acceptance) and /addresses (output address acceptance). Keeping
+    # the MVP narrow to p2wpkh removes the multisig vsize variability and the
+    # bech32m parsing edge cases. Widen here when you're ready.
+    "ACCEPTED_INPUT_TYPES":  "p2wpkh",
+    "ACCEPTED_OUTPUT_TYPES": "p2wpkh",
+
     # Bitcoin API
     "MEMPOOL_API": "https://mempool.space/api",
 
     # Database
     "DB_PATH": "./bot.db",
 
-    # Per-script-type vbyte sizes (from script-vbytesize.md)
+    # Per-script-type vbyte sizes. Calibrated against real mainnet
+    # transactions, rounded up to the nearest 5 vbytes for a small fee
+    # buffer. Confirmed values: p2wpkh ≈ 69, p2pkh ≈ 148, p2sh-p2wpkh ≈ 92,
+    # p2tr key-path ≈ 58, p2wsh 2-of-2 ≈ 96, p2sh-p2wsh 2-of-3 ≈ 131.
+    # Output sizes are structural: value(8) + length(1) + script bytes.
     # Input vBytes
     "P2PKH_INPUT_VSIZE": 150,
-    "P2SH_INPUT_VSIZE": 255,
+    "P2SH_INPUT_VSIZE": 135,        # covers p2sh-p2wsh 2-of-3; bare p2sh-multisig is heavier
     "P2SH_P2WPKH_INPUT_VSIZE": 95,
     "P2WPKH_INPUT_VSIZE": 70,
-    "P2WSH_INPUT_VSIZE": 1455,
-    "P2TR_INPUT_VSIZE": 70,
+    "P2WSH_INPUT_VSIZE": 100,       # covers 2-of-2; 2-of-3 is ~104, larger N-of-M heavier
+    "P2TR_INPUT_VSIZE": 60,         # key-path; script-path is heavier
     # Output vBytes
     "P2PKH_OUTPUT_VSIZE": 35,
     "P2SH_OUTPUT_VSIZE": 35,
     "P2SH_P2WPKH_OUTPUT_VSIZE": 35,
     "P2WPKH_OUTPUT_VSIZE": 35,
-    "P2WSH_OUTPUT_VSIZE": 4,
+    "P2WSH_OUTPUT_VSIZE": 45,       # was 4 — that was a bug; real ≈ 43
     "P2TR_OUTPUT_VSIZE": 45,
 
     # Transaction overhead
@@ -111,6 +122,13 @@ class BotConfig:
         raw = self._values.get("NOSTR_RELAYS", "")
         relay_list = [r.strip() for r in raw.split(",") if r.strip()]
         self._values["_relays"] = relay_list
+
+        # Parse accepted-type allowlists into sets. Empty config falls back to
+        # {'p2wpkh'} rather than {} (which would reject everything).
+        for key in ("ACCEPTED_INPUT_TYPES", "ACCEPTED_OUTPUT_TYPES"):
+            raw = self._values.get(key, "")
+            parsed = {t.strip().lower() for t in raw.split(",") if t.strip()}
+            self._values[f"_{key.lower()}"] = parsed or {"p2wpkh"}
 
     # --- Property helpers ---
 
@@ -229,6 +247,14 @@ class BotConfig:
     @property
     def BROADCAST_CHECK_INTERVAL_HOURS(self) -> int:
         return self._values["BROADCAST_CHECK_INTERVAL_HOURS"]
+
+    @property
+    def ACCEPTED_INPUT_TYPES(self) -> set:
+        return self._values["_accepted_input_types"]
+
+    @property
+    def ACCEPTED_OUTPUT_TYPES(self) -> set:
+        return self._values["_accepted_output_types"]
 
     @property
     def MEMPOOL_API(self) -> str:

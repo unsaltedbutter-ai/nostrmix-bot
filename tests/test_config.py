@@ -81,22 +81,22 @@ class TestBotConfig:
         ivm = cfg.INPUT_VSIZE_BY_TYPE
         ovm = cfg.OUTPUT_VSIZE_BY_TYPE
 
-        # From script-vbytesize.md table
+        # Calibrated against real mainnet txs, rounded up to nearest 5.
         assert ivm["p2wpkh"] == 70
-        assert ivm["p2tr"] == 70
+        assert ivm["p2tr"] == 60
         assert ivm["p2pkh"] == 150
-        assert ivm["p2sh"] == 255
+        assert ivm["p2sh"] == 135
         assert ivm["p2sh-p2wpkh"] == 95
-        assert ivm["p2wsh"] == 1455
+        assert ivm["p2wsh"] == 100
 
         assert ovm["p2wpkh"] == 35
         assert ovm["p2tr"] == 45
-        assert ovm["p2wsh"] == 4
+        assert ovm["p2wsh"] == 45
         assert ovm["p2pkh"] == 35
 
         # Lookup methods
         assert cfg.input_vsize_for("p2wpkh") == 70
-        assert cfg.input_vsize_for("p2tr") == 70
+        assert cfg.input_vsize_for("p2tr") == 60
         assert cfg.output_vsize_for("p2tr") == 45
 
         os.unlink(env_path)
@@ -116,3 +116,41 @@ class TestBotConfig:
         # Other types unchanged
         assert cfg.input_vsize_for("p2pkh") == 150
         os.unlink(env_path)
+
+
+class TestAcceptedTypes:
+    """The operator allowlist for input/output script types.
+
+    Default is p2wpkh-only — narrow on purpose so vsize variability and
+    bech32m parsing edge cases don't bite the MVP.
+    """
+
+    def test_default_allowlist_is_p2wpkh_only(self):
+        cfg = BotConfig("/nonexistent.env")
+        assert cfg.ACCEPTED_INPUT_TYPES == {"p2wpkh"}
+        assert cfg.ACCEPTED_OUTPUT_TYPES == {"p2wpkh"}
+
+    def test_allowlist_parses_comma_separated_and_lowercases(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("ACCEPTED_INPUT_TYPES=p2wpkh, P2TR\n")
+            f.write("ACCEPTED_OUTPUT_TYPES=p2wpkh,p2tr,p2sh\n")
+            env_path = f.name
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.ACCEPTED_INPUT_TYPES == {"p2wpkh", "p2tr"}
+            assert cfg.ACCEPTED_OUTPUT_TYPES == {"p2wpkh", "p2tr", "p2sh"}
+        finally:
+            os.unlink(env_path)
+
+    def test_empty_allowlist_falls_back_to_p2wpkh(self):
+        """Empty config must not mean 'reject everything' — fall back instead."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("ACCEPTED_INPUT_TYPES=\n")
+            f.write("ACCEPTED_OUTPUT_TYPES=   ,  \n")
+            env_path = f.name
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.ACCEPTED_INPUT_TYPES == {"p2wpkh"}
+            assert cfg.ACCEPTED_OUTPUT_TYPES == {"p2wpkh"}
+        finally:
+            os.unlink(env_path)

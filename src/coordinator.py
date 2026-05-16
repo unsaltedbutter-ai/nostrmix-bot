@@ -8,6 +8,7 @@ import logging
 from typing import Optional, Dict, List, Any, Callable, Tuple
 
 from nostrbot_sdk import SenderContext, ValidatedZap, NostrBot
+from nostr_sdk import PublicKey
 
 from .config import BotConfig
 from .database import Database
@@ -20,6 +21,19 @@ from .command_parser import CommandParser, ParsedCommand
 from .privacy import PrivacyCheck
 
 logger = logging.getLogger(__name__)
+
+
+def _bech32_npub(hex_pubkey: str) -> str:
+    """Render a hex pubkey as a bech32 npub for operator-readable logs.
+
+    Per the plan, log lines should print npubs in bech32, not hex. Falls back
+    to the original hex string if conversion fails — we never want a logging
+    helper to raise during state-machine processing.
+    """
+    try:
+        return PublicKey.parse(hex_pubkey).to_bech32()
+    except Exception:
+        return hex_pubkey
 
 
 class Coordinator:
@@ -213,17 +227,43 @@ class Coordinator:
                 await self.nostr.send_dm(npub_hex, f"Could not find UTXO {txid}:{vout} on chain.")
                 continue
 
+            # Reject UTXOs that have already been spent on-chain. Without this
+            # check a participant could commit a stale output, the bot would
+            # build a PSBT against it, and broadcast would fail late.
+            if await self.chain.is_utxo_spent(txid, vout):
+                await self.nostr.send_dm(npub_hex, f"UTXO {txid}:{vout} has already been spent on-chain.")
+                continue
+
             amount = txout.get("value", 0)
             script_type = txout.get("scriptpubkey_type", "p2wpkh")
             scriptpubkey = txout.get("scriptpubkey", "")
 
-            # Verify address type matches mix
-            mix = await self.db.get_mix(mix_id)
-            # For now we only accept p2wpkh
+            # Operator allowlist for input types. Anything off the list gets a
+            # polite reject. Underlying vsize tables still support the rejected
+            # types — only the policy gate is closed.
+            if script_type not in self.cfg.ACCEPTED_INPUT_TYPES:
+                accepted = ", ".join(sorted(self.cfg.ACCEPTED_INPUT_TYPES))
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"UTXO {txid}:{vout} is {script_type}; we only accept {accepted} inputs right now.",
+                )
+                continue
+
+            # Reject dust below MINIMUM_UTXO_SIZE — these can't realistically
+            # carry an equal output through mixing and only inflate vsize.
+            if amount < self.cfg.MINIMUM_UTXO_SIZE:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"UTXO {txid}:{vout} is {amount} sats, below the {self.cfg.MINIMUM_UTXO_SIZE}-sat minimum.",
+                )
+                continue
 
             # Add UTXO to database — include the actual prevout script hex
             # so build_skeleton can create a valid CTxOut for the PSBT input.
             await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
+            # Reserve the UTXO so a concurrent commit (from a second mix or
+            # a re-/commit) can't claim the same outpoint.
+            await self.db.mark_utxo_used(pid, txid, vout)
             valid_utxos.append({"txid": txid, "vout": vout, "amount": amount, "script_type": script_type, "scriptpubkey": scriptpubkey})
             total_sats += amount
 
@@ -247,9 +287,33 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, "You need to send us at least 2 addresses.")
             return
 
-        # Find active participant
+        # Operator allowlist for output types. Reject the whole batch if any
+        # address is the wrong type (or doesn't parse) — easier for the user to
+        # fix a complete set than to track which ones we accepted.
+        disallowed = []
+        for addr in addrs:
+            try:
+                t = self.psbt_mgr._address_type(addr)
+            except Exception:
+                disallowed.append((addr, "unparseable"))
+                continue
+            if t not in self.cfg.ACCEPTED_OUTPUT_TYPES:
+                disallowed.append((addr, t))
+        if disallowed:
+            accepted = ", ".join(sorted(self.cfg.ACCEPTED_OUTPUT_TYPES))
+            sample = ", ".join(a for a, _ in disallowed[:3])
+            await self.nostr.send_dm(
+                npub_hex,
+                f"For this mix we're only accepting {accepted} addresses. "
+                f"These don't match: {sample}",
+            )
+            return
+
+        # Find active participant. We accept 'paid' here as well as 'committed'
+        # so that ghost-recovery survivors can re-submit addresses without
+        # re-paying the service fee.
         participants = await self.db.get_participants_by_npub(npub_hex)
-        active = [p for p in participants if p["state"] in ("committed",)]
+        active = [p for p in participants if p["state"] in ("committed", "paid")]
 
         if not active:
             await self.nostr.send_dm(npub_hex, "You haven't committed UTXOs yet. Start with /commit")
@@ -257,6 +321,7 @@ class Coordinator:
 
         pid = active[0]["id"]
         mix_id = active[0]["mix_id"]
+        already_paid = active[0]["state"] == "paid"
         mix = await self.db.get_mix(mix_id)
 
         if not mix:
@@ -287,12 +352,14 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, "Your inputs are insufficient for even one output.")
             return
 
-        # Store addresses in database
-        # Save them in order, marking change
+        # Store addresses. If this is a ghost-recovery resubmission, clear the
+        # stale outputs first so we don't double-count.
+        if already_paid:
+            await self.db.delete_outputs_by_participant(pid)
+
+        # Save them in order: equal outputs use first num_equal addresses, then
+        # one change output at index num_equal (if change is large enough).
         for i, addr in enumerate(addrs):
-            is_change = i >= num_equal  # indices >= num_equal are change outputs
-            # Actually we need to be smarter: we use addresses in order
-            # equal outputs use first N addresses, then change uses next
             amount = output_size if i < num_equal else (chg_amt if i == num_equal else 0)
             if amount > 0:
                 await self.db.add_output(pid, addr, amount, is_change=(i >= num_equal))
@@ -300,15 +367,25 @@ class Coordinator:
         # Calculate final service fee
         final_service_fee = self.fee_engine.calculate_service_fee(num_inputs, num_used_outputs)
 
-        await self.nostr.send_dm(
-            npub_hex,
-            f"{num_equal} outputs @ {eq_amt / 1e8:.4f} BTC each."
-            + (f" + {chg_amt / 1e8:.4f} BTC change." if num_change and chg_amt > 0 else "")
-            + f"\nPay {final_service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}."
-        )
+        if already_paid:
+            # No zap prompt — they've already paid in a prior round.
+            await self.nostr.send_dm(
+                npub_hex,
+                f"{num_equal} outputs @ {eq_amt / 1e8:.4f} BTC each."
+                + (f" + {chg_amt / 1e8:.4f} BTC change." if num_change and chg_amt > 0 else "")
+                + "\nYou're already paid up; waiting for the mix to refill."
+            )
+        else:
+            await self.nostr.send_dm(
+                npub_hex,
+                f"{num_equal} outputs @ {eq_amt / 1e8:.4f} BTC each."
+                + (f" + {chg_amt / 1e8:.4f} BTC change." if num_change and chg_amt > 0 else "")
+                + f"\nPay {final_service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}."
+            )
 
-        # Update participant state
-        await self.db.update_participant(pid, state="committed", change_amount=chg_amt)
+        # Preserve 'paid' across resubmission; only move 'committed' rows forward.
+        new_state = "paid" if already_paid else "committed"
+        await self.db.update_participant(pid, state=new_state, change_amount=chg_amt)
         # Move mix to collecting if not already; set deadline if unset
         if mix["state"] == "announced":
             deadline = mix.get("deadline_unix")
@@ -335,8 +412,12 @@ class Coordinator:
         pid = signing[0]["id"]
         mix_id = signing[0]["mix_id"]
 
-        # Get the sent PSBT round
-        round_data = await self.db.get_psbt_round(mix_id, pid, 1)
+        # Look up the active PSBT round. Each ghost-recovery pass increments
+        # the round number, so we ask for whichever round was emitted by the
+        # most recent _assemble_psbt for this mix.
+        mix_row = await self.db.get_mix(mix_id)
+        round_num = (mix_row.get("ghost_retries", 0) + 1) if mix_row else 1
+        round_data = await self.db.get_psbt_round(mix_id, pid, round_num)
         if not round_data:
             await self.nostr.send_dm(npub_hex, "No PSBT record found. Please wait for the signing request.")
             return
@@ -621,20 +702,32 @@ class Coordinator:
             )
 
     async def _assemble_psbt(self, mix: Dict, active: List[Dict]):
-        """Build the PSBT skeleton and send to all paid participants."""
+        """Build the PSBT skeleton and send to all paid participants.
+
+        Each participant's outputs are sized as:
+            equal_outputs:  num_equal * output_size  (size set by the mix)
+            change_output:  total_inputs - num_equal*output_size - fee_share
+
+        fee_share is each participant's proportional slice of the total miner
+        fee, computed from their input+output vsize contribution. The miner
+        fee is what makes (sum of inputs) > (sum of outputs); it must be left
+        on the table, not handed back as change.
+        """
         mix_id = mix["id"]
         output_size = mix["output_size"]
-        fee_rate = mix.get("fee_rate", 30)
+        fee_rate = mix.get("fee_rate") or 30
 
-        # Gather all inputs and outputs
-        all_inputs = []
-        all_outputs = []
-        participant_details = []
+        # Gather inputs and per-participant fee-engine input.
+        all_inputs: List[Dict] = []
+        participants_data: List[Dict] = []  # for calculate_all_fees
+        addrs_by_pid: Dict[str, List[str]] = {}
 
         for p in active:
             pid = p["id"]
             utxos = await self.db.get_utxos_by_participant(pid)
-            outputs = await self.db.get_outputs_by_participant(pid)
+            stored_outputs = await self.db.get_outputs_by_participant(pid)
+            addrs_in_order = [o["address"] for o in stored_outputs]
+            total_sats = sum(u["amount"] for u in utxos)
 
             for u in utxos:
                 all_inputs.append({
@@ -645,50 +738,62 @@ class Coordinator:
                     "scriptpubkey": u.get("scriptpubkey", ""),
                 })
 
-            for o in outputs:
-                if o["amount"] > 0:
-                    all_outputs.append({
-                        "address": o["address"],
-                        "amount": o["amount"],
-                    })
-
-            # Count inputs by script type for this participant
             ibt: Dict[str, int] = {}
             for u in utxos:
                 st = u.get("script_type", "p2wpkh")
                 ibt[st] = ibt.get(st, 0) + 1
 
-            # Count outputs by script type (inferred from addresses)
             obt: Dict[str, int] = {}
-            for o in outputs:
-                if o["amount"] > 0:
-                    addr_type = self.psbt_mgr._address_type(o["address"])
-                    obt[addr_type] = obt.get(addr_type, 0) + 1
+            for addr in addrs_in_order:
+                addr_type = self.psbt_mgr._address_type(addr)
+                obt[addr_type] = obt.get(addr_type, 0) + 1
 
-            participant_details.append({
+            participants_data.append({
                 "pid": pid,
+                "npub_hex": p["npub_hex"],
                 "num_inputs": len(utxos),
-                "total_sats": sum(u["amount"] for u in utxos),
-                "num_addresses": len([o for o in outputs if o["amount"] > 0]),
+                "total_sats": total_sats,
+                "num_addresses": len(addrs_in_order),
                 "inputs_by_type": ibt,
-                "outputs_by_type": obt if obt else {"p2wpkh": len([o for o in outputs if o["amount"] > 0])},
+                "outputs_by_type": obt if obt else {"p2wpkh": 0},
             })
+            addrs_by_pid[pid] = addrs_in_order
 
-        # Aggregate all input/output types for total vsize
-        agg_inputs: Dict[str, int] = {}
-        agg_outputs: Dict[str, int] = {}
-        for pd in participant_details:
-            for k, v in pd.get("inputs_by_type", {"p2wpkh": pd["num_inputs"]}).items():
-                agg_inputs[k] = agg_inputs.get(k, 0) + v
-            for k, v in pd.get("outputs_by_type", {"p2wpkh": pd["num_addresses"]}).items():
-                agg_outputs[k] = agg_outputs.get(k, 0) + v
-
-        total_vsize = self.psbt_mgr.estimate_vsize(agg_inputs, agg_outputs)
-        total_miner_fee = int(total_vsize * fee_rate)
+        # Compute per-participant fee shares with the actual fee_rate.
+        total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
+            participants_data, output_size, fee_rate,
+        )
 
         if total_miner_fee <= 0:
             await self._cancel_and_refund(mix, "invalid fee calculation")
             return
+
+        # Build all_outputs with the corrected per-participant amounts. Each
+        # participant's change is reduced by their fee_share; if change drops
+        # below MINIMUM_UTXO_SIZE it's dropped entirely (those sats become
+        # additional miner fee, per the plan).
+        all_outputs: List[Dict] = []
+        for rec, fr in zip(participants_data, fee_results):
+            if fr.num_equal_outputs == 0:
+                await self._cancel_and_refund(
+                    mix, f"participant {rec['pid']} can't cover one equal output after fees",
+                )
+                return
+            addrs = addrs_by_pid[rec["pid"]]
+            for i in range(fr.num_equal_outputs):
+                all_outputs.append({"address": addrs[i], "amount": output_size})
+            if fr.num_change_outputs > 0 and fr.change_sats > 0:
+                change_idx = fr.num_equal_outputs
+                if change_idx < len(addrs):
+                    all_outputs.append({"address": addrs[change_idx], "amount": fr.change_sats})
+            # Persist the final accounting for transparency / debugging.
+            await self.db.update_participant(
+                rec["pid"],
+                fee_share=fr.fee_share_sats,
+                change_amount=fr.change_sats,
+            )
+
+        await self.db.update_mix(mix_id, fee_rate=int(fee_rate))
 
         # Build the PSBT
         psbt_hex = self.psbt_mgr.build_skeleton(all_inputs, all_outputs)
@@ -703,11 +808,14 @@ class Coordinator:
             logger.warning(f"Privacy check failed for {mix_id}: {privacy_msg}")
             # Continue anyway — the plan says non-authoritative
 
-        # Record PSBT rounds for each participant
+        # Record PSBT rounds for each participant. round_num tracks ghost
+        # recovery passes; the schema's UNIQUE(mix_id, pid, round_num) means
+        # a second pass with round_num=1 would collide.
+        round_num = mix.get("ghost_retries", 0) + 1
         now_ts = int(time.time())
         for p in active:
             pid = p["id"]
-            round_id = await self.db.add_psbt_round(mix_id, pid, round_num=1)
+            round_id = await self.db.add_psbt_round(mix_id, pid, round_num=round_num)
             await self.db.update_psbt_round(round_id, psbt_sent=psbt_hex, psbt_sent_at_unix=now_ts)
 
             # Send PSBT to participant
@@ -748,24 +856,40 @@ class Coordinator:
             if p["state"] == "signed":
                 continue  # Already signed
 
-            # Check ghosting
+            # Reminder progression: count is the number of DMs sent so far.
+            # Time bands (low → high): deadline/8 → /4 → /2 → deadline.
+            # Each band gates on the prior band's count so we only DM once.
             if time_since > deadline_seconds:
-                # Ghosted
+                # Ghosted — blacklist the npub AND each of their UTXOs by
+                # txid:vout, so a ghoster can't re-commit the same UTXOs from
+                # a fresh npub.
                 await self.db.update_participant(p["id"], state="ghosted")
-                # Add to blacklist
+                # Keep the in-memory dict in sync: later filters (remaining,
+                # ghost_participants) read p["state"] and would otherwise see
+                # the pre-update value.
+                p["state"] = "ghosted"
                 await self.db.add_to_blacklist(p["npub_hex"], reason="ghosting")
+                ghost_utxos = await self.db.get_utxos_by_participant(p["id"])
+                for gu in ghost_utxos:
+                    await self.db.add_to_blacklist(
+                        p["npub_hex"],
+                        utxo_txid_vout=f"{gu['txid']}:{gu['vout']}",
+                        reason="ghosting",
+                    )
                 ghosted_any = True
-                logger.info(f"Participant {p['npub_hex']} ghosted mix {mix_id}")
+                logger.info(f"Participant {_bech32_npub(p['npub_hex'])} ghosted mix {mix_id}")
 
             elif time_since > deadline_seconds // 2:
-                # Final warning
-                if p.get("reminder_count", 0) <= 1:
+                # Final warning — gates on count==2 (the second reminder must
+                # have already fired). The old code gated on count<=1, which
+                # was permanently false after the second reminder ran.
+                if p.get("reminder_count", 0) == 2:
                     await self.nostr.send_dm(
                         p["npub_hex"],
                         f"FINAL WARNING: Sign the PSBT for {mix_id} within "
                         f"{int((deadline_seconds - time_since) / 3600)} hours or lose your fee."
                     )
-                    await self.db.update_participant(p["id"], reminder_count=2)
+                    await self.db.update_participant(p["id"], reminder_count=3)
 
             elif time_since > deadline_seconds // 4:
                 # Second reminder
@@ -809,26 +933,36 @@ class Coordinator:
                     await self.db.delete_utxos_by_participant(gp["id"])
                     await self.db.delete_outputs_by_participant(gp["id"])
 
-                # Notify remaining of ghosting
+                # Notify remaining and actually clear their addresses so the
+                # ghost-warning DM ("we've thrown out your addresses") tells
+                # the truth. Their UTXOs and service-fee payment are kept; the
+                # 'paid' state combined with empty outputs is what _cmd_provide_addresses
+                # needs to accept a re-submission without re-charging.
                 for p in remaining:
+                    await self.db.delete_outputs_by_participant(p["id"])
+                    await self.db.update_participant(p["id"], state="paid", reminder_count=0)
                     await self.nostr.send_dm(
                         p["npub_hex"],
                         self.parser.format_ghost_warning(mix_id),
                     )
-                    # Move back to paid state
-                    await self.db.update_participant(p["id"], state="paid")
 
-                # Move mix back to collecting
-                await self.db.update_mix(mix_id, state="collecting")
+                # Move mix back to collecting and extend the deadline so the
+                # survivors actually have time to re-submit addresses before
+                # the next assembly attempt.
+                new_deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+                await self.db.update_mix(
+                    mix_id, state="collecting", deadline_unix=new_deadline,
+                )
 
     async def _combine_and_broadcast(self, mix: Dict, signed: List[Dict]):
         """Combine all signed PSBTs and broadcast."""
         mix_id = mix["id"]
+        round_num = mix.get("ghost_retries", 0) + 1
 
-        # Collect signed PSBTs
+        # Collect signed PSBTs from the active round
         psbt_hexes = []
         for p in signed:
-            rounds = await self.db.get_psbt_round(mix_id, p["id"], 1)
+            rounds = await self.db.get_psbt_round(mix_id, p["id"], round_num)
             if rounds and rounds.get("psbt_returned"):
                 psbt_hexes.append(rounds["psbt_returned"])
 
@@ -848,10 +982,14 @@ class Coordinator:
             await self._cancel_and_refund(mix, "failed to finalize transaction")
             return
 
-        # Broadcast
+        # Broadcast. Save the raw hex alongside the txid so _broadcast_sweep
+        # can re-push the tx if it falls out of the mempool before confirming.
         txid = await self.chain.broadcast_tx(raw_tx_hex)
         if txid:
-            await self.db.update_mix(mix_id, state="broadcast", broadcast_txid=txid)
+            await self.db.update_mix(
+                mix_id, state="broadcast",
+                broadcast_txid=txid, broadcast_tx_hex=raw_tx_hex,
+            )
             # Notify participants
             for p in signed:
                 await self.nostr.send_dm(p["npub_hex"], f"Transaction broadcast: {txid}")
@@ -900,7 +1038,17 @@ class Coordinator:
                 confirmed = False
 
             if not confirmed:
-                logger.info(f"Mix {mix_id} broadcast tx {txid} not yet confirmed (checked at {now})")
+                # Re-push the tx in case it fell out of mempool. Cheap to do
+                # on the sweep cadence; harmless if the tx is still in mempool.
+                raw_tx_hex = mix.get("broadcast_tx_hex")
+                if raw_tx_hex:
+                    rebroadcast = await self.chain.re_broadcast(raw_tx_hex)
+                    if rebroadcast:
+                        logger.info(f"Mix {mix_id} re-broadcast {txid}; next check in {interval_hours}h")
+                    else:
+                        logger.warning(f"Mix {mix_id} re-broadcast of {txid} failed")
+                else:
+                    logger.info(f"Mix {mix_id} broadcast tx {txid} not confirmed; no raw hex saved, cannot re-broadcast")
                 continue
 
             # Confirmed! Notify remaining participants, then destroy all trace.
