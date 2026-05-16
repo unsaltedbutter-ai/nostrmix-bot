@@ -67,15 +67,17 @@ class Database:
 
     async def create_mix(self, output_size: int, min_participants: int = 3,
                          max_participants: Optional[int] = None,
-                         fee_per_element: int = 100) -> str:
+                         fee_per_element: int = 100,
+                         deadline_unix: Optional[int] = None) -> str:
         mid = _hex_id()
         now = _now()
+        deadline = deadline_unix if deadline_unix is not None else now + 3600 * 12  # 12 hour default
         await self._execute(
             """INSERT INTO mixes (id, output_size, min_participants, max_participants,
-               fee_per_element, state, created_at_unix, updated_at_unix)
-               VALUES (?, ?, ?, ?, ?, 'announced', ?, ?)""",
+               fee_per_element, state, deadline_unix, created_at_unix, updated_at_unix)
+               VALUES (?, ?, ?, ?, ?, 'announced', ?, ?, ?)""",
             (mid, output_size, min_participants, max_participants,
-             fee_per_element, now, now),
+             fee_per_element, deadline, now, now),
         )
         await self._conn.commit()
         return mid

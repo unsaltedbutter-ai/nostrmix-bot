@@ -305,9 +305,14 @@ class Coordinator:
 
         # Update participant state
         await self.db.update_participant(pid, state="committed", change_amount=chg_amt)
-        # Move mix to collecting if not already
+        # Move mix to collecting if not already; set deadline if unset
         if mix["state"] == "announced":
-            await self.db.update_mix(mix_id, state="collecting")
+            deadline = mix.get("deadline_unix")
+            if not deadline:
+                deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+                await self.db.update_mix(mix_id, state="collecting", deadline_unix=deadline)
+            else:
+                await self.db.update_mix(mix_id, state="collecting")
 
     async def _cmd_accept_psbt(self, ctx: SenderContext, npub_hex: str, psbt_hex: str):
         """Handle /psbt_accept <hex> — participant returns signed PSBT."""
@@ -860,14 +865,16 @@ class Coordinator:
 
         if not available:
             # No open mixes — create one using defaults
+            deadline_unix = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
             mid = await self.db.create_mix(
                 output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
                 min_participants=self.cfg.DEFAULT_MIX_USER_COUNT,
                 max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
                 fee_per_element=self.cfg.FEE_PER_ELEMENT,
+                deadline_unix=deadline_unix,
             )
             await self.db.update_mix(mid, state="collecting",
-                                     deadline_unix=int(time.time()) + 86400 * 3)  # 3 day deadline
+                                     deadline_unix=deadline_unix)
             msg = self.parser.format_list_response([{"id": mid, "output_size": self.cfg.DEFAULT_OUTPUT_SIZE, "state": "collecting"}])
 
         else:
