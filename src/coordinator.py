@@ -794,6 +794,18 @@ class Coordinator:
 
         # Validate payment — partial payments are the same as no payment
         if amount_sats >= expected_fee:
+            # Note overpayments so the operator can audit revenue against
+            # expected service fees. The user gets the same accept DM either
+            # way (it includes the actual amount they sent). On cancellation,
+            # the full fee_paid is what gets refunded (modulo keep_percent),
+            # so the bot's only net gain on overpayment is on a successful
+            # mix — the operator should be able to see that in the books.
+            if amount_sats > expected_fee:
+                logger.info(
+                    "Overpayment from %s for %s: %d sats received, %d expected (+%d)",
+                    _bech32_npub(npub_hex), mix_id,
+                    amount_sats, expected_fee, amount_sats - expected_fee,
+                )
             await self.db.update_participant(pid, fee_paid=amount_sats, state="paid")
             await self.nostr.send_dm(npub_hex, f"Payment of {amount_sats} sats accepted for {mix_id}.")
 

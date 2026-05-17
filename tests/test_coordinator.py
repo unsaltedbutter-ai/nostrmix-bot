@@ -1245,6 +1245,124 @@ class TestExitMixTypoMultiMix:
             await db.close()
 
 
+class TestOnZapHappyAndOverpayPaths:
+    """The committed-zap path was thin on coverage (only the unmatched-zap
+    log was tested). These pin down the exact-pay, overpay, and underpay
+    accept/reject + accounting + operator-log behaviour."""
+
+    async def _setup_committed_participant(self, db):
+        mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+                                     fee_per_element=100)
+        await db.update_mix(mix_id, state="collecting")
+        npub = "npub_payer"
+        pid = await db.add_participant(mix_id, npub, "")
+        await db.add_utxo(pid, TXID[0], 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+        # 2 outputs registered → expected = FEE_PER_ELEMENT * (1 + 2) = 300 sats
+        await db.add_output(pid, P2WPKH_ADDRS[0], 1_000_000)
+        await db.add_output(pid, P2WPKH_ADDRS[1], 1_000_000)
+        await db.update_participant(pid, state="committed")
+        return mix_id, pid, npub
+
+    @pytest.mark.asyncio
+    async def test_exact_payment_marks_paid_and_dms_acceptance(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pid, npub = await self._setup_committed_participant(db)
+
+            class Zap:
+                sender_hex = npub
+                amount_sats = 300  # 100 * (1 input + 2 outputs)
+
+            await coord._on_zap(Zap(), FakeCtx(npub))
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "paid"
+            assert p["fee_paid"] == 300
+            joined = " ".join(m for r, m in nostr.sent_dms if r == npub).lower()
+            assert "300 sats accepted" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_overpayment_marks_paid_with_full_amount_and_logs(self, caplog):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            import logging
+            mix_id, pid, npub = await self._setup_committed_participant(db)
+
+            class Zap:
+                sender_hex = npub
+                amount_sats = 1500  # expected 300, sent 1500 → +1200 overpay
+
+            with caplog.at_level(logging.INFO, logger="src.coordinator"):
+                await coord._on_zap(Zap(), FakeCtx(npub))
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "paid"
+            # The FULL zap amount is recorded — that's what gets refunded
+            # (modulo keep_percent) if the mix later cancels.
+            assert p["fee_paid"] == 1500
+            joined = " ".join(m for r, m in nostr.sent_dms if r == npub).lower()
+            assert "1500 sats accepted" in joined
+            # Operator-visibility log surfaces the excess.
+            log_text = " ".join(r.message.lower() for r in caplog.records)
+            assert "overpayment" in log_text
+            assert "1500" in log_text and "300" in log_text
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_underpayment_does_not_mark_paid_and_dms_insufficient(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pid, npub = await self._setup_committed_participant(db)
+
+            class Zap:
+                sender_hex = npub
+                amount_sats = 100  # expected 300, sent 100 → partial
+
+            await coord._on_zap(Zap(), FakeCtx(npub))
+
+            # Per the plan, partial payments are treated as no payment.
+            p = await db.get_participant(pid)
+            assert p["state"] == "committed"
+            assert p["fee_paid"] in (None, 0)
+            joined = " ".join(m for r, m in nostr.sent_dms if r == npub).lower()
+            assert "insufficient" in joined and "300" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_one_at_a_time_invariant_prevents_multi_mix_zap_ambiguity(self):
+        """The friend-reported concern that _on_zap picks awaiting[0] and
+        ignores siblings is structurally prevented: /join and the auto-mix
+        race guard ensure a user has at most one 'committed' participant.
+        Verify that by attempting to insert two committed rows for the
+        same npub — only one survives at all (the second goes through the
+        one-at-a-time gate)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Get into mix A and commit (so state is 'committed').
+            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            pid_a = await db.add_participant(mix_a, "npub_x", "")
+            await db.update_participant(pid_a, state="committed")
+
+            # Now try /join'ing mix B.
+            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            await coord._cmd_join_mix(FakeCtx("npub_x"), mix_b)
+
+            participants = await db.get_participants_by_npub("npub_x")
+            committed = [p for p in participants if p["state"] == "committed"]
+            assert len(committed) == 1, (
+                f"one-at-a-time gate failed: {len(committed)} committed rows"
+            )
+            # And the DM explains why /join was refused.
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "before joining another" in joined
+        finally:
+            await db.close()
+
+
 class TestSilentZapNoLongerSilent:
     """S6: zaps not matched to any committed participant were dropped with
     no log or DM. Operator-visibility regression."""
