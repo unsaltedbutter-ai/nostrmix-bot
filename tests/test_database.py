@@ -100,21 +100,19 @@ class TestDatabase:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_utxo_double_spend_detection(self):
+    async def test_utxo_double_spend_detection_marks_used(self):
+        """The is_used / is_utxo_used / mark_utxo_used flow still works on
+        a single-row outpoint. (Prior to S9 this test created two utxos
+        rows for the same outpoint; that's now blocked by the UNIQUE
+        constraint and the realistic flow is one row per active outpoint.)"""
         db = await make_db()
         try:
-            mid1 = await db.create_mix(1_000_000, 3)
-            mid2 = await db.create_mix(1_000_000, 3)
-            pid1 = await db.add_participant(mid1, "npub1", "")
-            pid2 = await db.add_participant(mid2, "npub2", "")
-
-            await db.add_utxo(pid1, "txid_abc", 0, 100_000)
-            await db.add_utxo(pid2, "txid_abc", 0, 200_000)
-
-            await db.mark_utxo_used(pid1, "txid_abc", 0)
-
-            used = await db.is_utxo_used("txid_abc", 0)
-            assert used
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "npub1", "")
+            await db.add_utxo(pid, "txid_abc", 0, 100_000)
+            assert await db.is_utxo_used("txid_abc", 0) is False
+            await db.mark_utxo_used(pid, "txid_abc", 0)
+            assert await db.is_utxo_used("txid_abc", 0) is True
         finally:
             await db.close()
 
@@ -169,6 +167,40 @@ class TestDatabase:
             await db.add_participant(mid2, "npub_hex", "")
             count = await db.count_active_participant_mixes("npub_hex")
             assert count == 2
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_add_utxo_duplicate_outpoint_is_blocked_by_unique_constraint(self):
+        """S9: the schema's UNIQUE(txid, vout) is the defense of last
+        resort against duplicate-outpoint inserts that slip past the
+        coordinator's is_utxo_used check (e.g. two parallel /commit
+        DMs racing between the check and the insert)."""
+        import sqlite3
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid1 = await db.add_participant(mid, "n1", "")
+            pid2 = await db.add_participant(mid, "n2", "")
+            await db.add_utxo(pid1, "abc", 0, 100_000)
+            with pytest.raises((sqlite3.IntegrityError, Exception)) as exc_info:
+                await db.add_utxo(pid2, "abc", 0, 100_000)
+            # Sanity check the error mentions the constraint.
+            assert "UNIQUE" in str(exc_info.value) or "constraint" in str(exc_info.value).lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unique_constraint_allows_distinct_outpoints(self):
+        """Same (txid, vout) → blocked. Same txid, different vout → fine."""
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 3)
+            pid = await db.add_participant(mid, "n1", "")
+            await db.add_utxo(pid, "abc", 0, 100_000)
+            await db.add_utxo(pid, "abc", 1, 100_000)  # different vout: OK
+            utxos = await db.get_utxos_by_participant(pid)
+            assert len(utxos) == 2
         finally:
             await db.close()
 

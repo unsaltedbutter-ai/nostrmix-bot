@@ -232,6 +232,17 @@ class Database:
         )
         await self._conn.commit()
 
+    async def delete_utxos_for_mix(self, mix_id: str):
+        """Delete all utxos rows for any participant in `mix_id`. Used by
+        cancel-and-refund and other paths that release the mix's outpoints
+        back to the pool so they can be re-committed elsewhere."""
+        await self._execute(
+            "DELETE FROM utxos WHERE participant_id IN "
+            "(SELECT id FROM participants WHERE mix_id = ?)",
+            (mix_id,),
+        )
+        await self._conn.commit()
+
     # --- Output CRUD ---
 
     async def add_output(self, participant_id: str, address: str,

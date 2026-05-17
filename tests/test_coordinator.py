@@ -1968,6 +1968,124 @@ class TestChunkedReassembly:
             await db.close()
 
 
+# --- S9: outpoint released to the pool on every cancel/drop/exit path ---
+
+
+class TestOutpointReleasedOnCancel:
+    """The UNIQUE(txid, vout) constraint is permanent — once a row exists,
+    no other commit can use the same outpoint. So every path that 'releases'
+    a participant or mix MUST delete the corresponding utxos rows or the
+    outpoint is bricked forever."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_and_refund_deletes_utxos(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            pid = await db.add_participant(mix_id, "user_x", "x@x")
+            await db.update_participant(pid, state="paid", fee_paid=500)
+            await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.mark_utxo_used(pid, TXID[0], 0)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
+
+            # Row is gone.
+            assert await db.get_utxo(TXID[0], 0) is None
+            # And a new commit can now use the same outpoint.
+            mix_id2 = await db.create_mix(output_size=1_000_000, min_participants=3)
+            pid2 = await db.add_participant(mix_id2, "user_y", "")
+            await db.add_utxo(pid2, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            assert await db.get_utxo(TXID[0], 0) is not None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_voluntary_exit_deletes_utxos(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            pid = await db.add_participant(mix_id, "exiter", "e@x")
+            await db.update_participant(pid, state="paid", fee_paid=500)
+            await db.add_utxo(pid, TXID[1], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.mark_utxo_used(pid, TXID[1], 0)
+
+            await coord._cmd_exit_mix(FakeCtx("exiter"), "exiter", None)
+
+            assert await db.get_utxo(TXID[1], 0) is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_drop_underfunded_deletes_utxos(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
+                                         max_participants=10)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30)
+
+            # Pattern from TestBroadcast409TreatedAsSuccess: two well-funded
+            # + one under-funded; the latter is dropped on assembly.
+            rich1 = await db.add_participant(mix_id, "rich_d1", "r1@x")
+            await db.update_participant(rich1, state="paid", fee_paid=500)
+            await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(rich1, addr, 1_000_000)
+
+            rich2 = await db.add_participant(mix_id, "rich_d2", "r2@x")
+            await db.update_participant(rich2, state="paid", fee_paid=500)
+            await db.add_utxo(rich2, TXID[1], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:6]:
+                await db.add_output(rich2, addr, 1_000_000)
+
+            poor = await db.add_participant(mix_id, "poor_d", "p@x")
+            await db.update_participant(poor, state="paid", fee_paid=300)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
+
+            await coord._assemble_psbt(await db.get_mix(mix_id),
+                                       await db.get_participants_by_mix(mix_id))
+
+            # poor's utxo should be released.
+            assert await db.get_utxo(TXID[2], 0) is None
+            # The survivors' utxos remain.
+            assert await db.get_utxo(TXID[0], 0) is not None
+            assert await db.get_utxo(TXID[1], 0) is not None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_commit_handles_unique_constraint_violation_gracefully(self):
+        """Race between is_utxo_used and add_utxo: simulate by pre-inserting
+        the same outpoint via a different participant. The coordinator
+        should catch the IntegrityError, DM the user, and not crash."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # A separate mix already holds (TXID[3], 0).
+            other_mix = await db.create_mix(output_size=1_000_000, min_participants=3)
+            other_pid = await db.add_participant(other_mix, "other", "")
+            await db.add_utxo(other_pid, TXID[3], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            # Note: is_used left as 0 so is_utxo_used returns False (the row
+            # exists but isn't yet "claimed"). This forces the add_utxo
+            # path to actually run and hit the UNIQUE constraint.
+
+            # New user commits the same outpoint.
+            new_mix = await db.create_mix(output_size=1_000_000, min_participants=3)
+            new_pid = await db.add_participant(new_mix, "racer", "")
+
+            chain.txouts[f"{TXID[3]}:0"] = _fake_txout(value=500_000)
+            await coord._cmd_commit_utxos(
+                FakeCtx("racer"), "racer", [{"txid": TXID[3], "vout": 0}],
+            )
+
+            # No second row added; user got a clear DM.
+            us = await db.get_utxos_by_participant(new_pid)
+            assert us == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "claimed" in joined or "another commit" in joined
+        finally:
+            await db.close()
+
+
 # --- S1: auto-mix-on-commit must re-check during the chain.lookup_txout await ---
 
 

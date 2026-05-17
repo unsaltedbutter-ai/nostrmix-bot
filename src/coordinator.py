@@ -375,7 +375,21 @@ class Coordinator:
 
             # Add UTXO to database — include the actual prevout script hex
             # so build_skeleton can create a valid CTxOut for the PSBT input.
-            await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
+            # The schema's UNIQUE(txid, vout) is the defense of last resort
+            # against the race window between is_utxo_used (which we checked
+            # above) and this insert. A parallel /commit handler could have
+            # claimed the same outpoint while we were awaiting chain calls;
+            # SQLite raises IntegrityError, we DM the user and move on.
+            import sqlite3
+            try:
+                await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
+            except sqlite3.IntegrityError:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"UTXO {txid}:{vout} was claimed by another commit while we "
+                    f"were processing yours. Please retry.",
+                )
+                continue
             # Reserve the UTXO so a concurrent commit (from a second mix or
             # a re-/commit) can't claim the same outpoint.
             await self.db.mark_utxo_used(pid, txid, vout)
@@ -731,7 +745,12 @@ class Coordinator:
 
         await self.nostr.send_dm(npub_hex, msg)
 
-        # Remove participant from mix
+        # Remove participant from mix. Also release their UTXOs back to
+        # the outpoint pool so they can re-commit them to a future mix —
+        # UNIQUE(txid, vout) would otherwise block the same outpoint
+        # forever.
+        await self.db.delete_utxos_by_participant(pid)
+        await self.db.delete_outputs_by_participant(pid)
         await self.db.update_participant(pid, state="cancelled")
 
     # --- Zap Handler ---
@@ -982,6 +1001,12 @@ class Coordinator:
         """Refund + DM a participant whose allocation collapsed to 0 equal
         outputs once the real miner fee was applied. C2 fix — the old code
         cancelled the whole mix in this case."""
+        # Release the dropped participant's UTXOs back to the pool — the
+        # UNIQUE(txid, vout) constraint would otherwise block these
+        # outpoints from being committed to a future mix.
+        await self.db.delete_utxos_by_participant(p["id"])
+        await self.db.delete_outputs_by_participant(p["id"])
+
         fee_paid = int(p.get("fee_paid") or 0)
         lud16 = p.get("lightning_addr", "")
         npub = p["npub_hex"]
@@ -1509,8 +1534,12 @@ class Coordinator:
                 await self.nostr.send_dm(p["npub_hex"], f"Mix {mix_id} cancelled: {reason}.")
 
         await self.db.update_mix(mix_id, state="cancelled")
-        # Clean up associated records
+        # Clean up associated records. utxos must go too: now that the
+        # schema enforces UNIQUE(txid, vout), leaving rows around would
+        # permanently block the same outpoints from being committed to
+        # any future mix.
         await self.db.delete_outputs_for_mix(mix_id)
+        await self.db.delete_utxos_for_mix(mix_id)
 
     # --- Lifecycle ---
 

@@ -46,7 +46,12 @@ CREATE TABLE IF NOT EXISTS utxos (
     script_type     TEXT,                        -- p2wpkh | p2tr | p2pkh
     scriptpubkey    TEXT,                        -- hex of the prevout script (from chain lookup)
     is_used         BOOLEAN DEFAULT 0,
-    created_at_unix INTEGER NOT NULL
+    created_at_unix INTEGER NOT NULL,
+    -- S9: at most one row per (txid, vout) in the table at any time.
+    -- All paths that "release" an outpoint (whole-mix cancel, per-participant
+    -- drop / cancel / exit, ghost detection, broadcast-confirmation destroy)
+    -- delete the utxos row, so the same outpoint can be re-committed later.
+    UNIQUE(txid, vout)
 );
 
 CREATE TABLE IF NOT EXISTS outputs (

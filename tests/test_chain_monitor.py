@@ -308,12 +308,17 @@ class TestVsizeAccuracy:
     @pytest.mark.asyncio
     async def test_p2tr_estimate_covers_real_vsize(self):
         """Live-hunt a recent block for a pure-p2tr tx and check it against
-        our estimate. Bumped out of parametrize because we have to search
-        for a tx with only p2tr inputs (not always present in a fixed tx)."""
+        our estimate — BUT only count it if every input looks like a
+        key-path spend (witness is a single 64-or-65 byte signature).
+        Script-path spends carry merkle proofs + script bytes and are
+        deliberately not modelled by our config's 60-vbyte estimate.
+
+        If no clean key-path candidate shows up in the recent chain
+        (some periods are heavy on Ordinals / inscriptions which use
+        script-path), the test skips rather than going red."""
         cm = ChainMonitor()
         try:
-            tip_height_raw = (await cm._client.get(f"{cm._api_base}/blocks/tip/height")).text
-            tip = int(tip_height_raw)
+            tip = int((await cm._client.get(f"{cm._api_base}/blocks/tip/height")).text)
             found_tx = None
             for offset in range(0, 6):
                 h = tip - offset
@@ -326,7 +331,19 @@ class TestVsizeAccuracy:
                         vi.get("prevout", {}).get("scriptpubkey_type")
                         for vi in stub["vin"] if vi.get("prevout")
                     }
-                    if types == {"v1_p2tr"}:
+                    if types != {"v1_p2tr"}:
+                        continue
+                    # Key-path test: each vin's witness is exactly one item,
+                    # 64 bytes (BIP-340 schnorr sig) or 65 bytes (with the
+                    # explicit sighash byte). Anything else (multi-item
+                    # witness, control-block, script bytes) is script-path
+                    # and not in scope for the 60-vbyte estimate.
+                    def _is_key_path(vin):
+                        w = vin.get("witness") or []
+                        if len(w) != 1:
+                            return False
+                        return len(w[0]) // 2 in (64, 65)  # hex → bytes
+                    if all(_is_key_path(vi) for vi in stub["vin"]):
                         found_tx = stub
                         break
                 if found_tx:
@@ -335,7 +352,10 @@ class TestVsizeAccuracy:
             await cm.close()
 
         if found_tx is None:
-            pytest.skip("no pure-p2tr tx in last 6 blocks; mempool.space ran out")
+            pytest.skip(
+                "no pure-p2tr key-path tx in last 6 blocks "
+                "(recent chain is heavy on script-path spends?)"
+            )
 
         vsize_calc = VsizeCalculator()
         actual = self._actual_vsize(found_tx)
