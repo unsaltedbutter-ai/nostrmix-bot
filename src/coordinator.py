@@ -10,7 +10,6 @@ import logging
 from typing import Optional, Dict, List, Any, Callable, Tuple
 
 from nostrbot_sdk import SenderContext, ValidatedZap, NostrBot
-from nostr_sdk import PublicKey
 
 from .config import BotConfig
 from .database import Database
@@ -21,21 +20,27 @@ from .fee_engine import FeeEngine, FeeResult
 from .lightning_handler import LightningHandler
 from .command_parser import CommandParser, ParsedCommand
 from .privacy import PrivacyCheck
+from .log_tokens import tokens
 
 logger = logging.getLogger(__name__)
 
 
-def _bech32_npub(hex_pubkey: str) -> str:
-    """Render a hex pubkey as a bech32 npub for operator-readable logs.
-
-    Per the plan, log lines should print npubs in bech32, not hex. Falls back
-    to the original hex string if conversion fails — we never want a logging
-    helper to raise during state-machine processing.
-    """
-    try:
-        return PublicKey.parse(hex_pubkey).to_bech32()
-    except Exception:
-        return hex_pubkey
+# Logging discipline (privacy gate):
+#
+# This bot's job is to break the on-chain link between participants. Any
+# log line that pairs (npub OR lud16) with (mix_id OR txid OR address OR
+# UTXO) reconstructs the link an outside observer can't otherwise derive.
+# Rules followed throughout this file:
+#
+#   1. Never log raw npub / lud16. Use tokens.p() / tokens.l().
+#   2. Never log mix_id and txid in the same line. The txid is public
+#      on-chain; the mix_id is internal. Pairing them in a log file
+#      lets anyone reading the log map every participant onto the
+#      public coinjoin transaction.
+#   3. Never log full output addresses or UTXO txid:vout. Tokens only.
+#   4. Never use ``exc_info=True`` or include ``{e}`` text in logs
+#      triggered by user input — tracebacks dump frame locals
+#      (UTXOs, addresses, PSBT hex). Use ``type(e).__name__`` instead.
 
 
 class Coordinator:
@@ -91,6 +96,10 @@ class Coordinator:
         npub_hex = ctx.sender_hex
 
         try:
+            # Privacy: do NOT pass user input to logger here. The match
+            # arms below log their own context; the outer except logs
+            # only the command verb + exception class, never the npub
+            # or the parsed args.
             match parsed.command:
                 case "list_mixes":
                     await self._cmd_list_mixes(ctx)
@@ -126,8 +135,17 @@ class Coordinator:
                 case _:
                     await self.nostr.send_dm(npub_hex, "Unknown command. Try: /list, /join <mix_id>, /commit, /addresses, /psbt_accept, /cancel")
         except Exception as e:
-            logger.error(f"DM handler error for {npub_hex}: {e}", exc_info=True)
+            # exc_info would dump frame locals (UTXOs, addresses, PSBT hex)
+            # into the log. Just record the participant token + command
+            # verb + exception class — enough to triage, nothing to leak.
+            logger.error(
+                "DM handler error: participant=%s command=%s err=%s",
+                tokens.p(npub_hex), parsed.command, type(e).__name__,
+            )
             try:
+                # The DM back to the user can carry the exception text
+                # safely — it goes only to them. (We could trim if we
+                # ever logged DM contents, but we don't.)
                 await self.nostr.send_dm(npub_hex, f"Error processing your message: {str(e)}")
             except Exception:
                 pass
@@ -231,7 +249,7 @@ class Coordinator:
             deadline_unix=deadline,
         )
         await self.db.update_mix(mid, state="collecting", input_type=input_type)
-        logger.info(f"Auto-created mix {mid} for input_type={input_type}")
+        logger.info("Auto-created mix %s for input_type=%s", tokens.m(mid), input_type)
         return mid
 
     async def _cmd_commit_utxos(self, ctx: SenderContext, npub_hex: str, utxos: List[Dict]):
@@ -768,10 +786,11 @@ class Coordinator:
             # No pending fee — could be a donation, a late zap after we already
             # marked the participant paid, or a zap from an npub we've never
             # met. Log so the operator can audit the bot's Lightning inflows
-            # against expected service fees.
+            # against expected service fees. Sender becomes an opaque token
+            # so the log doesn't link an npub to a payment trail.
             logger.info(
-                "Unmatched zap from %s for %d sats — no committed participant; ignored",
-                _bech32_npub(npub_hex), amount_sats,
+                "Unmatched zap: sender=%s amount=%d sats — no committed participant; ignored",
+                tokens.p(npub_hex), amount_sats,
             )
             return
 
@@ -802,8 +821,8 @@ class Coordinator:
             # mix — the operator should be able to see that in the books.
             if amount_sats > expected_fee:
                 logger.info(
-                    "Overpayment from %s for %s: %d sats received, %d expected (+%d)",
-                    _bech32_npub(npub_hex), mix_id,
+                    "Overpayment: participant=%s mix=%s received=%d expected=%d (+%d)",
+                    tokens.p(npub_hex), tokens.m(mix_id),
                     amount_sats, expected_fee, amount_sats - expected_fee,
                 )
             await self.db.update_participant(pid, fee_paid=amount_sats, state="paid")
@@ -837,7 +856,9 @@ class Coordinator:
             try:
                 await self._tick()
             except Exception as e:
-                logger.error(f"Event loop tick error: {e}", exc_info=True)
+                # exc_info would carry user-data-bearing frame locals into
+                # the log. Class name only.
+                logger.error("Event loop tick error: %s", type(e).__name__)
             await asyncio.sleep(60)  # Check every 60 seconds
 
     STALE_CHUNK_TIMEOUT = 3600  # 1 hour — discard incomplete chunk sets
@@ -851,15 +872,23 @@ class Coordinator:
             try:
                 await self._process_mix(mix, now)
             except Exception as e:
-                logger.error(f"Error processing mix {mix['id']}: {e}")
+                # mix token + exception class only — `e` may include
+                # UTXO or address content from inner SQL / PSBT errors.
+                logger.error(
+                    "Error processing mix %s: %s",
+                    tokens.m(mix["id"]), type(e).__name__,
+                )
 
         # Stale chunk cleanup — discard chunk sets that started >1h ago
         stale_keys = [
             k for k, rec in self._psbt_chunks.items()
             if now - rec.get("started", 0) > self.STALE_CHUNK_TIMEOUT
         ]
+        if stale_keys:
+            # Don't log the keys — they're "<npub_hex>:<mix_id>" strings.
+            # The count is all the operator needs for hygiene.
+            logger.info("Cleaning up %d stale PSBT chunk set(s)", len(stale_keys))
         for key in stale_keys:
-            logger.info(f"Cleaning up stale PSBT chunks for {key}")
             del self._psbt_chunks[key]
 
         # Broadcast sweep — checks confirmed mixes on an N-hour interval
@@ -892,8 +921,9 @@ class Coordinator:
                     if age <= pay_seconds:
                         continue
                     logger.info(
-                        f"Participant {_bech32_npub(p['npub_hex'])} never paid "
-                        f"for {mix_id} after {self.cfg.PAY_DEADLINE_HOURS}h — removing"
+                        "Participant %s never paid mix %s after %dh — removing",
+                        tokens.p(p["npub_hex"]), tokens.m(mix_id),
+                        self.cfg.PAY_DEADLINE_HOURS,
                     )
                     await self.db.delete_utxos_by_participant(p["id"])
                     await self.db.delete_outputs_by_participant(p["id"])
@@ -1038,7 +1068,7 @@ class Coordinator:
             logger.error(
                 "Cannot refund dropped participant %s in mix %s: fee_paid=%d but "
                 "no lightning_addr. Sats stranded; operator must reconcile.",
-                _bech32_npub(npub), mix_id, fee_paid,
+                tokens.p(npub), tokens.m(mix_id), fee_paid,
             )
             await self.db.update_participant(p["id"], state="cancelled")
             await self.nostr.send_dm(
@@ -1243,7 +1273,10 @@ class Coordinator:
                         reason="ghosting",
                     )
                 ghosted_any = True
-                logger.info(f"Participant {_bech32_npub(p['npub_hex'])} ghosted mix {mix_id}")
+                logger.info(
+                    "Participant %s ghosted mix %s",
+                    tokens.p(p["npub_hex"]), tokens.m(mix_id),
+                )
 
             elif time_since > deadline_seconds // 2:
                 # Final warning — gates on count==2 (the second reminder must
@@ -1407,14 +1440,20 @@ class Coordinator:
                 # Re-push the tx in case it fell out of mempool. Cheap to do
                 # on the sweep cadence; harmless if the tx is still in mempool.
                 raw_tx_hex = mix.get("broadcast_tx_hex")
+                # Privacy: NEVER log mix_id and txid together. The txid
+                # is public on-chain, the mix_id is internal — joining
+                # them in a log file lets anyone reconstruct mix
+                # membership from the public coinjoin. Use the mix
+                # token only; surface the txid in a separate line.
+                mtoken = tokens.m(mix_id)
                 if raw_tx_hex:
                     rebroadcast = await self.chain.re_broadcast(raw_tx_hex)
                     if rebroadcast:
-                        logger.info(f"Mix {mix_id} re-broadcast {txid}; next check in {interval_hours}h")
+                        logger.info("Mix %s: re-broadcast attempted; next check in %dh", mtoken, interval_hours)
                     else:
-                        logger.warning(f"Mix {mix_id} re-broadcast of {txid} failed")
+                        logger.warning("Mix %s: re-broadcast failed", mtoken)
                 else:
-                    logger.info(f"Mix {mix_id} broadcast tx {txid} not confirmed; no raw hex saved, cannot re-broadcast")
+                    logger.info("Mix %s: broadcast not yet confirmed; no raw hex saved, cannot re-broadcast", mtoken)
                 continue
 
             # Confirmed! Notify remaining participants, then destroy all trace.
@@ -1430,7 +1469,10 @@ class Coordinator:
                         pass
 
             await self.db.destroy_mix_data(mix_id)
-            logger.info(f"Mix {mix_id} confirmed and all data destroyed (txid={txid})")
+            # Privacy: mix token only — pairing it with the public txid
+            # would let an observer map every participant in the local
+            # logs onto the on-chain coinjoin.
+            logger.info("Mix %s confirmed and all data destroyed", tokens.m(mix_id))
 
     # --- Announcement Scheduler ---
 
@@ -1464,7 +1506,7 @@ class Coordinator:
                 try:
                     await self._post_daily_announcement()
                 except Exception as e:
-                    logger.error(f"Daily announcement failed: {e}", exc_info=True)
+                    logger.error("Daily announcement failed: %s", type(e).__name__)
 
     async def _post_daily_announcement(self):
         """Post a daily announcement of open mixes."""
@@ -1531,7 +1573,7 @@ class Coordinator:
                     "Cannot refund participant %s for mix %s: fee_paid=%d but "
                     "no lightning_addr on record. Sats are stranded; operator "
                     "must reconcile manually.",
-                    _bech32_npub(p["npub_hex"]), mix_id, fee_paid,
+                    tokens.p(p["npub_hex"]), tokens.m(mix_id), fee_paid,
                 )
                 await self.db.update_participant(p["id"], state="cancelled")
                 await self.nostr.send_dm(
@@ -1563,6 +1605,9 @@ class Coordinator:
         keys = nostr_handler.keys
         if keys:
             await self.lightning.init_payer_with_keys(keys)
+            # The bot's own pubkey is a public identity — not a privacy
+            # concern. The operator needs to know which key the running
+            # bot is signing as.
             logger.info(
                 "LNURL payer initialized with bot keys: %s",
                 keys.public_key().to_bech32(),

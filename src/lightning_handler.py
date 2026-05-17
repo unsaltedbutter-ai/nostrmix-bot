@@ -7,7 +7,13 @@ from typing import Optional
 from nostrbot_sdk import BtcPayWallet, LnurlPayer, PayoutResult, FeePolicy
 from nostr_sdk import Keys
 
+from .log_tokens import tokens
+
 logger = logging.getLogger(__name__)
+
+
+# Logging discipline (see src/coordinator.py top-of-file): never log raw
+# lud16 or exception tracebacks. Tokens + exception class names only.
 
 
 class LightningHandler:
@@ -52,7 +58,8 @@ class LightningHandler:
                 balance = await self._btcpay_wallet.get_balance()
                 return balance
             except Exception as e:
-                logger.warning("BTCPay get_balance failed: %s", e, exc_info=True)
+                # No user data in this path; exception class is fine.
+                logger.warning("BTCPay get_balance failed: %s", type(e).__name__)
                 return None
         return None
 
@@ -74,9 +81,11 @@ class LightningHandler:
                 return result
             except Exception as e:
                 # Fall through to the LNURL payer rather than failing silently.
+                # Privacy: tokenise the lud16 (maps to npub via DB) and drop
+                # the traceback (would dump call-site locals).
                 logger.warning(
                     "BTCPay refund to %s for %d sats (reason=%s) failed: %s",
-                    lud16, amount_sats, reason, e, exc_info=True,
+                    tokens.l(lud16), amount_sats, reason, type(e).__name__,
                 )
 
         # Fallback: use LNURL payer
@@ -96,12 +105,12 @@ class LightningHandler:
             except Exception as e:
                 logger.error(
                     "LNURL refund to %s for %d sats (reason=%s) failed: %s",
-                    lud16, amount_sats, reason, e, exc_info=True,
+                    tokens.l(lud16), amount_sats, reason, type(e).__name__,
                 )
 
         logger.error(
             "Refund to %s for %d sats (reason=%s) — no working backend",
-            lud16, amount_sats, reason,
+            tokens.l(lud16), amount_sats, reason,
         )
         return None
 
