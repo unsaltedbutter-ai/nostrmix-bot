@@ -206,6 +206,33 @@ class PSBTManager:
                         or ret_in.prevout.n != skel_in.prevout.n):
                     return False, f"Input #{i} outpoint changed"
 
+            # S-C: nVersion, nLockTime, and per-input nSequence are part of
+            # the sighash. If a participant signed a modified version of any
+            # of them, the resulting signatures would either fail to combine
+            # cleanly or produce a tx with semantics we didn't intend (e.g.
+            # nLockTime in the future to delay confirmation, nSequence that
+            # signals RBF). In the happy path combine_psbts uses OUR
+            # unsigned_tx so the broadcast carries our version/locktime,
+            # but a malicious return whose signatures match a different
+            # locktime would silently fail at extract_transaction, masking
+            # the real cause. Reject up front.
+            if ret_tx.nVersion != skel_tx.nVersion:
+                return False, (
+                    f"Transaction version changed: "
+                    f"{ret_tx.nVersion} vs {skel_tx.nVersion}"
+                )
+            if ret_tx.nLockTime != skel_tx.nLockTime:
+                return False, (
+                    f"Transaction nLockTime changed: "
+                    f"{ret_tx.nLockTime} vs {skel_tx.nLockTime}"
+                )
+            for i, (skel_in, ret_in) in enumerate(zip(skel_tx.vin, ret_tx.vin)):
+                if ret_in.nSequence != skel_in.nSequence:
+                    return False, (
+                        f"Input #{i} nSequence changed: "
+                        f"{ret_in.nSequence} vs {skel_in.nSequence}"
+                    )
+
             # Check output amounts and scripts haven't been tampered with.
             for i, (skel_out, ret_out) in enumerate(zip(skel_tx.vout, ret_tx.vout)):
                 if ret_out.nValue != skel_out.nValue:
@@ -300,7 +327,15 @@ class PSBTManager:
         3. Returns the immutable CTransaction
 
         Returns: hex-encoded raw transaction, or None on failure.
+
+        C-E: logs the exception class + truncated message on failure so
+        the operator can distinguish "missing/bad sigs" (expected, user
+        misbehaviour) from "library/skeleton bug" (urgent — every mix would
+        cancel-and-refund silently otherwise). NOT exc_info — that would
+        dump frame locals containing PSBT hex with addresses.
         """
+        import logging
+        log = logging.getLogger(__name__)
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 
         try:
@@ -310,6 +345,17 @@ class PSBTManager:
             final_tx = combined_psbt.extract_transaction()
             return b2x(final_tx.serialize())
         except Exception as e:
+            # Truncate the message — bitcointx exceptions sometimes embed
+            # serialized PSBT fragments. 120 chars is plenty for diagnosis
+            # without leaking addresses or scripts wholesale.
+            msg = str(e)
+            if len(msg) > 120:
+                msg = msg[:120] + "...(truncated)"
+            log.warning(
+                "PSBT finalize failed: %s — %s "
+                "(typically means at least one input is unsigned)",
+                type(e).__name__, msg,
+            )
             return None
 
     # --- Chunking ---

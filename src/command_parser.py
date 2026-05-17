@@ -154,21 +154,6 @@ class CommandParser:
             )
         return "\n".join(lines)
 
-    def format_join_response(self, mix_id: str, num_addresses: int,
-                             input_count: int, fee_sats: int) -> str:
-        """Format the response after a participant registers."""
-        return (
-            f"Registered for mix {mix_id}.\n"
-            f"Send me txid and vout and {num_addresses} output addresses.\n"
-            f"Joining fee: {fee_sats} sats ({input_count} inputs + {num_addresses} outputs × fee)."
-        )
-
-    def format_fee_request(self, mix_id: str, fee_sats: int) -> str:
-        """Format the zap fee request message."""
-        return (
-            f"Zap me {fee_sats} sats to join {mix_id} mix."
-        )
-
     def format_paid_confirmation(self, mix_id: str, waiting: int) -> str:
         """Format the confirmation after payment received."""
         if waiting > 0:

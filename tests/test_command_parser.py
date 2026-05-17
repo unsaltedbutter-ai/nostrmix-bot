@@ -91,8 +91,7 @@ class TestCommandParser:
         assert "east-gate" in response
         assert "buggy-whip" in response
 
-    def test_format_fee_request(self):
-        """Test format_fee_request."""
-        msg = self.parser.format_fee_request("east-gate", 500)
-        assert "Zap me 500 sats" in msg
-        assert "east-gate" in msg
+    # format_fee_request / format_join_response were dead code (never
+    # called from the real flow — the fee is quoted in _cmd_provide_addresses
+    # AFTER both /commit and /addresses) and were removed to avoid misleading
+    # readers about when the fee is asked for.

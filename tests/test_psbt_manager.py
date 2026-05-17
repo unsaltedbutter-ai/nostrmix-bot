@@ -316,6 +316,84 @@ class TestPSBTManager:
             "finalize should not produce a tx hex for an only-partially-signed PSBT"
         )
 
+    # --- S-C: tx-level field checks (nVersion / nLockTime / nSequence) ---
+
+    def _modify_unsigned_tx(self, skel_hex: str, *, nVersion=None,
+                             nLockTime=None, vin_index_to_seq=None):
+        """Build a tampered PSBT by deserializing the skeleton, mutating
+        the unsigned_tx, and reserializing."""
+        from bitcointx.core import b2x
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel_hex))
+        tx = psbt.unsigned_tx.to_mutable()
+        if nVersion is not None:
+            tx.nVersion = nVersion
+        if nLockTime is not None:
+            tx.nLockTime = nLockTime
+        if vin_index_to_seq:
+            for i, seq in vin_index_to_seq.items():
+                tx.vin[i].nSequence = seq
+        psbt.unsigned_tx = tx
+        return b2x(psbt.serialize())
+
+    def test_validate_returned_rejects_modified_nversion(self):
+        """S-C: changing nVersion changes the sighash; the signatures the
+        participant produced wouldn't be ours, and extract_transaction
+        would fail late. Reject up front."""
+        skel = self._build_skeleton_with_input("dd" * 32)
+        tampered = self._modify_unsigned_tx(skel, nVersion=42)
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=0,
+            expected_output_addresses=[],
+        )
+        assert not ok
+        assert "version" in reason.lower()
+
+    def test_validate_returned_rejects_modified_nlocktime(self):
+        """S-C: a participant could push nLockTime forward to delay the tx."""
+        skel = self._build_skeleton_with_input("ee" * 32)
+        tampered = self._modify_unsigned_tx(skel, nLockTime=900_000)
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=0,
+            expected_output_addresses=[],
+        )
+        assert not ok
+        assert "locktime" in reason.lower()
+
+    def test_validate_returned_rejects_modified_nsequence(self):
+        """S-C: per-input nSequence is part of the sighash; modifying it
+        can also signal RBF in some wallets' interpretation."""
+        skel, keys = self._multi_input_skeleton(n=3)
+        tampered = self._modify_unsigned_tx(skel, vin_index_to_seq={1: 0xfffffffd})
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=1,
+            expected_output_addresses=[],
+            participant_input_indices=[0],
+        )
+        assert not ok
+        assert "nsequence" in reason.lower()
+
+    # --- C-E: finalize logs a useful diagnostic on failure ---
+
+    def test_finalize_logs_when_psbt_incomplete(self, caplog):
+        """C-E: if extract_transaction raises (typically because some input
+        is unsigned), finalize logs the exception class so the operator
+        can tell unsigned-input failures from real PSBT-structure bugs."""
+        import logging
+        skel, keys = self._multi_input_skeleton(n=3)
+        # Combine 2 of 3 signed PSBTs — the third input has no signature.
+        signed = [self._sign_with(skel, [i], keys) for i in range(2)]
+        combined = self.mgr.combine_psbts(signed)
+        with caplog.at_level(logging.WARNING, logger="src.psbt_manager"):
+            result = self.mgr.finalize(combined)
+        assert result is None
+        # Log captures the exception class name.
+        joined = " ".join(r.message for r in caplog.records)
+        assert "PSBT finalize failed" in joined
+
     def test_validate_returned_accepts_identical_skeleton_round_trip(self):
         """Regression guard for the S7 fix: an unmodified-but-not-yet-signed
         round-trip of the skeleton should pass the structural checks

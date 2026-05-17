@@ -152,6 +152,21 @@ class Database:
         await self._execute("DELETE FROM participants WHERE mix_id=?", (mix_id,))
         await self._conn.commit()
 
+    async def scrub_participants_for_mix(self, mix_id: str):
+        """S-F: clear npub_hex / lightning_addr from every participant in a
+        mix so a cancelled mix leaves no on-disk privacy footprint.
+
+        Used by _cancel_and_refund. Keeps the participant rows (so 'refunded' /
+        'refund_failed' / 'cancelled' state remains queryable for the operator)
+        but blanks the identifying fields. Blacklist entries are stored
+        separately and untouched.
+        """
+        await self._execute(
+            "UPDATE participants SET npub_hex='', lightning_addr='' WHERE mix_id=?",
+            (mix_id,),
+        )
+        await self._conn.commit()
+
     async def delete_participant(self, pid: str):
         await self._execute("DELETE FROM participants WHERE id=?", (pid,))
         await self._conn.commit()
@@ -282,16 +297,43 @@ class Database:
 
     async def add_psbt_round(self, mix_id: str, participant_id: str,
                              round_num: int = 1) -> str:
+        """Insert a psbt_rounds row, or return the existing row's id if
+        (mix_id, participant_id, round_num) already exists.
+
+        Idempotent so that a crash-mid-_assemble_psbt followed by an event-
+        loop retry doesn't trip the UNIQUE(mix_id, participant_id, round_num)
+        constraint and wedge the mix (C-C). The caller's subsequent
+        update_psbt_round will overwrite psbt_sent / input_indices, which is
+        exactly what we want — the second-pass skeleton replaces the
+        partially-written first-pass one.
+        """
         rid = _hex_id()
         now = _now()
-        await self._execute(
-            """INSERT INTO psbt_rounds (id, mix_id, participant_id, round_num,
-               psbt_sent_at_unix, created_at_unix)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (rid, mix_id, participant_id, round_num, now, now),
-        )
-        await self._conn.commit()
-        return rid
+        try:
+            await self._execute(
+                """INSERT INTO psbt_rounds (id, mix_id, participant_id, round_num,
+                   psbt_sent_at_unix, created_at_unix)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (rid, mix_id, participant_id, round_num, now, now),
+            )
+            await self._conn.commit()
+            return rid
+        except sqlite3.IntegrityError:
+            # Row already exists for this (mix, pid, round). Return its id;
+            # the caller will UPDATE it. Reset psbt_returned/psbt_valid since
+            # they may have stale state from the prior incomplete attempt.
+            existing = await self._fetchone(
+                "SELECT id FROM psbt_rounds WHERE mix_id=? AND participant_id=? AND round_num=?",
+                (mix_id, participant_id, round_num),
+            )
+            assert existing is not None, "IntegrityError but row not found?"
+            await self._execute(
+                "UPDATE psbt_rounds SET psbt_returned=NULL, psbt_valid=NULL, "
+                "psbt_returned_at_unix=NULL, updated_at_unix=? WHERE id=?",
+                (now, existing["id"]),
+            )
+            await self._conn.commit()
+            return existing["id"]
 
     async def get_psbt_round(self, mix_id: str, participant_id: str,
                              round_num: int) -> Optional[Dict]:
@@ -370,6 +412,13 @@ class Database:
         because those are handled via the N-hour sweep in _broadcast_sweep."""
         return await self.get_mixes_by_state(
             "announced", "collecting", "assembling", "signing"
+        )
+
+    async def participants_in_state(self, state: str) -> List[Dict]:
+        """All participant rows in a given state. Used at startup to surface
+        crash-stuck refunds (see Coordinator.start)."""
+        return await self._fetchall(
+            "SELECT * FROM participants WHERE state = ?", (state,),
         )
 
     async def resume_unfinished(self) -> List[Dict]:

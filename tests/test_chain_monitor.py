@@ -204,28 +204,36 @@ class TestLiveMempoolSpace:
         assert r3 is None
 
     @pytest.mark.asyncio
-    async def test_is_utxo_spent_malformed_txid_fail_open(self):
-        """is_utxo_spent is fail-open: malformed/unknown returns False."""
+    async def test_is_utxo_spent_malformed_txid_returns_false_when_endpoint_404s(self):
+        """S-B: when mempool.space cleanly 404s on a malformed/unknown txid,
+        is_utxo_spent returns False (not None). None is reserved for cases
+        where we couldn't reach the chain at all."""
         cm = ChainMonitor()
         try:
+            # Each of these will hit the live API. mempool.space responds
+            # 404 quickly to bad-format / nonexistent txids — that's a clean
+            # 'not spent' answer for our purposes.
             r1 = await cm.is_utxo_spent("not-a-real-txid", 0)
-            r2 = await cm.is_utxo_spent("0" * 64, 0)  # well-formed but never existed
+            r2 = await cm.is_utxo_spent("0" * 64, 0)
             r3 = await cm.is_utxo_spent("", 0)
         finally:
             await cm.close()
-        assert r1 is False
-        assert r2 is False
-        assert r3 is False
+        # Each may be False (404) or None (network blip) depending on the
+        # current state of the live API. Crucially, neither must be True.
+        assert r1 in (False, None)
+        assert r2 in (False, None)
+        assert r3 in (False, None)
 
     @pytest.mark.asyncio
     async def test_is_utxo_spent_negative_vout_does_not_throw(self):
-        """A negative vout would 404 the API; we should still return False."""
+        """A negative vout would 404 the API; should return False (404 is
+        a clean 'not spent' signal)."""
         cm = ChainMonitor()
         try:
             spent = await cm.is_utxo_spent(SATOSHI_BLOCK1_TXID, -1)
         finally:
             await cm.close()
-        assert spent is False
+        assert spent in (False, None)
 
     @pytest.mark.asyncio
     async def test_is_confirmed_unknown_txid_returns_false(self):
@@ -369,6 +377,278 @@ class TestVsizeAccuracy:
 # offline. respx will intercept before httpx makes a real request.
 _OFFLINE_API = "https://test-mempool-offline.invalid/api"
 _OFFLINE_BACKUP = "https://test-mempool-backup-offline.invalid/api"
+
+
+# --- C-A: smart fee estimator (max-of-mins over last N blocks) -----------
+
+
+class TestSmartFeeEstimator:
+    """C-A: estimate_fee_rate looks at recent confirmed blocks' minimum
+    accepted feerates and takes the MAX (price of admission to the tightest
+    block in the lookback), times FEE_MULTIPLIER. Pin down the math."""
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_uses_max_of_min_feerates_across_lookback(self):
+        # 3 blocks; mins are 5, 7, 3 sat/vB. max = 7. multiplier 2.0 → 14.
+        blocks = [
+            {"id": "blk1", "extras": {"feeRange": [5, 8, 10, 15, 20, 30, 50]}},
+            {"id": "blk2", "extras": {"feeRange": [7, 8, 10, 15, 20, 30, 50]}},
+            {"id": "blk3", "extras": {"feeRange": [3, 8, 10, 15, 20, 30, 50]}},
+        ]
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(200, json=blocks)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.0, max_fee_rate=510, fee_multiplier=2.0,
+            fee_lookback_blocks=3,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        assert rate == 14.0, f"expected 7 (max of mins) × 2.0 = 14, got {rate}"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_lookback_window_caps_blocks_examined(self):
+        # 6 blocks served; with fee_lookback_blocks=2 we only see the first 2.
+        blocks = [
+            {"extras": {"feeRange": [50, 60, 70, 80, 90, 100, 200]}},   # max if included
+            {"extras": {"feeRange": [2, 8, 10, 15, 20, 30, 50]}},
+            {"extras": {"feeRange": [3, 8, 10, 15, 20, 30, 50]}},
+            {"extras": {"feeRange": [4, 8, 10, 15, 20, 30, 50]}},
+            {"extras": {"feeRange": [5, 8, 10, 15, 20, 30, 50]}},
+            {"extras": {"feeRange": [6, 8, 10, 15, 20, 30, 50]}},
+        ]
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(200, json=blocks)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.0, max_fee_rate=10000, fee_multiplier=1.0,
+            fee_lookback_blocks=2,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        # max(50, 2) = 50 × 1.0 = 50
+        assert rate == 50.0, f"expected lookback to cap at first 2 blocks: {rate}"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_clamp_floor_applies_when_chain_is_calm(self):
+        blocks = [{"extras": {"feeRange": [0.1, 1, 1, 1, 1, 1, 2]}}]
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(200, json=blocks)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.5, max_fee_rate=510, fee_multiplier=1.0,
+            fee_lookback_blocks=6,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        # 0.1 × 1.0 = 0.1, clamped up to MIN_FEE_RATE_SATS = 1.5
+        assert rate == 1.5
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_clamp_ceiling_applies_when_chain_is_hot(self):
+        blocks = [{"extras": {"feeRange": [400, 500, 600, 700, 800, 900, 1000]}}]
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(200, json=blocks)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.0, max_fee_rate=510, fee_multiplier=2.0,
+            fee_lookback_blocks=6,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        # 400 × 2.0 = 800, clamped down to MAX_FEE_RATE_SATS = 510
+        assert rate == 510.0
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_falls_back_to_hour_fee_when_blocks_unavailable(self):
+        # /v1/blocks returns nothing useful; /v1/fees/recommended has hourFee.
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(500)
+        )
+        respx.get(f"{_OFFLINE_API}/v1/fees/recommended").mock(
+            return_value=httpx.Response(200, json={"hourFee": 25})
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.0, max_fee_rate=510, fee_multiplier=2.0,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        assert rate == 50.0, f"25 × 2.0 = 50, got {rate}"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_final_fallback_returns_clamp_floor(self):
+        # Every endpoint dead → fall back to the clamp floor.
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(500)
+        )
+        respx.get(f"{_OFFLINE_API}/v1/fees/recommended").mock(
+            return_value=httpx.Response(500)
+        )
+        respx.get(f"{_OFFLINE_API}/v1/fees/mempool-blocks").mock(
+            return_value=httpx.Response(500)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.5, max_fee_rate=510, fee_multiplier=1.5,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        assert rate >= 1.5
+
+
+# --- C-D: tx_known semantics --------------------------------------------
+
+
+class TestTxKnown:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_true_when_primary_finds_tx(self):
+        respx.get(f"{_OFFLINE_API}/tx/abc").mock(
+            return_value=httpx.Response(200, json={"txid": "abc"})
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            assert (await cm.tx_known("abc")) is True
+        finally:
+            await cm.close()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_false_when_both_return_404(self):
+        respx.get(f"{_OFFLINE_API}/tx/abc").mock(return_value=httpx.Response(404))
+        respx.get(f"{_OFFLINE_BACKUP}/tx/abc").mock(return_value=httpx.Response(404))
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            assert (await cm.tx_known("abc")) is False
+        finally:
+            await cm.close()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_none_when_both_endpoints_unreachable(self):
+        """Critical for C-D: this is what stops the coordinator from
+        refunding while the tx might actually be in someone's mempool."""
+        respx.get(f"{_OFFLINE_API}/tx/abc").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        respx.get(f"{_OFFLINE_BACKUP}/tx/abc").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            assert (await cm.tx_known("abc")) is None
+        finally:
+            await cm.close()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_true_when_backup_finds_tx(self):
+        respx.get(f"{_OFFLINE_API}/tx/abc").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        respx.get(f"{_OFFLINE_BACKUP}/tx/abc").mock(
+            return_value=httpx.Response(200, json={"txid": "abc"})
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            assert (await cm.tx_known("abc")) is True
+        finally:
+            await cm.close()
+
+
+# --- S-B: is_utxo_spent fail-closed -------------------------------------
+
+
+class TestIsUtxoSpentFailClosed:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_true_when_endpoint_reports_spent(self):
+        respx.get(f"{_OFFLINE_API}/tx/aa/outspend/0").mock(
+            return_value=httpx.Response(200, json={"spent": True})
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=None)
+        try:
+            assert (await cm.is_utxo_spent("aa", 0)) is True
+        finally:
+            await cm.close()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_false_when_endpoint_reports_unspent(self):
+        respx.get(f"{_OFFLINE_API}/tx/aa/outspend/0").mock(
+            return_value=httpx.Response(200, json={"spent": False})
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=None)
+        try:
+            assert (await cm.is_utxo_spent("aa", 0)) is False
+        finally:
+            await cm.close()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_returns_none_when_both_endpoints_fail(self):
+        """The S-B fix. With fail-open this used to return False;
+        users were charged a service fee for unspendable UTXOs during
+        API outages."""
+        respx.get(f"{_OFFLINE_API}/tx/aa/outspend/0").mock(
+            side_effect=httpx.ConnectError("dns")
+        )
+        respx.get(f"{_OFFLINE_BACKUP}/tx/aa/outspend/0").mock(
+            return_value=httpx.Response(500)
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            assert (await cm.is_utxo_spent("aa", 0)) is None
+        finally:
+            await cm.close()
+
+
+# --- broadcast_tx 429 must not be treated as a hard rejection -----------
+
+
+class TestBroadcast429FallsThroughToBackup:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_429_on_primary_tries_backup(self):
+        raw, expected_txid = _real_tx_hex_and_txid()
+        respx.post(f"{_OFFLINE_API}/tx").mock(
+            return_value=httpx.Response(429, text="too many requests")
+        )
+        respx.post(f"{_OFFLINE_BACKUP}/tx").mock(
+            return_value=httpx.Response(200, text=expected_txid)
+        )
+        cm = ChainMonitor(api_base=_OFFLINE_API, api_backup=_OFFLINE_BACKUP)
+        try:
+            result = await cm.broadcast_tx(raw)
+        finally:
+            await cm.close()
+        assert result == expected_txid
+
+
+
 
 
 def _offline_monitor() -> ChainMonitor:

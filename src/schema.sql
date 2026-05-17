@@ -26,7 +26,12 @@ CREATE TABLE IF NOT EXISTS participants (
     mix_id          TEXT NOT NULL REFERENCES mixes(id),
     npub_hex        TEXT NOT NULL,
     state           TEXT NOT NULL DEFAULT 'interested',
-    -- interested | committed | paid | signing | signed | ghosted | broadcast | refunded
+    -- interested | committed | paid | signing | signed | ghosted | broadcast
+    -- | refunding | refunded | refund_failed | cancelled
+    -- 'refunding' is set BEFORE we call the LN wallet so a crash-resume
+    -- never re-attempts a payout that may already have left the wallet.
+    -- 'refund_failed' is set if both LN backends returned None — operator
+    -- must reconcile manually.
     fee_paid        INTEGER,                    -- sats zap received
     fee_share       INTEGER,                    -- on-chain fee share (calculated)
     change_amount   INTEGER,                    -- change output sats, 0 = no change

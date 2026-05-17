@@ -49,6 +49,7 @@ async def main():
         min_fee_rate=cfg.MIN_FEE_RATE_SATS,
         max_fee_rate=cfg.MAX_FEE_RATE_SATS,
         fee_multiplier=cfg.FEE_MULTIPLIER,
+        fee_lookback_blocks=cfg.FEE_LOOKBACK_BLOCKS,
     )
 
     psbt_mgr = PSBTManager(

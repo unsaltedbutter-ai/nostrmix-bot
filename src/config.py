@@ -30,6 +30,11 @@ _DEFAULTS = {
     "FEE_MULTIPLIER": 1.5,
     "MIN_FEE_RATE_SATS": 1.5,
     "MAX_FEE_RATE_SATS": 510,
+    # How many recently-confirmed blocks to look back when estimating the
+    # sat/vB rate that will probably confirm within an hour. Bitcoin's target
+    # is ~10 min/block, so 6 ≈ 1 hour. Larger values smooth over short fee
+    # spikes (safer) at the cost of paying more in calm mempools.
+    "FEE_LOOKBACK_BLOCKS": 6,
     "REFUND_KEEP_PERCENT": 5,
     "REFUND_KEEP_MIN_SATS": 50,
 
@@ -211,6 +216,10 @@ class BotConfig:
     @property
     def MAX_FEE_RATE_SATS(self) -> float:
         return self._values["MAX_FEE_RATE_SATS"]
+
+    @property
+    def FEE_LOOKBACK_BLOCKS(self) -> int:
+        return self._values["FEE_LOOKBACK_BLOCKS"]
 
     @property
     def REFUND_KEEP_PERCENT(self) -> int:

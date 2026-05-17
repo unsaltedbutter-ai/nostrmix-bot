@@ -95,7 +95,14 @@ class FakeChainMonitor:
     def __init__(self):
         self.txouts: Dict[str, Dict] = {}
         self.spent: Dict[str, bool] = {}
+        self.spent_check_fails: Dict[str, bool] = {}  # S-B: simulate API errors
         self.confirmed: Dict[str, bool] = {}
+        self.known_txids: Dict[str, Optional[bool]] = {}  # C-D: tx_known()
+        # When True, tx_known returns False for txids not explicitly listed
+        # (i.e. "we know it's not out there"). When False, returns None
+        # (i.e. "we couldn't reach the chain"). Default True is the common
+        # test case where the fake chain is "online".
+        self.tx_known_default_chain_reachable: bool = True
         self.broadcast_calls: List[str] = []
         self.broadcast_return = "fake_broadcast_txid"
 
@@ -103,10 +110,19 @@ class FakeChainMonitor:
         return self.txouts.get(f"{txid}:{vout}")
 
     async def is_utxo_spent(self, txid, vout):
+        # S-B: real impl now returns Optional[bool]; None = couldn't check.
+        if self.spent_check_fails.get(f"{txid}:{vout}", False):
+            return None
         return self.spent.get(f"{txid}:{vout}", False)
 
     async def is_confirmed(self, txid):
         return self.confirmed.get(txid, False)
+
+    async def tx_known(self, txid):
+        if txid in self.known_txids:
+            return self.known_txids[txid]
+        # Default: chain is reachable, tx is not out there.
+        return False if self.tx_known_default_chain_reachable else None
 
     async def estimate_fee_rate(self):
         return 30.0
@@ -432,22 +448,24 @@ class TestReminderProgression:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_final_warning_does_not_fire_if_count_stuck_at_2_in_old_logic(self):
-        """Regression guard: the old buggy code gated on count<=1 so the final
-        warning never fired after the second reminder set count=2. The new
-        code gates on count==2 and bumps to 3."""
+    async def test_final_warning_fires_even_when_count_was_lagged_by_downtime(self):
+        """S-D: if the bot was down across the /4 → /2 boundary the
+        participant's reminder_count may be 1 when time_since is already
+        past /2. The fix bumps directly to the expected level (3) and fires
+        the final warning rather than refusing because the prior band's
+        reminder didn't run."""
         coord, db, nostr, pid, mix_id = await self._setup_signing_participant("half")
         try:
-            await db.update_participant(pid, reminder_count=1)  # not yet 2
+            await db.update_participant(pid, reminder_count=1)  # stale (bot was down)
             mix_row = await db.get_mix(mix_id)
             active = await db.get_participants_by_mix(mix_id)
             await coord._handle_signing(mix_row, active, int(time.time()))
 
-            # With count==1, the final-warning gate (count==2) shouldn't fire.
+            # Expected: jumps to level 3 and the user gets a final warning.
             p = await db.get_participant(pid)
-            assert p["reminder_count"] == 1
+            assert p["reminder_count"] == 3
             joined = " ".join(m for _, m in nostr.sent_dms).lower()
-            assert "final warning" not in joined
+            assert "final warning" in joined
         finally:
             await db.close()
 
@@ -1997,7 +2015,10 @@ class TestExitMixSingleAndNone:
             await coord._cmd_exit_mix(FakeCtx("npub_solo"), "npub_solo", None)
 
             p = await db.get_participant(pid)
-            assert p["state"] == "cancelled"
+            # C-B: paid users go through the idempotent refund path and end
+            # in 'refunded' (or 'refund_failed') rather than the older
+            # 'cancelled'. 'cancelled' is now reserved for unpaid exits.
+            assert p["state"] == "refunded"
             # Refund was attempted for the participant's lud16.
             assert any(r[0] == "solo@x" for r in lightning.refunds)
             dms = [m for r, m in nostr.sent_dms if r == "npub_solo"]
@@ -2028,8 +2049,8 @@ class TestExitMixSingleAndNone:
 
             await coord._cmd_exit_mix(FakeCtx("npub_mm"), "npub_mm", mix_a)
 
-            # Only the named mix's participant is cancelled.
-            assert (await db.get_participant(pid_a))["state"] == "cancelled"
+            # C-B: paid exit lands in 'refunded' (not 'cancelled').
+            assert (await db.get_participant(pid_a))["state"] == "refunded"
             assert (await db.get_participant(pid_b))["state"] == "paid"
         finally:
             await db.close()
@@ -2254,3 +2275,541 @@ class TestAutoMixRaceGuard:
             )
         finally:
             await db.close()
+
+
+# ============================================================================
+# Wave 5 — fixes from the second audit pass
+# ============================================================================
+
+
+# --- C-A: smart fee estimator is wired into assembly ---
+
+
+class TestAssemblyUsesLiveFeeRate:
+    """C-A: _assemble_psbt must call chain.estimate_fee_rate, not use the
+    hardcoded schema default of 30 sat/vB."""
+
+    @pytest.mark.asyncio
+    async def test_estimate_fee_rate_is_called_and_persisted(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            calls: List[float] = []
+
+            async def fake_estimate():
+                calls.append(99.0)
+                return 99.0
+            chain.estimate_fee_rate = fake_estimate
+
+            mix_id, pids, _ = await _make_2p_signing_mix(coord, db)
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(mix_row, active)
+
+            assert len(calls) == 1, "estimate_fee_rate should have been called"
+            updated = await db.get_mix(mix_id)
+            assert updated["fee_rate"] == 99, (
+                f"persisted fee_rate should match live estimate; got {updated['fee_rate']}"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_stored_rate_when_estimate_raises(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            async def boom():
+                raise RuntimeError("mempool.space down")
+            chain.estimate_fee_rate = boom
+
+            mix_id, pids, _ = await _make_2p_signing_mix(coord, db)
+            # stored fee_rate from _make_2p_signing_mix is 30
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(mix_row, active)
+
+            # Should not have crashed; mix should have advanced to signing.
+            after = await db.get_mix(mix_id)
+            assert after["state"] == "signing"
+            assert after["fee_rate"] == 30
+        finally:
+            await db.close()
+
+
+# --- C-B: refund idempotency on crash-resume ---
+
+
+class TestRefundIdempotency:
+    """C-B: a crash between send_refund() and the state UPDATE used to leave
+    the participant in 'paid', so the next event-loop tick would re-enter
+    the same code path and pay them again. Now: state moves to 'refunding'
+    BEFORE the wallet call, and _REFUND_TERMINAL_STATES blocks re-entry."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_and_refund_is_idempotent_across_simulated_crash(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            pid = await db.add_participant(mix_id, "npub_idem", "idem@x")
+            await db.update_participant(pid, state="paid", fee_paid=1000)
+            await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+
+            # First call: refund goes through, state moves to 'refunded'.
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
+            assert (await db.get_participant(pid))["state"] == "refunded"
+            first_count = len(lightning.refunds)
+            assert first_count == 1
+
+            # Simulate the bot crashing right after the state update — the
+            # next event-loop tick would re-enter _cancel_and_refund on the
+            # same participant. Must not pay twice.
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test (resume)")
+            assert (await db.get_participant(pid))["state"] == "refunded"
+            assert len(lightning.refunds) == first_count, (
+                "C-B regression: second cancel_and_refund call paid again"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_drop_underfunded_is_idempotent_across_simulated_crash(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            pid = await db.add_participant(mix_id, "npub_drop", "drop@x")
+            await db.update_participant(pid, state="paid", fee_paid=300)
+            await db.add_utxo(pid, TXID[1], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+
+            p = await db.get_participant(pid)
+            await coord._drop_underfunded(p, mix_id)
+            assert (await db.get_participant(pid))["state"] == "refunded"
+            first_count = len(lightning.refunds)
+
+            # Re-call with the now-stale `p` dict (state was 'paid' when we
+            # read it). Real crash-resume hits the same scenario.
+            await coord._drop_underfunded(p, mix_id)
+            assert len(lightning.refunds) == first_count, (
+                "C-B regression: _drop_underfunded paid twice"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_refunding_state_blocks_re_entry(self):
+        """The pre-call state UPDATE to 'refunding' is the crash-window
+        defence: even if the wallet crashes mid-call, the next resume
+        sees 'refunding' and doesn't try again."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            pid = await db.add_participant(mix_id, "npub_stuck", "stuck@x")
+            await db.update_participant(pid, state="refunding", fee_paid=1000)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "resume")
+            # Should not have attempted a refund — state was already
+            # 'refunding' so we skipped.
+            assert lightning.refunds == [], (
+                f"C-B regression: refunded a 'refunding' participant; got {lightning.refunds}"
+            )
+            # State stays 'refunding' (operator must investigate).
+            assert (await db.get_participant(pid))["state"] == "refunding"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_refund_failed_state_when_both_backends_return_none(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            pid = await db.add_participant(mix_id, "npub_brokeln", "br@x")
+            await db.update_participant(pid, state="paid", fee_paid=1000)
+
+            async def fail_refund(lud16, sats, reason="x"):
+                lightning.refunds.append((lud16, sats, reason))
+                return None
+            lightning.send_refund = fail_refund
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
+            assert (await db.get_participant(pid))["state"] == "refund_failed"
+            assert len(lightning.refunds) == 1
+        finally:
+            await db.close()
+
+
+# --- C-C: assembly idempotency under UNIQUE constraint ---
+
+
+class TestAssemblyIdempotency:
+    """C-C: a crash in _assemble_psbt after some pids got psbt_rounds rows
+    but before mix.state moved to 'signing' would leave the mix wedged on
+    the next attempt (UNIQUE(mix_id, pid, round_num) violation). Now
+    add_psbt_round is idempotent."""
+
+    @pytest.mark.asyncio
+    async def test_assemble_psbt_can_be_called_twice_without_unique_violation(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, _ = await _make_2p_signing_mix(coord, db)
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(mix_row, active)
+
+            # Simulate a crash by resetting the mix to 'assembling' and
+            # participants back to 'paid' WITHOUT bumping ghost_retries.
+            # The next assembly attempt re-uses round_num=1 — the UNIQUE
+            # constraint would fire if add_psbt_round weren't idempotent.
+            await db.update_mix(mix_id, state="assembling")
+            for pid in pids:
+                await db.update_participant(pid, state="paid", psbt_sent_at_unix=None)
+
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(mix_row, active)  # must not raise
+
+            # Still one row per participant per round_num=1 (the existing
+            # rows got UPDATED, not duplicated).
+            rounds = await db.get_psbt_rounds_by_mix(mix_id)
+            assert len(rounds) == 2
+            assert all(r["round_num"] == 1 for r in rounds)
+            # And the mix did advance to signing.
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+        finally:
+            await db.close()
+
+
+# --- C-D: pre-refund tx_known check ---
+
+
+class TestPreRefundChainCheck:
+    """C-D: when broadcast_tx returns None, the coordinator must verify the
+    tx isn't actually known to the chain before refunding. Otherwise a
+    broadcast that succeeded into one mempool but had its HTTP response
+    lost would cause a double-pay."""
+
+    @pytest.mark.asyncio
+    async def test_broadcast_none_but_tx_known_parks_in_broadcast(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = None
+            # Force tx_known to return True — pretend the tx made it.
+            chain.tx_known_default_chain_reachable = True
+
+            async def tx_is_known(txid):
+                return True
+            chain.tx_known = tx_is_known
+
+            signed = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            after = await db.get_mix(mix_id)
+            assert after["state"] == "broadcast", (
+                f"C-D regression: refunded instead of parking; state={after['state']}"
+            )
+            assert after["broadcast_txid"], "broadcast_txid should be set"
+            assert lightning.refunds == [], (
+                f"C-D regression: refunded while tx is known: {lightning.refunds}"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_none_and_chain_unreachable_parks_uncertain(self):
+        """If tx_known returns None (couldn't reach chain), we still don't
+        refund — better to park in broadcast and re-check than to double-pay."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = None
+
+            async def tx_unknown_chain_down(txid):
+                return None
+            chain.tx_known = tx_unknown_chain_down
+
+            signed = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            after = await db.get_mix(mix_id)
+            assert after["state"] == "broadcast", (
+                f"C-D regression: refunded on uncertain chain; state={after['state']}"
+            )
+            assert lightning.refunds == []
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_broadcast_none_and_tx_not_known_cancels_and_refunds(self):
+        """Only the 'tx is definitely nowhere' case proceeds to refund."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = None  # tx_known default returns False
+            # Default fake returns False for unknown txids → "chain is online
+            # and says nothing's there" → safe to refund.
+
+            signed = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] == "signed"]
+            await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
+
+            after = await db.get_mix(mix_id)
+            assert after["state"] == "cancelled"
+            assert {r[0] for r in lightning.refunds} == {"a@x", "b@x"}
+        finally:
+            await db.close()
+
+
+# --- S-A: iterated fee math ---
+
+
+class TestIteratedFeeMath:
+    """S-A: a participant who provides MORE addresses than they have BTC
+    for ends up with fewer actual outputs. The first fee pass overcounted
+    their vsize contribution; the iteration shrinks fee_share accordingly."""
+
+    @pytest.mark.asyncio
+    async def test_extra_addresses_dont_inflate_fee_share(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, max_participants=10,
+            )
+            await db.update_mix(mix_id, state="assembling", fee_rate=30)
+
+            # Participant A: 3M sats, 3 addresses, will use all 3.
+            pa = await db.add_participant(mix_id, "p_a_iter", "a@x")
+            await db.update_participant(pa, state="paid", fee_paid=500)
+            await db.add_utxo(pa, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(pa, addr, 1_000_000)
+
+            # Participant B: only 1.05M sats but provided 5 addresses — will
+            # only use 1 equal output. Pre-S-A would charge B for a 5-output
+            # vsize contribution.
+            pb = await db.add_participant(mix_id, "p_b_iter", "b@x")
+            await db.update_participant(pb, state="paid", fee_paid=500)
+            await db.add_utxo(pb, TXID[1], 0, 1_050_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:8]:
+                await db.add_output(pb, addr, 1_000_000)
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            after_a = await db.get_participant(pa)
+            after_b = await db.get_participant(pb)
+            # B contributed fewer real outputs than A, so B's fee_share
+            # should be <= A's fee_share, NOT higher because of the 5
+            # declared addresses. (Without iteration B's fee_share would
+            # have been ≈ 5/8 of total instead of ≈ 1/4.)
+            assert after_b["fee_share"] <= after_a["fee_share"], (
+                f"S-A regression: B's fee_share ({after_b['fee_share']}) > "
+                f"A's ({after_a['fee_share']}) despite B having fewer "
+                f"actual outputs"
+            )
+        finally:
+            await db.close()
+
+
+# --- S-B: coordinator rejects /commit when chain spent-check is unreachable ---
+
+
+class TestCommitRejectsOnSpentCheckUnreachable:
+    @pytest.mark.asyncio
+    async def test_chain_unreachable_does_not_add_utxo(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_unreachable"
+            pid = await db.add_participant(mix_id, npub, "")
+
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000)
+            # S-B fake: simulate chain spent-check failure for this outpoint.
+            chain.spent_check_fails[f"{TXID[0]}:0"] = True
+
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            utxos = await db.get_utxos_by_participant(pid)
+            assert utxos == [], (
+                "S-B regression: accepted a UTXO whose spent-check failed"
+            )
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "verify" in joined or "unreachable" in joined or "retry" in joined
+        finally:
+            await db.close()
+
+
+# --- S-E: pre-broadcast sum invariant ---
+
+
+class TestSumInvariantCancelsBadFeeMath:
+    @pytest.mark.asyncio
+    async def test_zero_miner_fee_cancels_mix(self, monkeypatch):
+        """S-E: if the fee math somehow produces sum(outputs) >= sum(inputs),
+        the mix is cancelled BEFORE we send the PSBT — better loud cancel
+        than a tx that won't relay."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, _ = await _make_2p_signing_mix(coord, db)
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+
+            # Force the fee engine to claim zero miner fee but full output
+            # allocation. Patch calculate_all_fees to return a result that
+            # would produce sum(outputs) == sum(inputs).
+            from src.fee_engine import FeeResult
+            real_calc = coord.fee_engine.calculate_all_fees
+
+            def zero_fee_calc(participants_data, output_size, fee_rate):
+                # Build results where fee_share is 0 and change_sats =
+                # total_sats - num_equal * output_size → no miner fee.
+                results = []
+                for p in participants_data:
+                    n_eq = p["total_sats"] // output_size
+                    change = p["total_sats"] - n_eq * output_size
+                    results.append(FeeResult(
+                        total_inputs=p["num_inputs"], total_sats=p["total_sats"],
+                        num_equal_outputs=n_eq,
+                        num_change_outputs=1 if change >= 10000 else 0,
+                        fee_share_sats=0,
+                        change_sats=change if change >= 10000 else 0,
+                        service_fee_sats=500,
+                    ))
+                # total_vsize > 0 so MIN_FEE_RATE_SATS × vsize > 0 too.
+                return (200, 0, results)
+            coord.fee_engine.calculate_all_fees = zero_fee_calc
+
+            await coord._assemble_psbt(mix_row, active)
+
+            # The invariant trips → mix cancels.
+            after = await db.get_mix(mix_id)
+            assert after["state"] == "cancelled", (
+                f"S-E regression: assembled a 0-miner-fee tx; state={after['state']}"
+            )
+        finally:
+            await db.close()
+
+
+# --- S-G: DM error path does not leak str(e) ---
+
+
+class TestDMErrorDoesNotLeakException:
+    @pytest.mark.asyncio
+    async def test_dm_handler_exception_returns_generic_message(self):
+        """S-G: if an internal handler raises, the user-facing DM is a
+        generic prompt, not str(e). Inner exceptions can carry other-user
+        data in their message."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            secret = "SECRET_ADDRESS_bc1qOTHERUSER"
+
+            # Replace _cmd_list_mixes to raise with the secret in the message.
+            async def raise_with_secret(ctx):
+                raise RuntimeError(secret)
+            coord._cmd_list_mixes = raise_with_secret
+
+            await coord._on_dm(FakeCtx("npub_dm_err"), "/list")
+
+            dms = [m for r, m in nostr.sent_dms if r == "npub_dm_err"]
+            assert dms, "user got no DM at all"
+            joined = " ".join(dms)
+            assert secret not in joined, (
+                f"S-G regression: exception text leaked to user: {joined!r}"
+            )
+        finally:
+            await db.close()
+
+
+# --- M2: batched commit-rejection DM ---
+
+
+class TestBatchedCommitRejectionDMs:
+    @pytest.mark.asyncio
+    async def test_many_bad_utxos_produce_one_summary_dm(self):
+        """M2: pasting 12 invalid outpoints used to produce 12 DMs. Now:
+        one DM with up to _MAX_REJECTION_LINES detail lines + a tail."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_spammer"
+            await db.add_participant(mix_id, npub, "")
+
+            # 12 outpoints, none of which exist on chain.
+            utxos = [{"txid": f"{i:064x}", "vout": 0} for i in range(1, 13)]
+            await coord._cmd_commit_utxos(FakeCtx(npub), npub, utxos)
+
+            dms_to_user = [m for r, m in nostr.sent_dms if r == npub]
+            # Exactly one rejection-summary DM + (no-valid-UTXOs DM).
+            summary_dms = [m for m in dms_to_user if "Rejected" in m and "UTXO" in m]
+            assert len(summary_dms) == 1, (
+                f"M2 regression: expected one summary DM, got {len(summary_dms)}: "
+                f"{summary_dms}"
+            )
+            # The summary mentions the total count and includes the "more"
+            # tail since 12 > _MAX_REJECTION_LINES (8 by default).
+            assert "Rejected 12" in summary_dms[0]
+            assert "more rejected" in summary_dms[0]
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_small_number_of_rejections_lists_each_with_reason(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_two_bad"
+            await db.add_participant(mix_id, npub, "")
+
+            utxos = [
+                {"txid": "a" * 64, "vout": 0},
+                {"txid": "b" * 64, "vout": 0},
+            ]
+            await coord._cmd_commit_utxos(FakeCtx(npub), npub, utxos)
+
+            dms_to_user = [m for r, m in nostr.sent_dms if r == npub]
+            summary = [m for m in dms_to_user if "Rejected" in m]
+            assert len(summary) == 1
+            # Both outpoints appear.
+            assert ("a" * 64) in summary[0]
+            assert ("b" * 64) in summary[0]
+            assert "more rejected" not in summary[0]
+        finally:
+            await db.close()
+
+
+# --- S-F: scrub_participants_for_mix on cancel ---
+
+
+class TestCancelScrubsIdentifiers:
+    @pytest.mark.asyncio
+    async def test_cancelled_mix_blanks_npub_and_lud16(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            pid = await db.add_participant(mix_id, "npub_priv", "priv@example.com")
+            await db.update_participant(pid, state="paid", fee_paid=500)
+            await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
+
+            row = await db.get_participant(pid)
+            # State is preserved (refunded), but identifiers are gone.
+            assert row["state"] in ("refunded", "refund_failed", "cancelled")
+            assert row["npub_hex"] == "", f"S-F: npub_hex leaked: {row['npub_hex']!r}"
+            assert row["lightning_addr"] == "", f"S-F: lud16 leaked: {row['lightning_addr']!r}"
+        finally:
+            await db.close()
+
+
+# --- C-A wiring smoke test ---
+
+
+class TestFeeRateConfigKnob:
+    def test_fee_lookback_blocks_is_a_config_property(self):
+        cfg = BotConfig("/nonexistent-env-for-tests.env")
+        # Default from _DEFAULTS in src/config.py.
+        assert cfg.FEE_LOOKBACK_BLOCKS == 6

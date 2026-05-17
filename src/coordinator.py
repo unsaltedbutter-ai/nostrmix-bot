@@ -143,14 +143,46 @@ class Coordinator:
                 tokens.p(npub_hex), parsed.command, type(e).__name__,
             )
             try:
-                # The DM back to the user can carry the exception text
-                # safely — it goes only to them. (We could trim if we
-                # ever logged DM contents, but we don't.)
-                await self.nostr.send_dm(npub_hex, f"Error processing your message: {str(e)}")
+                # S-G: never put str(e) in the DM. Inner exceptions from
+                # SQLite / bitcointx / httpx sometimes embed other-user
+                # data in their string form (SQL fragments, hex). Users
+                # could probe for leaks by sending malformed commands.
+                # Give them a generic message; the operator gets the
+                # diagnostic via the logger.error above.
+                await self.nostr.send_dm(
+                    npub_hex,
+                    "Error processing your message. Check the command format "
+                    "(see /list, /join, /commit, /addresses, /psbt_accept, /cancel) "
+                    "and try again.",
+                )
             except Exception:
                 pass
 
     # --- Command Implementations ---
+
+    # M2: cap to avoid spamming a user (or eating relay budget) when
+    # someone pastes a giant blob. First N rejections are detailed; the
+    # rest collapse to a count.
+    _MAX_REJECTION_LINES = 8
+
+    async def _send_rejection_summary(self, npub_hex: str,
+                                       rejections: List[Tuple[str, str]]):
+        """One DM listing up to _MAX_REJECTION_LINES rejected outpoints
+        with their reasons; collapse the rest into a "+N more rejected"
+        tail. Replaces the old one-DM-per-bad-UTXO behaviour (M2)."""
+        if not rejections:
+            return
+        head = rejections[: self._MAX_REJECTION_LINES]
+        rest = len(rejections) - len(head)
+        lines = [f"Rejected {len(rejections)} UTXO(s):"]
+        for outpoint, reason in head:
+            lines.append(f"  • {outpoint} — {reason}")
+        if rest > 0:
+            lines.append(f"  • …and {rest} more rejected.")
+        try:
+            await self.nostr.send_dm(npub_hex, "\n".join(lines))
+        except Exception:
+            pass
 
     async def _cmd_list_mixes(self, ctx: SenderContext):
         """Handle /list — show open mixes."""
@@ -234,7 +266,7 @@ class Coordinator:
                 continue
             cap = m.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
             cnt = await self.db.count_participants_by_mix(
-                m["id"], exclude_states=["cancelled", "ghosted"],
+                m["id"], exclude_states=["cancelled", "ghosted", "refunding", "refunded", "refund_failed"],
             )
             if cnt >= cap:
                 continue
@@ -325,94 +357,89 @@ class Coordinator:
         locked_input_type: Optional[str] = mix.get("input_type") if mix else None
         candidate_lock_type: Optional[str] = locked_input_type
 
+        # M2: batch rejections into a single summary DM instead of spamming
+        # one DM per bad UTXO. A user pasting 50 outpoints (or a griefer
+        # pasting nonsense) used to get one DM per row; that exhausts the
+        # SDK's relay budget and is genuinely user-hostile.
+        # rejections: list of (txid:vout, short reason). Same outpoint can
+        # appear under multiple buckets if multiple checks would fail; we
+        # only report the first one we hit per UTXO.
+        rejections: List[Tuple[str, str]] = []
+
         # Validate UTXOs on chain
         total_sats = 0
         valid_utxos = []
+        import sqlite3
         for utxo_data in utxos:
             txid = utxo_data["txid"]
             vout = utxo_data["vout"]
+            outpoint = f"{txid}:{vout}"
 
-            # Check blacklist
-            if await self.db.is_blacklisted(npub_hex, f"{txid}:{vout}"):
-                await self.nostr.send_dm(npub_hex, f"UTXO {txid}:{vout} is blacklisted.")
+            if await self.db.is_blacklisted(npub_hex, outpoint):
+                rejections.append((outpoint, "blacklisted"))
                 continue
 
-            # Check double-spend
             if await self.db.is_utxo_used(txid, vout):
-                await self.nostr.send_dm(npub_hex, f"UTXO {txid}:{vout} already used in another mix.")
+                rejections.append((outpoint, "already used in another mix"))
                 continue
 
-            # Look up on-chain
             txout = await self.chain.lookup_txout(txid, vout)
             if txout is None:
-                await self.nostr.send_dm(npub_hex, f"Could not find UTXO {txid}:{vout} on chain.")
+                rejections.append((outpoint, "not found on chain"))
                 continue
 
-            # Reject UTXOs that have already been spent on-chain. Without this
-            # check a participant could commit a stale output, the bot would
-            # build a PSBT against it, and broadcast would fail late.
-            if await self.chain.is_utxo_spent(txid, vout):
-                await self.nostr.send_dm(npub_hex, f"UTXO {txid}:{vout} has already been spent on-chain.")
+            # S-B: None = couldn't verify; True = spent; False = unspent.
+            spent = await self.chain.is_utxo_spent(txid, vout)
+            if spent is None:
+                rejections.append((outpoint, "chain unreachable — try again later"))
+                continue
+            if spent:
+                rejections.append((outpoint, "already spent on-chain"))
                 continue
 
             amount = txout.get("value", 0)
             script_type = txout.get("scriptpubkey_type", "p2wpkh")
             scriptpubkey = txout.get("scriptpubkey", "")
 
-            # Operator allowlist for input types. Anything off the list gets a
-            # polite reject. Underlying vsize tables still support the rejected
-            # types — only the policy gate is closed.
             if script_type not in self.cfg.ACCEPTED_INPUT_TYPES:
                 accepted = ", ".join(sorted(self.cfg.ACCEPTED_INPUT_TYPES))
-                await self.nostr.send_dm(
-                    npub_hex,
-                    f"UTXO {txid}:{vout} is {script_type}; we only accept {accepted} inputs right now.",
+                rejections.append(
+                    (outpoint, f"is {script_type}, we only accept {accepted}"),
                 )
                 continue
 
-            # Per-mix type lock: first valid UTXO sets the lock; later UTXOs
-            # in this commit (and from other participants) must match it.
             if candidate_lock_type is None:
                 candidate_lock_type = script_type
             elif script_type != candidate_lock_type:
-                await self.nostr.send_dm(
-                    npub_hex,
-                    f"UTXO {txid}:{vout} is {script_type}, but this mix is locked to "
-                    f"{candidate_lock_type}. Send only {candidate_lock_type} UTXOs.",
+                rejections.append(
+                    (outpoint,
+                     f"is {script_type}, but this mix is locked to {candidate_lock_type}"),
                 )
                 continue
 
-            # Reject dust below MINIMUM_UTXO_SIZE — these can't realistically
-            # carry an equal output through mixing and only inflate vsize.
             if amount < self.cfg.MINIMUM_UTXO_SIZE:
-                await self.nostr.send_dm(
-                    npub_hex,
-                    f"UTXO {txid}:{vout} is {amount} sats, below the {self.cfg.MINIMUM_UTXO_SIZE}-sat minimum.",
+                rejections.append(
+                    (outpoint,
+                     f"{amount} sats < {self.cfg.MINIMUM_UTXO_SIZE}-sat minimum"),
                 )
                 continue
 
-            # Add UTXO to database — include the actual prevout script hex
-            # so build_skeleton can create a valid CTxOut for the PSBT input.
-            # The schema's UNIQUE(txid, vout) is the defense of last resort
-            # against the race window between is_utxo_used (which we checked
-            # above) and this insert. A parallel /commit handler could have
-            # claimed the same outpoint while we were awaiting chain calls;
-            # SQLite raises IntegrityError, we DM the user and move on.
-            import sqlite3
             try:
                 await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
             except sqlite3.IntegrityError:
-                await self.nostr.send_dm(
-                    npub_hex,
-                    f"UTXO {txid}:{vout} was claimed by another commit while we "
-                    f"were processing yours. Please retry.",
+                rejections.append(
+                    (outpoint, "claimed by another commit during processing — retry"),
                 )
                 continue
-            # Reserve the UTXO so a concurrent commit (from a second mix or
-            # a re-/commit) can't claim the same outpoint.
             await self.db.mark_utxo_used(pid, txid, vout)
             valid_utxos.append({"txid": txid, "vout": vout, "amount": amount, "script_type": script_type, "scriptpubkey": scriptpubkey})
             total_sats += amount
+
+        # Send the batched rejection summary now — before the "no valid
+        # UTXOs" early-return and before the success DM so the user sees
+        # both pieces in order.
+        if rejections:
+            await self._send_rejection_summary(npub_hex, rejections)
 
         if not valid_utxos:
             await self.nostr.send_dm(npub_hex, "No valid UTXOs registered.")
@@ -707,7 +734,8 @@ class Coordinator:
             return
 
         # Filter to non-cancelled participants
-        active = [p for p in participants if p["state"] not in ("cancelled", "ghosted", "completed")]
+        active = [p for p in participants if p["state"] not in ("cancelled", "ghosted", "completed",
+                                                          "refunding", "refunded", "refund_failed")]
 
         if not active:
             await self.nostr.send_dm(npub_hex, "Done.")
@@ -747,29 +775,42 @@ class Coordinator:
             )
             return
 
-        # Refund fee
-        fee_paid = active[0].get("fee_paid", 0)
-        if fee_paid > 0:
-            refund_sats = max(fee_paid * (100 - self.cfg.REFUND_KEEP_PERCENT) // 100,
-                              fee_paid - self.cfg.REFUND_KEEP_MIN_SATS)
-            await self.lightning.send_refund(
-                active[0].get("lightning_addr", ""),
-                refund_sats,
-                reason="voluntary_exit",
+        # Release UTXOs back to the outpoint pool BEFORE the wallet call so
+        # they're freed even if we crash mid-refund. UNIQUE(txid, vout)
+        # would otherwise block the same outpoint forever.
+        await self.db.delete_utxos_by_participant(pid)
+        await self.db.delete_outputs_by_participant(pid)
+
+        # Refund fee — goes through _safe_refund for idempotency (C-B).
+        fee_paid = int(active[0].get("fee_paid") or 0)
+        lud16 = active[0].get("lightning_addr") or ""
+        if fee_paid > 0 and lud16:
+            refund_sats = self._refund_keep_math(fee_paid)
+            new_state = await self._safe_refund(
+                active[0], actual_mix_id, refund_sats, reason="voluntary_exit",
             )
-            msg = self.parser.format_refund(refund_sats, "voluntary exit")
+            if new_state == "refunded":
+                msg = self.parser.format_refund(refund_sats, "voluntary exit")
+            else:
+                msg = (f"Sorry to see you go. We tried to refund {refund_sats} sats "
+                       f"but our Lightning backend rejected it — please contact "
+                       f"the operator.")
+        elif fee_paid > 0:
+            # Stuck without a lud16: log + DM, leave state cancelled.
+            logger.error(
+                "Cannot refund voluntary exit for participant %s in mix %s: "
+                "fee_paid=%d but no lightning_addr.",
+                tokens.p(npub_hex), tokens.m(actual_mix_id), fee_paid,
+            )
+            await self.db.update_participant(pid, state="cancelled")
+            msg = (f"Sorry to see you go. We can't refund automatically "
+                   f"(no Lightning address on file) — please contact the operator "
+                   f"to reclaim your {fee_paid} sats.")
         else:
+            await self.db.update_participant(pid, state="cancelled")
             msg = "Sorry to see you go."
 
         await self.nostr.send_dm(npub_hex, msg)
-
-        # Remove participant from mix. Also release their UTXOs back to
-        # the outpoint pool so they can re-commit them to a future mix —
-        # UNIQUE(txid, vout) would otherwise block the same outpoint
-        # forever.
-        await self.db.delete_utxos_by_participant(pid)
-        await self.db.delete_outputs_by_participant(pid)
-        await self.db.update_participant(pid, state="cancelled")
 
     # --- Zap Handler ---
 
@@ -829,7 +870,7 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, f"Payment of {amount_sats} sats accepted for {mix_id}.")
 
             # Check if mix is now full
-            count = await self.db.count_participants_by_mix(mix_id, exclude_states=["cancelled", "ghosted"])
+            count = await self.db.count_participants_by_mix(mix_id, exclude_states=["cancelled", "ghosted", "refunding", "refunded", "refund_failed"])
             max_part = mix.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
             min_part = mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT)
 
@@ -901,7 +942,8 @@ class Coordinator:
         state = mix["state"]
         participants = await self.db.get_participants_by_mix(mix_id)
         # Filter active participants
-        active = [p for p in participants if p["state"] not in ("cancelled", "ghosted", "completed")]
+        active = [p for p in participants if p["state"] not in ("cancelled", "ghosted", "completed",
+                                                          "refunding", "refunded", "refund_failed")]
 
         match state:
             case "announced":
@@ -939,7 +981,8 @@ class Coordinator:
                         pass
 
                 # Re-filter active after the pay-timeout sweep.
-                active = [p for p in active if p["state"] not in ("cancelled", "ghosted", "completed")]
+                active = [p for p in active if p["state"] not in ("cancelled", "ghosted", "completed",
+                                                          "refunding", "refunded", "refund_failed")]
 
                 # Mix-level deadline
                 deadline = mix.get("deadline_unix")
@@ -1039,31 +1082,110 @@ class Coordinator:
 
         return all_inputs, participants_data, addrs_by_pid, input_indices_by_pid
 
+    # Terminal-for-refund-purposes states. Any participant in one of these
+    # has already had their refund decision made; calling _safe_refund again
+    # on them is a no-op. Critical for crash-recovery idempotency (C-B).
+    _REFUND_TERMINAL_STATES = frozenset({
+        "refunding", "refunded", "refund_failed", "cancelled", "completed",
+    })
+
+    async def _safe_refund(self, p: Dict, mix_id: str, refund_sats: int,
+                            reason: str) -> str:
+        """Idempotent refund. Sets state='refunding' BEFORE calling the LN
+        wallet, then 'refunded' or 'refund_failed' after. If a prior call
+        already moved the participant past 'paid', returns immediately
+        without touching the wallet — this is the crash-resume defence
+        against double payouts.
+
+        Returns the new state. Callers should DM the user based on that.
+        """
+        pid = p["id"]
+        # Re-read state from DB. The `p` dict the caller passed may be
+        # stale if anything else updated this participant in the meantime
+        # (e.g. event loop crash + restart between the caller's read and
+        # this call). The DB is the source of truth.
+        fresh = await self.db.get_participant(pid)
+        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+            logger.info(
+                "Skipping refund for participant %s in mix %s — already in state %s",
+                tokens.p(p["npub_hex"]), tokens.m(mix_id), fresh.get("state"),
+            )
+            return fresh.get("state") or "cancelled"
+
+        # Commit the intent BEFORE the network call. If the bot crashes
+        # between this UPDATE and the LN call, the participant will be in
+        # 'refunding' on resume — _REFUND_TERMINAL_STATES treats that as
+        # done, so we don't pay twice. The trade-off: an actual LN failure
+        # mid-call also looks like 'refunding'. The operator scans for
+        # stuck 'refunding' rows at startup.
+        await self.db.update_participant(pid, state="refunding")
+
+        lud16 = p.get("lightning_addr", "")
+        result = await self.lightning.send_refund(lud16, refund_sats, reason=reason)
+        if result is not None:
+            await self.db.update_participant(pid, state="refunded")
+            return "refunded"
+        # LN refused both backends. Don't go back to 'paid' (would invite
+        # another retry). Park in 'refund_failed' so the operator can
+        # reconcile by hand without us hammering the wallet on every tick.
+        await self.db.update_participant(pid, state="refund_failed")
+        logger.error(
+            "Refund FAILED for participant %s in mix %s (sats=%d, reason=%s) — "
+            "operator must reconcile",
+            tokens.p(p["npub_hex"]), tokens.m(mix_id), refund_sats, reason,
+        )
+        return "refund_failed"
+
+    def _refund_keep_math(self, fee_paid: int) -> int:
+        """Apply REFUND_KEEP_PERCENT / REFUND_KEEP_MIN_SATS to fee_paid."""
+        return max(
+            fee_paid * (100 - self.cfg.REFUND_KEEP_PERCENT) // 100,
+            max(fee_paid - self.cfg.REFUND_KEEP_MIN_SATS, 0),
+        )
+
     async def _drop_underfunded(self, p: Dict, mix_id: str):
         """Refund + DM a participant whose allocation collapsed to 0 equal
         outputs once the real miner fee was applied. C2 fix — the old code
-        cancelled the whole mix in this case."""
+        cancelled the whole mix in this case.
+
+        Idempotent via _safe_refund — safe to call twice on the same pid
+        across a crash boundary (C-B fix)."""
+        # If already past 'paid' (e.g. a prior _drop_underfunded call landed
+        # before a crash), skip the whole thing — UTXOs are gone, refund
+        # decision is recorded.
+        fresh = await self.db.get_participant(p["id"])
+        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+            return
+
         # Release the dropped participant's UTXOs back to the pool — the
         # UNIQUE(txid, vout) constraint would otherwise block these
-        # outpoints from being committed to a future mix.
+        # outpoints from being committed to a future mix. Idempotent
+        # (DELETE on already-empty set is a no-op).
         await self.db.delete_utxos_by_participant(p["id"])
         await self.db.delete_outputs_by_participant(p["id"])
 
         fee_paid = int(p.get("fee_paid") or 0)
         lud16 = p.get("lightning_addr", "")
         npub = p["npub_hex"]
+
         if fee_paid > 0 and lud16:
-            refund_sats = max(
-                fee_paid * (100 - self.cfg.REFUND_KEEP_PERCENT) // 100,
-                max(fee_paid - self.cfg.REFUND_KEEP_MIN_SATS, 0),
+            refund_sats = self._refund_keep_math(fee_paid)
+            new_state = await self._safe_refund(
+                p, mix_id, refund_sats, reason="underfunded_dropped",
             )
-            await self.lightning.send_refund(lud16, refund_sats, reason="underfunded_dropped")
-            await self.db.update_participant(p["id"], state="refunded")
-            await self.nostr.send_dm(
-                npub,
-                f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
-                f"output plus your share of the miner fee. Refunded {refund_sats} sats.",
-            )
+            if new_state == "refunded":
+                await self.nostr.send_dm(
+                    npub,
+                    f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
+                    f"output plus your share of the miner fee. Refunded {refund_sats} sats.",
+                )
+            else:  # refund_failed
+                await self.nostr.send_dm(
+                    npub,
+                    f"Dropped from mix {mix_id}: your inputs couldn't cover one equal "
+                    f"output plus miner fees. We tried to refund {refund_sats} sats but "
+                    f"our Lightning backend rejected it — please contact the operator.",
+                )
         elif fee_paid > 0:
             logger.error(
                 "Cannot refund dropped participant %s in mix %s: fee_paid=%d but "
@@ -1104,7 +1226,25 @@ class Coordinator:
         """
         mix_id = mix["id"]
         output_size = mix["output_size"]
-        fee_rate = mix.get("fee_rate") or 30
+
+        # Live fee-rate estimate at assembly time. If the chain monitor can
+        # determine a recent-blocks rate, use it; otherwise fall back to the
+        # mix's stored rate (set on a prior assembly attempt during crash
+        # resume), and only then to the schema default. The estimate is
+        # already clamped to [MIN_FEE_RATE, MAX_FEE_RATE] inside
+        # ChainMonitor.estimate_fee_rate.
+        live_rate: Optional[float] = None
+        try:
+            live_rate = await self.chain.estimate_fee_rate()
+        except Exception as e:
+            logger.warning(
+                "estimate_fee_rate failed for mix %s: %s — falling back to stored rate",
+                tokens.m(mix_id), type(e).__name__,
+            )
+        if live_rate and live_rate > 0:
+            fee_rate = live_rate
+        else:
+            fee_rate = mix.get("fee_rate") or 30
 
         # Defensive: only assemble paid (or already-signing, for crash-resume)
         # participants. The caller's `active` filter is loose ("not cancelled,
@@ -1119,6 +1259,52 @@ class Coordinator:
         total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
             participants_data, output_size, fee_rate,
         )
+
+        # S-A: iterate the fee math. The first pass used each participant's
+        # num_addresses_provided as their output-count contribution to total
+        # vsize, but determine_outputs may trim to fewer actual outputs.
+        # That overestimates vsize → overestimates total_miner_fee → each
+        # participant's fee_share is inflated and the miner overcollects.
+        # Rebuild outputs_by_type from the trimmed counts and re-run until
+        # stable (or after a couple of passes — it's monotonically
+        # converging because trimming output count can only ever reduce
+        # the next pass's miner fee, never grow it).
+        for _iter in range(3):
+            changed = False
+            for rec, fr in zip(participants_data, fee_results):
+                actual_used = fr.num_equal_outputs + fr.num_change_outputs
+                # Distribute actual_used across the address types the
+                # participant provided. We trim from the LAST type in
+                # iteration order so the same-type-everywhere case (the
+                # only one the allowlist actually permits today) collapses
+                # cleanly to {primary_type: actual_used}.
+                obt = dict(rec.get("outputs_by_type") or {})
+                declared = sum(obt.values())
+                if declared == actual_used or actual_used == 0:
+                    continue
+                if actual_used >= declared:
+                    continue  # determine_outputs never grows past declared
+                # Trim down to actual_used. Walk types and reduce.
+                remaining = actual_used
+                trimmed: Dict[str, int] = {}
+                for k, v in obt.items():
+                    take = min(v, remaining)
+                    if take > 0:
+                        trimmed[k] = take
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                if trimmed != obt:
+                    rec["outputs_by_type"] = trimmed
+                    rec["num_addresses"] = actual_used
+                    changed = True
+            if not changed:
+                break
+            total_vsize, total_miner_fee, fee_results = (
+                self.fee_engine.calculate_all_fees(
+                    participants_data, output_size, fee_rate,
+                )
+            )
 
         if total_miner_fee <= 0:
             await self._cancel_and_refund(mix, "invalid fee calculation")
@@ -1185,6 +1371,32 @@ class Coordinator:
             )
 
         await self.db.update_mix(mix_id, fee_rate=int(fee_rate))
+
+        # S-E: defensive invariant. The PSBT we're about to send must pay
+        # the miner more than the minimum relay fee. A future bug in the
+        # fee math (wrong sign, off-by-one, etc.) could otherwise produce
+        # a tx with sum(outputs) >= sum(inputs), and we'd push it to
+        # broadcast where it would either silently fail or — worse —
+        # actually relay at a negative effective fee depending on the
+        # node's relay policy. Better to cancel here loudly than to ship
+        # a bad tx.
+        sum_inputs = sum(int(i["amount"]) for i in all_inputs)
+        sum_outputs = sum(int(o["amount"]) for o in all_outputs)
+        actual_miner_fee = sum_inputs - sum_outputs
+        min_required_fee = int(total_vsize * self.cfg.MIN_FEE_RATE_SATS)
+        if actual_miner_fee < min_required_fee:
+            logger.error(
+                "Mix %s: pre-broadcast sum invariant failed. "
+                "sum_inputs=%d sum_outputs=%d miner_fee=%d min_required=%d "
+                "(vsize=%d × MIN_FEE_RATE=%s). Cancelling rather than sending "
+                "a tx that won't relay.",
+                tokens.m(mix_id), sum_inputs, sum_outputs, actual_miner_fee,
+                min_required_fee, total_vsize, self.cfg.MIN_FEE_RATE_SATS,
+            )
+            await self._cancel_and_refund(
+                mix, "fee math produced an undercollecting tx",
+            )
+            return
 
         # Build the PSBT
         psbt_hex = self.psbt_mgr.build_skeleton(all_inputs, all_outputs)
@@ -1278,37 +1490,45 @@ class Coordinator:
                     tokens.p(p["npub_hex"]), tokens.m(mix_id),
                 )
 
-            elif time_since > deadline_seconds // 2:
-                # Final warning — gates on count==2 (the second reminder must
-                # have already fired). The old code gated on count<=1, which
-                # was permanently false after the second reminder ran.
-                if p.get("reminder_count", 0) == 2:
-                    await self.nostr.send_dm(
-                        p["npub_hex"],
-                        f"FINAL WARNING: Sign the PSBT for {mix_id} within "
-                        f"{int((deadline_seconds - time_since) / 3600)} hours or lose your fee."
-                    )
-                    await self.db.update_participant(p["id"], reminder_count=3)
+            else:
+                # S-D: compute expected reminder level from time_since alone,
+                # not from prior reminder_count. The old code gated each
+                # band on the previous band's count having advanced first;
+                # if the bot was down across a band boundary the participant
+                # could be ghosted with zero DMs sent. The fix: figure out
+                # which level we OUGHT to be at given the time elapsed, and
+                # if the participant's stored count is behind, fire the
+                # highest-numbered DM we haven't fired yet (so they always
+                # get at least one warning before the deadline).
+                if time_since > deadline_seconds // 2:
+                    expected_level = 3  # final warning
+                elif time_since > deadline_seconds // 4:
+                    expected_level = 2  # second reminder
+                elif time_since > deadline_seconds // 8:
+                    expected_level = 1  # first reminder
+                else:
+                    expected_level = 0
 
-            elif time_since > deadline_seconds // 4:
-                # Second reminder
-                if p.get("reminder_count", 0) == 1:
-                    await self.nostr.send_dm(
-                        p["npub_hex"],
-                        f"Reminder: Sign the PSBT for {mix_id}. "
-                        f"{int((deadline_seconds - time_since) / 3600)} hours remaining."
-                    )
-                    await self.db.update_participant(p["id"], reminder_count=2)
-
-            elif time_since > deadline_seconds // 8:
-                # First reminder
-                if p.get("reminder_count", 0) == 0:
-                    await self.nostr.send_dm(
-                        p["npub_hex"],
-                        f"Reminder: Sign the PSBT for {mix_id}. You have "
-                        f"{int(deadline_hours)} hours from receipt."
-                    )
-                    await self.db.update_participant(p["id"], reminder_count=1)
+                current_level = p.get("reminder_count", 0) or 0
+                if expected_level > current_level:
+                    hours_remaining = max(0, int((deadline_seconds - time_since) / 3600))
+                    if expected_level == 3:
+                        text = (
+                            f"FINAL WARNING: Sign the PSBT for {mix_id} within "
+                            f"{hours_remaining} hours or lose your fee."
+                        )
+                    elif expected_level == 2:
+                        text = (
+                            f"Reminder: Sign the PSBT for {mix_id}. "
+                            f"{hours_remaining} hours remaining."
+                        )
+                    else:  # 1
+                        text = (
+                            f"Reminder: Sign the PSBT for {mix_id}. You have "
+                            f"{hours_remaining} hours from receipt."
+                        )
+                    await self.nostr.send_dm(p["npub_hex"], text)
+                    await self.db.update_participant(p["id"], reminder_count=expected_level)
 
         # Check if all remaining signed
         remaining = [p for p in active if p["state"] not in ("ghosted", "cancelled")]
@@ -1392,8 +1612,84 @@ class Coordinator:
             # Notify participants
             for p in signed:
                 await self.nostr.send_dm(p["npub_hex"], f"Transaction broadcast: {txid}")
-        else:
-            await self._cancel_and_refund(mix, "broadcast failed")
+            return
+
+        # C-D: broadcast_tx returned None. That can mean (a) genuine
+        # rejection, OR (b) all endpoints had transient failures while
+        # the tx may actually have entered the mempool. Compute the local
+        # txid from our raw hex and ask the chain whether anyone has seen
+        # it. Refunding without this check would double-pay anyone whose
+        # on-chain output later confirms.
+        local_txid: Optional[str] = None
+        try:
+            from bitcointx.core import CTransaction, b2x as _b2x
+            local_txid = _b2x(
+                CTransaction.deserialize(bytes.fromhex(raw_tx_hex)).GetTxid()[::-1]
+            )
+        except Exception:
+            local_txid = None
+
+        known: Optional[bool] = None
+        if local_txid:
+            try:
+                known = await self.chain.tx_known(local_txid)
+            except Exception as e:
+                logger.warning(
+                    "tx_known check failed for mix %s: %s",
+                    tokens.m(mix_id), type(e).__name__,
+                )
+                known = None
+
+        if known is True:
+            # Tx is out there. Park the mix in broadcast state and let
+            # _broadcast_sweep take it from here. Don't refund.
+            logger.warning(
+                "Mix %s: broadcast_tx returned None but tx is known on chain "
+                "(%s) — parking in broadcast state instead of refunding.",
+                tokens.m(mix_id), local_txid,
+            )
+            await self.db.update_mix(
+                mix_id, state="broadcast",
+                broadcast_txid=local_txid, broadcast_tx_hex=raw_tx_hex,
+            )
+            for p in signed:
+                await self.nostr.send_dm(
+                    p["npub_hex"],
+                    f"Transaction broadcast (confirmed via fallback check): {local_txid}",
+                )
+            return
+
+        if known is None:
+            # We couldn't reach any chain endpoint. Don't refund — that
+            # might double-pay if the tx actually got out. Park in
+            # broadcast state; the sweep will re-check later.
+            logger.error(
+                "Mix %s: broadcast_tx returned None AND chain endpoints "
+                "unreachable — cannot tell whether tx (%s) is in mempool. "
+                "Parking in broadcast state; the sweep will recheck.",
+                tokens.m(mix_id), local_txid or "<unparseable>",
+            )
+            if local_txid:
+                await self.db.update_mix(
+                    mix_id, state="broadcast",
+                    broadcast_txid=local_txid, broadcast_tx_hex=raw_tx_hex,
+                )
+                for p in signed:
+                    await self.nostr.send_dm(
+                        p["npub_hex"],
+                        f"Broadcast uncertain (chain unreachable). We will "
+                        f"keep retrying. Reference: {local_txid}",
+                    )
+            else:
+                # We can't even compute a local txid — give up safely.
+                await self._cancel_and_refund(
+                    mix, "broadcast failed (and tx hex unparseable)",
+                )
+            return
+
+        # known is False — every endpoint that answered said the tx is
+        # nowhere to be found. Genuine broadcast failure; safe to refund.
+        await self._cancel_and_refund(mix, "broadcast failed")
 
     async def _broadcast_sweep(self, now: float):
         """Sweep all broadcast-pending mixes and check confirmation.
@@ -1547,28 +1843,41 @@ class Coordinator:
     # --- Cancel and Refund ---
 
     async def _cancel_and_refund(self, mix: Dict, reason: str):
-        """Cancel a mix and refund all non-blacklisted participants."""
+        """Cancel a mix and refund all non-blacklisted participants.
+
+        Idempotent: refund decisions for each participant go through
+        _safe_refund, which is no-op on participants already in
+        _REFUND_TERMINAL_STATES. This is the C-B crash-recovery defence —
+        if we crash mid-loop, the next tick re-enters and only the
+        participants we hadn't processed yet are touched.
+        """
         mix_id = mix["id"]
         participants = await self.db.get_participants_by_mix(mix_id)
 
         for p in participants:
-            if p["state"] in ("cancelled", "completed"):
+            if p["state"] in self._REFUND_TERMINAL_STATES:
                 continue
 
-            # Refund fee minus keep percent
-            fee_paid = p.get("fee_paid", 0)
-            if fee_paid > 0 and p.get("lightning_addr"):
-                refund_sats = max(
-                    fee_paid * (100 - self.cfg.REFUND_KEEP_PERCENT) // 100,
-                    max(fee_paid - self.cfg.REFUND_KEEP_MIN_SATS, 0),
-                )
-                await self.lightning.send_refund(p["lightning_addr"], refund_sats, reason=reason)
-                await self.db.update_participant(p["id"], state="refunded")
-                await self.nostr.send_dm(p["npub_hex"], f"Mix {mix_id} cancelled ({reason}). Refunded {refund_sats} sats.")
+            fee_paid = int(p.get("fee_paid") or 0)
+            lud16 = p.get("lightning_addr") or ""
+
+            if fee_paid > 0 and lud16:
+                refund_sats = self._refund_keep_math(fee_paid)
+                new_state = await self._safe_refund(p, mix_id, refund_sats, reason=reason)
+                if new_state == "refunded":
+                    await self.nostr.send_dm(
+                        p["npub_hex"],
+                        f"Mix {mix_id} cancelled ({reason}). Refunded {refund_sats} sats.",
+                    )
+                else:  # refund_failed
+                    await self.nostr.send_dm(
+                        p["npub_hex"],
+                        f"Mix {mix_id} cancelled ({reason}). We tried to refund "
+                        f"{refund_sats} sats but our Lightning backend rejected it — "
+                        f"please contact the operator.",
+                    )
             elif fee_paid > 0:
                 # Paid the service fee but we have no lud16 to refund to.
-                # Log loudly and DM the user so they know to contact us
-                # rather than silently writing off their sats.
                 logger.error(
                     "Cannot refund participant %s for mix %s: fee_paid=%d but "
                     "no lightning_addr on record. Sats are stranded; operator "
@@ -1594,6 +1903,10 @@ class Coordinator:
         # any future mix.
         await self.db.delete_outputs_for_mix(mix_id)
         await self.db.delete_utxos_for_mix(mix_id)
+        # S-F: also wipe per-participant identifiers (npub_hex, lightning_addr)
+        # so a cancelled mix leaves no privacy footprint. Blacklist entries
+        # for ghosters are preserved separately.
+        await self.db.scrub_participants_for_mix(mix_id)
 
     # --- Lifecycle ---
 
@@ -1620,6 +1933,26 @@ class Coordinator:
         # Resume unfinished work (crash recovery)
         unfinished = await self.db.resume_unfinished()
         logger.info(f"Resuming {len(unfinished)} unfinished mixes")
+
+        # C-B: surface participants stuck in 'refunding' across a restart.
+        # That state means we set the intent before the LN call but never
+        # observed its completion — either the LN backend went down, the
+        # bot crashed mid-call, or the SDK ate the response. Operator must
+        # verify with the wallet whether the payout actually left.
+        stuck = await self.db.participants_in_state("refunding")
+        if stuck:
+            logger.error(
+                "Found %d participant(s) stuck in 'refunding' at startup — "
+                "operator must verify each LN payout manually before forcing "
+                "them to 'refunded' or 'refund_failed'.",
+                len(stuck),
+            )
+            for p in stuck:
+                logger.error(
+                    "  stuck refund: participant=%s mix=%s fee_paid=%s",
+                    tokens.p(p.get("npub_hex", "")), tokens.m(p.get("mix_id", "")),
+                    p.get("fee_paid"),
+                )
 
         # Start event loop
         self._event_loop_task = asyncio.create_task(self.run_event_loop())
