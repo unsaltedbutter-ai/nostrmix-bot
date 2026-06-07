@@ -170,9 +170,13 @@ async def run(spec: dict, env_path: str) -> int:
         output_size=output_size, fee_per_element=fee_per_element,
         required_nonconforming=required, max_conforming_utxos=max_conf,
     )
-    await db.update_mix(mix_id, state="collecting",
-                        fee_rate=int(fee_rate) if fee_rate else 30,
-                        input_type="p2wpkh", output_type="p2wpkh")
+    # Only pin a stored fee_rate when the spec fixed one. For the LIVE path we
+    # leave it unset so the rate the PSBT is built at is unambiguously the
+    # estimate fetched inside _assemble_psbt (no misleading placeholder).
+    collecting_kwargs = dict(state="collecting", input_type="p2wpkh", output_type="p2wpkh")
+    if fee_rate is not None:
+        collecting_kwargs["fee_rate"] = int(fee_rate)
+    await db.update_mix(mix_id, **collecting_kwargs)
 
     sum_in = 0
     present_conforming = 0

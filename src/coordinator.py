@@ -1636,6 +1636,14 @@ class Coordinator:
         # a second pass with round_num=1 would collide.
         round_num = mix.get("ghost_retries", 0) + 1
         now_ts = int(time.time())
+        # Per-participant accounting, keyed by pid, for the fee-disclosure DM.
+        # fee_share_sats is each participant's personal slice of the miner fee
+        # (their own NC portion + an even share of the conforming burden);
+        # conforming-only participants are 0.
+        fee_by_pid = {
+            rec["pid"]: fr.fee_share_sats
+            for rec, fr in zip(participants_data, fee_results)
+        }
         for p in active:
             pid = p["id"]
             round_id = await self.db.add_psbt_round(mix_id, pid, round_num=round_num)
@@ -1644,6 +1652,18 @@ class Coordinator:
                 psbt_sent=psbt_hex,
                 psbt_sent_at_unix=now_ts,
                 input_indices=json.dumps(input_indices_by_pid.get(pid, [])),
+            )
+
+            # Tell the participant their personal miner-fee share before the
+            # machine-readable PSBT, so they can see what they're paying (not
+            # just the whole-tx fee). 0 sats for a conforming-only participant.
+            share = fee_by_pid.get(pid, 0)
+            await self.nostr.send_dm(
+                p["npub_hex"],
+                f"Your share of the miner fee: {share} sats "
+                f"(~{share / 1e8:.8f} BTC). "
+                + ("Conforming UTXOs pass through free." if share == 0
+                   else "The PSBT to review and sign follows."),
             )
 
             # Send PSBT to participant
