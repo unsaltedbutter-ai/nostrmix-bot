@@ -27,7 +27,7 @@ Some basics:
 - let's us setup the database so that the same npub participant can be a party to more than one pending mix. This could result in the participant being asked to sign more than one PSBT at a time. We will need to match their reply to us against the n number of mixes they belong to. This should be a relatively small number. We can cap them to 5 simultaneous mixes, but let's use an env variable for the maximum allowed.
 - in logging when printing npubs, print the bech32-encoded format, not the hex, for operator readability.
 - The user decides for themselves how many outputs they want. They indicate the number by how many output addresses they send to us.
-- When the bot has no mixes open, it should make one using DEFAULT_OUTPUT_SIZE and DEFAULT_MIX_USER_COUNT
+- When the bot has no mixes open, it should make one using DEFAULT_OUTPUT_SIZE and DEFAULT_REQUIRED_NONCONFORMING
 
 ---
 
@@ -51,7 +51,6 @@ File: `schema.sql`
 CREATE TABLE mixes (
     id              TEXT PRIMARY KEY,          -- east-gate
     output_size     INTEGER NOT NULL,          -- sats (1_000_000 = 0.01 BTC); a UTXO of exactly this size is "conforming"
-    min_participants INTEGER NOT NULL DEFAULT 3,
     max_participants INTEGER,
     -- Conforming/non-conforming model:
     --   required_nonconforming = exact number of non-conforming participants the
@@ -162,7 +161,7 @@ Uses `nostrbot-sdk` for all transport. Handles:
 - **Outgoing DMs**: send structured messages to participants
 - **Zap monitoring**: listen for kind 9735 (zap receipt) events on relays; match sender npub + amount to pending participant
 - **Profile lookup**: fetch kind 0 for lightning address (refund path)
-- **Daily announcements**: once per day at `ANNOUNCEMENT_HOUR_UTC` (default 14:00 UTC), post a single combined kind 1 note listing all currently-open mixes. If no mixes are open, auto-create one with `DEFAULT_OUTPUT_SIZE` / `DEFAULT_MIX_USER_COUNT`.
+- **Daily announcements**: once per day at `ANNOUNCEMENT_HOUR_UTC` (default 14:00 UTC), post a single combined kind 1 note listing all currently-open mixes. If no mixes are open, auto-create one with `DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`.
 - **Ghosting pings**: graduated DMs at 1/8 of signing time, 1/4 of signing time, 1/2 of signing time after PSBT sent
 
 Command protocol — rigid, no NL parsing required. The bot responds with structured text:
@@ -320,17 +319,14 @@ async def run():
                     if deadline_unix passed:
                         if participants < 2:
                             cancel_and_refund(mix)
-                        elif participants < min_participants:
-                            if mix.allow_mini:
-                                proceed_to_assembling(mix)
-                            else:
-                                cancel_and_refund(mix)
+                        elif non_conforming_participants < required_nonconforming:
+                            cancel_and_refund(mix)
                         else:
                             proceed_to_assembling(mix)
 
                 case "assembling":
                     assemble_psbt(mix)
-                    update psbt_sent_at_unix for all min_participants
+                    update psbt_sent_at_unix for all paid participants
                     set p.state = "signing"
                     send_to_all_participants(mix)
                     mix.state = "signing"
@@ -640,14 +636,12 @@ REFUND_KEEP_MIN_SATS=50
 
 # Mix parameters
 DEFAULT_OUTPUT_SIZE=1000000
-MIN_PARTICIPANTS_DEFAULT=3
 MAX_PARTICIPANTS_DEFAULT=20
 MAX_PENDING_MIXES=3
 SIGNING_DEADLINE_HOURS=48
 PAY_DEADLINE_HOURS=12
 MAX_GHOST_RETRIES=3
 MINIMUM_UTXO_SIZE=10000
-DEFAULT_MIX_USER_COUNT=3           # legacy min-participants seed for auto-created mixes
 
 # Conforming / non-conforming model (see §3i)
 DEFAULT_REQUIRED_NONCONFORMING=3              # exact # of non-conforming participants a new mix waits for
@@ -702,7 +696,7 @@ DB_PATH=./bot.db
 
 All of these values are illustrative and placeholders. Make no assumption about them other than they will be strings/numbers, and should be whitespace trimmed when pulled out of the env file.
 
-The app should not accept MIN_PARTICIPANTS_DEFAULT < 2. It should upgrade the value to 2 in that case.
+The app should not accept DEFAULT_REQUIRED_NONCONFORMING < 1. It should upgrade the value to 1 in that case (a mix needs at least one non-conforming participant to fund the miner fee).
 
 ---
 

@@ -33,7 +33,6 @@ class TestBotConfig:
         # Service fee now defaults to 0 (zaps optional, off by default).
         assert cfg.FEE_PER_ELEMENT == 0
         assert cfg.MIN_FEE_RATE_SATS == 1.5
-        assert cfg.MIN_PARTICIPANTS_DEFAULT == 3
         assert cfg.MINIMUM_UTXO_SIZE == 10000
         # Conforming/non-conforming model defaults.
         assert cfg.DEFAULT_REQUIRED_NONCONFORMING == 3
@@ -48,18 +47,6 @@ class TestBotConfig:
         assert cfg.FEE_MULTIPLIER == 1.5
 
         # Clean up
-        os.unlink(env_path)
-
-    def test_min_participants_enforcement(self):
-        """Test that MIN_PARTICIPANTS_DEFAULT is enforced to at least 2."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
-            f.write("ZAP_PROVIDER_PUBKEY_HEX=def...\n")
-            f.write("MIN_PARTICIPANTS_DEFAULT=1\n")
-            env_path = f.name
-
-        cfg = BotConfig(env_path)
-        assert cfg.MIN_PARTICIPANTS_DEFAULT >= 2
         os.unlink(env_path)
 
     def test_relay_parsing(self):

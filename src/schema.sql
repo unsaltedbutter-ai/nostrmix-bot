@@ -4,7 +4,6 @@
 CREATE TABLE IF NOT EXISTS mixes (
     id              TEXT PRIMARY KEY,          -- human-readable name (east-gate)
     output_size     INTEGER NOT NULL,          -- sats per equal output; a UTXO of exactly this size is "conforming"
-    min_participants INTEGER NOT NULL DEFAULT 3,
     max_participants INTEGER,
     -- Conforming/non-conforming model:
     --   required_nonconforming = exact number of non-conforming participants

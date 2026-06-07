@@ -45,14 +45,12 @@ _DEFAULTS = {
 
     # Mix parameters
     "DEFAULT_OUTPUT_SIZE": 1000000,
-    "MIN_PARTICIPANTS_DEFAULT": 3,
     "MAX_PARTICIPANTS_DEFAULT": 20,
     "MAX_PENDING_MIXES": 5,
     "SIGNING_DEADLINE_HOURS": 48,
     "PAY_DEADLINE_HOURS": 12,
     "MAX_GHOST_RETRIES": 3,
     "MINIMUM_UTXO_SIZE": 10000,
-    "DEFAULT_MIX_USER_COUNT": 3,
 
     # --- Conforming / non-conforming UTXO model ---
     # A UTXO is "conforming" when its amount == the mix's output_size: it is
@@ -156,14 +154,9 @@ class BotConfig:
         self._validate()
 
     def _validate(self):
-        # Enforce MIN_PARTICIPANTS_DEFAULT >= 2
-        if self.MIN_PARTICIPANTS_DEFAULT < 2:
-            self._values["MIN_PARTICIPANTS_DEFAULT"] = 2
-
         # A mix must require at least one non-conforming participant — they are
         # the only parties that pay the miner fee, so a zero-NC mix could never
-        # fund a broadcast. Upgrade to 1 rather than reject (mirrors the
-        # MIN_PARTICIPANTS_DEFAULT clamp above).
+        # fund a broadcast. Upgrade to 1 rather than reject.
         if self.DEFAULT_REQUIRED_NONCONFORMING < 1:
             self._values["DEFAULT_REQUIRED_NONCONFORMING"] = 1
 
@@ -276,10 +269,6 @@ class BotConfig:
         return self._values["DEFAULT_OUTPUT_SIZE"]
 
     @property
-    def MIN_PARTICIPANTS_DEFAULT(self) -> int:
-        return self._values["MIN_PARTICIPANTS_DEFAULT"]
-
-    @property
     def MAX_PARTICIPANTS_DEFAULT(self) -> int:
         return self._values["MAX_PARTICIPANTS_DEFAULT"]
 
@@ -302,10 +291,6 @@ class BotConfig:
     @property
     def MINIMUM_UTXO_SIZE(self) -> int:
         return self._values["MINIMUM_UTXO_SIZE"]
-
-    @property
-    def DEFAULT_MIX_USER_COUNT(self) -> int:
-        return self._values["DEFAULT_MIX_USER_COUNT"]
 
     @property
     def DEFAULT_REQUIRED_NONCONFORMING(self) -> int:

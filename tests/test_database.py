@@ -44,7 +44,6 @@ class TestDatabase:
         try:
             mid = await db.create_mix(
                 output_size=1_000_000,
-                min_participants=3,
                 max_participants=10,
                 fee_per_element=100,
             )
@@ -52,7 +51,6 @@ class TestDatabase:
             mix = await db.get_mix(mid)
             assert mix is not None
             assert mix["output_size"] == 1_000_000
-            assert mix["min_participants"] == 3
             assert mix["state"] == "announced"
             # Conforming/non-conforming columns default in when not supplied.
             assert mix["required_nonconforming"] == 3
@@ -65,7 +63,7 @@ class TestDatabase:
         db = await make_db()
         try:
             mid = await db.create_mix(
-                output_size=500_000, min_participants=2,
+                output_size=500_000,
                 required_nonconforming=2, max_conforming_utxos=4,
             )
             mix = await db.get_mix(mid)
@@ -78,7 +76,7 @@ class TestDatabase:
     async def test_get_utxos_for_mix_spans_participants(self):
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 2)
+            mid = await db.create_mix(1_000_000)
             p1 = await db.add_participant(mid, "n1", "")
             p2 = await db.add_participant(mid, "n2", "")
             await db.add_utxo(p1, "11" * 32, 0, 1_000_000, "p2wpkh")
@@ -96,7 +94,7 @@ class TestDatabase:
     async def test_add_participant(self):
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "npub_hex_123", "user@pay.domain")
             assert pid is not None
             p = await db.get_participant(pid)
@@ -110,7 +108,7 @@ class TestDatabase:
     async def test_add_utxo(self):
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "npub_hex_123", "")
             uid = await db.add_utxo(pid, "abc123", 0, 100_000, "p2wpkh")
             assert uid is not None
@@ -124,7 +122,7 @@ class TestDatabase:
     async def test_add_output(self):
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "npub_hex_123", "")
             oid = await db.add_output(pid, "bc1qabc123", 1_000_000, False)
             assert oid is not None
@@ -142,7 +140,7 @@ class TestDatabase:
         constraint and the realistic flow is one row per active outpoint.)"""
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "npub1", "")
             await db.add_utxo(pid, "txid_abc", 0, 100_000)
             assert await db.is_utxo_used("txid_abc", 0) is False
@@ -155,7 +153,7 @@ class TestDatabase:
     async def test_get_active_mixes(self):
         db = await make_db()
         try:
-            await db.create_mix(1_000_000, 3)
+            await db.create_mix(1_000_000)
             active = await db.get_active_mixes()
             assert len(active) == 1
             assert active[0]["state"] == "announced"
@@ -170,7 +168,7 @@ class TestDatabase:
     async def test_participant_state_machine(self):
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "npub_hex", "")
             assert await db.get_participant(pid) is not None
             await db.update_participant(pid, state="paid", fee_paid=500)
@@ -196,8 +194,8 @@ class TestDatabase:
     async def test_count_active_participant_mixes(self):
         db = await make_db()
         try:
-            mid1 = await db.create_mix(1_000_000, 3)
-            mid2 = await db.create_mix(1_000_000, 3)
+            mid1 = await db.create_mix(1_000_000)
+            mid2 = await db.create_mix(1_000_000)
             await db.add_participant(mid1, "npub_hex", "")
             await db.add_participant(mid2, "npub_hex", "")
             count = await db.count_active_participant_mixes("npub_hex")
@@ -214,7 +212,7 @@ class TestDatabase:
         import sqlite3
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid1 = await db.add_participant(mid, "n1", "")
             pid2 = await db.add_participant(mid, "n2", "")
             await db.add_utxo(pid1, "abc", 0, 100_000)
@@ -230,7 +228,7 @@ class TestDatabase:
         """Same (txid, vout) → blocked. Same txid, different vout → fine."""
         db = await make_db()
         try:
-            mid = await db.create_mix(1_000_000, 3)
+            mid = await db.create_mix(1_000_000)
             pid = await db.add_participant(mid, "n1", "")
             await db.add_utxo(pid, "abc", 0, 100_000)
             await db.add_utxo(pid, "abc", 1, 100_000)  # different vout: OK
@@ -256,7 +254,7 @@ class TestDatabase:
         db1 = db_mod.Database(path)
         await db1.connect()
         # Write some state so we can also verify it survives across reconnects.
-        mid = await db1.create_mix(output_size=1_000_000, min_participants=3)
+        mid = await db1.create_mix(output_size=1_000_000)
         await db1.close()
 
         # The historically-broken path: connect again to the same file.

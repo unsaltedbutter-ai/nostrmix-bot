@@ -254,7 +254,7 @@ class TestRuntimeLogsHaveNoLeaks:
         try:
             secret_npub = "feed" * 16
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=3, fee_per_element=100,
+                output_size=1_000_000, fee_per_element=100,
             )
             await db.update_mix(mix_id, state="collecting")
             pid = await db.add_participant(mix_id, secret_npub, "")
@@ -289,7 +289,7 @@ class TestRuntimeLogsHaveNoLeaks:
         try:
             real_txid = "abc123txid" + "0" * 54  # something obviously distinct
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2,
+                output_size=100_000,
             )
             await db.update_mix(
                 mix_id, state="broadcast",
@@ -325,7 +325,7 @@ class TestRuntimeLogsHaveNoLeaks:
         try:
             real_txid = "ffaabbcctxidconfirmed" + "0" * 43
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2,
+                output_size=100_000,
             )
             await db.update_mix(
                 mix_id, state="broadcast",
@@ -356,7 +356,7 @@ class TestRuntimeLogsHaveNoLeaks:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             ghoster_npub = "9999" * 16
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="signing")
             deadline = coord.cfg.SIGNING_DEADLINE_HOURS * 3600
             past = int(time.time()) - (deadline + 120)

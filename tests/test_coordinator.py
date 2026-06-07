@@ -220,7 +220,7 @@ class TestCommitDustRejection:
     async def test_rejects_utxo_below_minimum(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_hex_test_dust"
             pid = await db.add_participant(mix_id, npub, "")
 
@@ -244,7 +244,7 @@ class TestCommitDustRejection:
     async def test_accepts_utxo_at_or_above_minimum(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_at_floor"
             pid = await db.add_participant(mix_id, npub, "")
 
@@ -269,7 +269,7 @@ class TestCommitMarksUtxoUsed:
     async def test_committed_utxo_is_marked_used(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_marker"
             await db.add_participant(mix_id, npub, "")
 
@@ -289,8 +289,8 @@ class TestCommitMarksUtxoUsed:
     async def test_duplicate_commit_is_rejected_by_is_utxo_used(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
+            mix_b = await db.create_mix(output_size=1_000_000)
             npub = "npub_dup"
             await db.add_participant(mix_a, npub, "")
             # second mix participant for the same npub
@@ -324,7 +324,7 @@ class TestProvideAddressesPaidState:
     async def test_paid_participant_can_resubmit_addresses_without_recharge(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_paid_resub"
             pid = await db.add_participant(mix_id, npub, "")
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -355,7 +355,7 @@ class TestProvideAddressesPaidState:
         # Service fee enabled (default is now 0 / no zap).
         coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+            mix_id = await db.create_mix(output_size=1_000_000,
                                          fee_per_element=100)
             npub = "npub_committed"
             pid = await db.add_participant(mix_id, npub, "")
@@ -379,7 +379,7 @@ class TestProvideAddressesPaidState:
         # Default config: FEE_PER_ELEMENT == 0 → no zap, straight to 'paid'.
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_nofee"
             pid = await db.add_participant(mix_id, npub, "")
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -411,7 +411,7 @@ class TestReminderProgression:
         psbt_sent_at_unix puts time_since into the requested band.
         time_band ∈ {'eighth', 'quarter', 'half', 'past'}."""
         coord, db, nostr, chain, lightning = await make_coord()
-        mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+        mix_id = await db.create_mix(output_size=1_000_000)
         # Two participants — ghosting one when only 1 exists would cancel the
         # mix. Two means the ghost-recovery branch runs.
         npub_a = "npub_signing_a"
@@ -511,7 +511,7 @@ class TestGhostBlacklistsUtxos:
     async def test_ghoster_npub_and_each_utxo_are_blacklisted(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="signing")
             deadline_seconds = coord.cfg.SIGNING_DEADLINE_HOURS * 3600
             past = int(time.time()) - (deadline_seconds + 120)
@@ -562,7 +562,7 @@ class TestGhostRecovery:
     async def test_survivors_have_outputs_cleared_and_state_paid(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(
                 mix_id, state="signing", ghost_retries=0,
                 deadline_unix=int(time.time()) - 100,  # already past
@@ -628,7 +628,7 @@ class TestInputTypeAllowlist:
     async def test_rejects_non_allowed_input_type(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_tr_rejected"
             pid = await db.add_participant(mix_id, npub, "")
 
@@ -660,7 +660,7 @@ class TestInputTypeAllowlist:
             # Widen the operator's allowlist in-place for this test.
             coord.cfg._values["_accepted_input_types"] = {"p2wpkh", "p2tr"}
 
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_tr_allowed"
             await db.add_participant(mix_id, npub, "")
 
@@ -692,7 +692,7 @@ class TestOutputTypeAllowlist:
     async def test_rejects_p2tr_address_when_only_p2wpkh_allowed(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_mixed_out"
             pid = await db.add_participant(mix_id, npub, "")
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -721,7 +721,7 @@ class TestOutputTypeAllowlist:
         try:
             coord.cfg._values["_accepted_output_types"] = {"p2wpkh", "p2tr"}
 
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_tr_out_allowed"
             pid = await db.add_participant(mix_id, npub, "")
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -742,7 +742,7 @@ class TestOutputTypeAllowlist:
     async def test_rejects_unparseable_address(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_garbage"
             pid = await db.add_participant(mix_id, npub, "")
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -788,7 +788,7 @@ class TestAssemblePsbt:
     async def test_miner_fee_is_deducted_so_outputs_sum_lt_inputs(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
             pids = await _seed_paid_participants(db, mix_id, count=3)
 
@@ -843,7 +843,7 @@ class TestAssemblePsbt:
     async def test_round_num_progresses_with_ghost_retries(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             # Simulate two prior ghost-recovery passes. The current assembly
             # should be round 3 (= ghost_retries + 1).
             await db.update_mix(mix_id, state="assembling", fee_rate=30, ghost_retries=2)
@@ -867,7 +867,7 @@ class TestAssemblePsbt:
         derived from ghost_retries+1, two passes write to different rows."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="assembling", fee_rate=30, ghost_retries=0)
             pids = await _seed_paid_participants(db, mix_id, count=3)
 
@@ -934,7 +934,7 @@ class TestPerParticipantPayTimeout:
     async def test_committed_past_deadline_is_cancelled(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="collecting",
                                 deadline_unix=int(time.time()) + 999_999)
 
@@ -963,7 +963,7 @@ class TestPerParticipantPayTimeout:
     async def test_committed_within_deadline_survives_tick(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="collecting",
                                 deadline_unix=int(time.time()) + 999_999)
             npub = "npub_recent"
@@ -988,8 +988,8 @@ class TestOneAtATimeMix:
     async def test_join_blocked_when_already_committed_elsewhere(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
+            mix_b = await db.create_mix(output_size=1_000_000)
             npub = "npub_busy"
             pid = await db.add_participant(mix_a, npub, "")
             await db.update_participant(pid, state="committed")
@@ -1009,8 +1009,8 @@ class TestOneAtATimeMix:
     async def test_join_blocked_when_interested_elsewhere(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
+            mix_b = await db.create_mix(output_size=1_000_000)
             npub = "npub_interested"
             await db.add_participant(mix_a, npub, "")  # default state 'interested'
 
@@ -1032,7 +1032,7 @@ class TestPerMixTypeLock:
     async def test_first_commit_locks_mix_input_type(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_first_commit"
             await db.add_participant(mix_id, npub, "")
             chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000, script_type="p2wpkh")
@@ -1053,7 +1053,7 @@ class TestPerMixTypeLock:
             # Widen the operator allowlist so the rejection comes from the
             # per-mix lock, not the global allowlist.
             coord.cfg._values["_accepted_input_types"] = {"p2wpkh", "p2tr"}
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, input_type="p2wpkh")
 
             npub = "npub_mismatch"
@@ -1104,7 +1104,7 @@ class TestAutoMixOnCommit:
     async def test_joins_existing_open_mix_if_compatible(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            existing = await db.create_mix(output_size=1_000_000, min_participants=3,
+            existing = await db.create_mix(output_size=1_000_000,
                                            max_participants=10)
             await db.update_mix(existing, state="collecting", input_type="p2wpkh")
 
@@ -1128,7 +1128,7 @@ class TestAutoMixOnCommit:
             # Widen the allowlist so p2tr passes the gate.
             coord.cfg._values["_accepted_input_types"] = {"p2wpkh", "p2tr"}
             # Existing mix is locked to p2wpkh.
-            existing = await db.create_mix(output_size=1_000_000, min_participants=3)
+            existing = await db.create_mix(output_size=1_000_000)
             await db.update_mix(existing, state="collecting", input_type="p2wpkh")
 
             npub = "npub_tr_seeker"
@@ -1162,13 +1162,13 @@ class TestPsbtAcceptDisambiguation:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             # Two mixes, both with same npub (legal: one paid each).
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_a = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_a, state="assembling", fee_rate=30)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_b = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_b, state="assembling", fee_rate=30)
 
             # In each mix, the npub is paired with one other participant so
-            # _assemble_psbt has min_participants=2 to work with.
+            # _assemble_psbt has 2 paid participants to work with.
             our_npub = "npub_two_mix"
             other_npub_a = "npub_other_a"
             other_npub_b = "npub_other_b"
@@ -1257,8 +1257,8 @@ class TestExitMixTypoMultiMix:
     async def test_cancel_typo_with_multiple_active_mixes(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
+            mix_b = await db.create_mix(output_size=1_000_000)
             npub = "npub_two_paid"
             pid_a = await db.add_participant(mix_a, npub, "")
             pid_b = await db.add_participant(mix_b, npub, "")
@@ -1279,8 +1279,8 @@ class TestExitMixTypoMultiMix:
         """Same broken f-string path, hit via /cancel with no mix_id at all."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
+            mix_b = await db.create_mix(output_size=1_000_000)
             npub = "npub_two_paid2"
             pid_a = await db.add_participant(mix_a, npub, "")
             pid_b = await db.add_participant(mix_b, npub, "")
@@ -1302,7 +1302,7 @@ class TestOnZapHappyAndOverpayPaths:
     accept/reject + accounting + operator-log behaviour."""
 
     async def _setup_committed_participant(self, db):
-        mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+        mix_id = await db.create_mix(output_size=1_000_000,
                                      fee_per_element=100)
         await db.update_mix(mix_id, state="collecting")
         npub = "npub_payer"
@@ -1394,12 +1394,12 @@ class TestOnZapHappyAndOverpayPaths:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             # Get into mix A and commit (so state is 'committed').
-            mix_a = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=1_000_000)
             pid_a = await db.add_participant(mix_a, "npub_x", "")
             await db.update_participant(pid_a, state="committed")
 
             # Now try /join'ing mix B.
-            mix_b = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_b = await db.create_mix(output_size=1_000_000)
             await coord._cmd_join_mix(FakeCtx("npub_x"), mix_b)
 
             participants = await db.get_participants_by_npub("npub_x")
@@ -1449,7 +1449,7 @@ class TestAssemblePsbtFiltersToPaid:
     async def test_assemble_skips_committed_participant(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
             # Two participants — one paid, one stuck in 'committed'.
@@ -1465,7 +1465,7 @@ class TestAssemblePsbtFiltersToPaid:
             for addr in P2WPKH_ADDRS[3:6]:
                 await db.add_output(pid_unpaid, addr, 1_000_000)
 
-            # Add a second paid participant so the min_participants=2 check holds.
+            # Add a second paid participant so assembly has >=2 to work with.
             pid_paid2 = await db.add_participant(mix_id, "npub_paid2", "")
             await db.update_participant(pid_paid2, state="paid", fee_paid=500)
             await db.add_utxo(pid_paid2, TXID[2], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -1526,7 +1526,7 @@ class TestStrandedFeeFallback:
     async def test_paid_participant_without_lud16_gets_stranded_dm(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="collecting")
 
             paid_npub = "npub_paid_no_lud16"
@@ -1618,10 +1618,10 @@ class TestBroadcast409TreatedAsSuccess:
         after applying the proportional miner fee, the old code cancelled
         the whole mix. New behaviour: refund the under-funded participant,
         notify them, and continue with the survivors if there are still
-        enough for min_participants."""
+        enough non-conforming participants for required_nonconforming."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
+            mix_id = await db.create_mix(output_size=1_000_000,
                                          max_participants=10, required_nonconforming=2)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
@@ -1691,13 +1691,13 @@ class TestBroadcast409TreatedAsSuccess:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_dropping_drops_below_min_participants_cancels_whole_mix(self):
-        """C2 boundary: if dropping under-funded participants would leave
-        fewer than min_participants, fall back to cancelling the whole mix
-        (the prior behavior)."""
+    async def test_dropping_drops_below_required_nonconforming_cancels_whole_mix(self):
+        """C2 boundary: if dropping under-funded participants would leave fewer
+        non-conforming survivors than required_nonconforming, fall back to
+        cancelling the whole mix."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+            mix_id = await db.create_mix(output_size=1_000_000,
                                          max_participants=10, required_nonconforming=3)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
@@ -1725,7 +1725,7 @@ class TestBroadcast409TreatedAsSuccess:
 
             mix_after = await db.get_mix(mix_id)
             assert mix_after["state"] == "cancelled", (
-                f"should cancel when survivors < min_participants; got {mix_after['state']}"
+                f"should cancel when NC survivors < required_nonconforming; got {mix_after['state']}"
             )
         finally:
             await db.close()
@@ -1804,7 +1804,7 @@ async def _make_2p_signing_mix(coord, db):
     spk_b = P2WPKHBitcoinAddress.from_pubkey(k_b.pub).to_scriptPubKey().hex()
 
     mix_id = await db.create_mix(
-        output_size=100_000, min_participants=2,
+        output_size=100_000,
         max_participants=10, fee_per_element=100,
     )
     await db.update_mix(
@@ -1933,7 +1933,7 @@ class TestBroadcastSweep:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             # Mix is in broadcast state with a known txid.
-            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=100_000)
             await db.update_mix(
                 mix_id, state="broadcast",
                 broadcast_txid="finaltxid_xyz",
@@ -1964,7 +1964,7 @@ class TestBroadcastSweep:
     async def test_unconfirmed_triggers_rebroadcast(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=100_000)
             await db.update_mix(
                 mix_id, state="broadcast",
                 broadcast_txid="pending_txid",
@@ -1992,7 +1992,7 @@ class TestBroadcastSweep:
         elapsed, the sweep is a no-op even if there's a pending broadcast."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=100_000)
             await db.update_mix(
                 mix_id, state="broadcast",
                 broadcast_txid="any", broadcast_tx_hex="00" * 16,
@@ -2022,7 +2022,7 @@ class TestDailyAnnouncementWithExistingMixes:
         try:
             ids = []
             for _ in range(2):
-                mid = await db.create_mix(output_size=100_000, min_participants=3)
+                mid = await db.create_mix(output_size=100_000)
                 await db.update_mix(mid, state="collecting")
                 ids.append(mid)
 
@@ -2043,7 +2043,7 @@ class TestExitMixSingleAndNone:
     async def test_single_mix_paid_refunds_and_dms(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=100_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=100_000)
             pid = await db.add_participant(mix_id, "npub_solo", "solo@x")
             await db.update_participant(pid, state="paid", fee_paid=1000)
 
@@ -2075,8 +2075,8 @@ class TestExitMixSingleAndNone:
     async def test_multi_mix_with_matching_id_exits_just_that_one(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_a = await db.create_mix(output_size=100_000, min_participants=3)
-            mix_b = await db.create_mix(output_size=100_000, min_participants=3)
+            mix_a = await db.create_mix(output_size=100_000)
+            mix_b = await db.create_mix(output_size=100_000)
             pid_a = await db.add_participant(mix_a, "npub_mm", "mm@x")
             pid_b = await db.add_participant(mix_b, "npub_mm", "mm@x")
             await db.update_participant(pid_a, state="paid", fee_paid=500)
@@ -2155,7 +2155,7 @@ class TestOutpointReleasedOnCancel:
     async def test_cancel_and_refund_deletes_utxos(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "user_x", "x@x")
             await db.update_participant(pid, state="paid", fee_paid=500)
             await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2166,7 +2166,7 @@ class TestOutpointReleasedOnCancel:
             # Row is gone.
             assert await db.get_utxo(TXID[0], 0) is None
             # And a new commit can now use the same outpoint.
-            mix_id2 = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id2 = await db.create_mix(output_size=1_000_000)
             pid2 = await db.add_participant(mix_id2, "user_y", "")
             await db.add_utxo(pid2, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
             assert await db.get_utxo(TXID[0], 0) is not None
@@ -2177,7 +2177,7 @@ class TestOutpointReleasedOnCancel:
     async def test_voluntary_exit_deletes_utxos(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "exiter", "e@x")
             await db.update_participant(pid, state="paid", fee_paid=500)
             await db.add_utxo(pid, TXID[1], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2193,7 +2193,7 @@ class TestOutpointReleasedOnCancel:
     async def test_drop_underfunded_deletes_utxos(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
+            mix_id = await db.create_mix(output_size=1_000_000,
                                          max_participants=10, required_nonconforming=2)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
@@ -2236,7 +2236,7 @@ class TestOutpointReleasedOnCancel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             # A separate mix already holds (TXID[3], 0).
-            other_mix = await db.create_mix(output_size=1_000_000, min_participants=3)
+            other_mix = await db.create_mix(output_size=1_000_000)
             other_pid = await db.add_participant(other_mix, "other", "")
             await db.add_utxo(other_pid, TXID[3], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
             # Note: is_used left as 0 so is_utxo_used returns False (the row
@@ -2244,7 +2244,7 @@ class TestOutpointReleasedOnCancel:
             # path to actually run and hit the UNIQUE constraint.
 
             # New user commits the same outpoint.
-            new_mix = await db.create_mix(output_size=1_000_000, min_participants=3)
+            new_mix = await db.create_mix(output_size=1_000_000)
             new_pid = await db.add_participant(new_mix, "racer", "")
 
             chain.txouts[f"{TXID[3]}:0"] = _fake_txout(value=500_000)
@@ -2292,7 +2292,7 @@ class TestAutoMixRaceGuard:
                 if not injected["done"]:
                     injected["done"] = True
                     other_mix = await db.create_mix(
-                        output_size=1_000_000, min_participants=3,
+                        output_size=1_000_000,
                     )
                     await db.add_participant(other_mix, npub, "")
                 return await original_lookup(txid, vout)
@@ -2384,7 +2384,7 @@ class TestRefundIdempotency:
     async def test_cancel_and_refund_is_idempotent_across_simulated_crash(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "npub_idem", "idem@x")
             await db.update_participant(pid, state="paid", fee_paid=1000)
             await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2410,7 +2410,7 @@ class TestRefundIdempotency:
     async def test_drop_underfunded_is_idempotent_across_simulated_crash(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "npub_drop", "drop@x")
             await db.update_participant(pid, state="paid", fee_paid=300)
             await db.add_utxo(pid, TXID[1], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2436,7 +2436,7 @@ class TestRefundIdempotency:
         sees 'refunding' and doesn't try again."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "npub_stuck", "stuck@x")
             await db.update_participant(pid, state="refunding", fee_paid=1000)
 
@@ -2455,7 +2455,7 @@ class TestRefundIdempotency:
     async def test_refund_failed_state_when_both_backends_return_none(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "npub_brokeln", "br@x")
             await db.update_participant(pid, state="paid", fee_paid=1000)
 
@@ -2611,7 +2611,7 @@ class TestIteratedFeeMath:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, max_participants=10,
+                output_size=1_000_000, max_participants=10,
             )
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
@@ -2657,7 +2657,7 @@ class TestCommitRejectsOnSpentCheckUnreachable:
     async def test_chain_unreachable_does_not_add_utxo(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_unreachable"
             pid = await db.add_participant(mix_id, npub, "")
 
@@ -2774,7 +2774,7 @@ class TestBatchedCommitRejectionDMs:
         one DM with up to _MAX_REJECTION_LINES detail lines + a tail."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_spammer"
             await db.add_participant(mix_id, npub, "")
 
@@ -2800,7 +2800,7 @@ class TestBatchedCommitRejectionDMs:
     async def test_small_number_of_rejections_lists_each_with_reason(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000)
             npub = "npub_two_bad"
             await db.add_participant(mix_id, npub, "")
 
@@ -2829,7 +2829,7 @@ class TestCancelScrubsIdentifiers:
     async def test_cancelled_mix_blanks_npub_and_lud16(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             pid = await db.add_participant(mix_id, "npub_priv", "priv@example.com")
             await db.update_participant(pid, state="paid", fee_paid=500)
             await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2872,7 +2872,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=2,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -2898,7 +2898,7 @@ class TestConformingModel:
         try:
             coord.cfg._values["MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT"] = 1
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
             )
             await db.update_mix(mix_id, state="collecting")
             npub = "npub_nccap"
@@ -2924,7 +2924,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, fee_per_element=100,
+                output_size=1_000_000, fee_per_element=100,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -2951,7 +2951,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, max_conforming_utxos=5,
+                output_size=1_000_000, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting")
             npub = "npub_addrcount"
@@ -2971,7 +2971,7 @@ class TestConformingModel:
     async def test_nonconforming_total_below_output_size_rejected(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=1_000_000)
             await db.update_mix(mix_id, state="collecting")
             npub = "npub_small"
             pid = await self._interested(coord, db, mix_id, npub)
@@ -2999,7 +2999,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
             )
             await db.update_mix(mix_id, state="collecting")
             # One paid NC participant — not enough yet.
@@ -3019,7 +3019,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=1, required_nonconforming=1,
+                output_size=1_000_000, required_nonconforming=1,
             )
             await db.update_mix(mix_id, state="collecting")
             # Single NC participant, no conforming present → must NOT proceed.
@@ -3046,7 +3046,7 @@ class TestConformingModel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
                 max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="assembling", fee_rate=30,
@@ -3114,7 +3114,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3146,7 +3146,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3175,7 +3175,7 @@ class TestConformingModelGaps:
         try:
             coord.cfg._values["DONATION_ADDRESS"] = P2WPKH_ADDRS[7]
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting",
@@ -3215,7 +3215,7 @@ class TestConformingModelGaps:
         try:
             # DONATION_ADDRESS left blank (default).
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting",
@@ -3240,7 +3240,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting",
@@ -3283,7 +3283,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, max_conforming_utxos=5,
+                output_size=1_000_000, max_conforming_utxos=5,
             )
             await db.update_mix(mix_id, state="collecting")
             npub = "conf2"
@@ -3307,7 +3307,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2,
+                output_size=1_000_000,
                 required_nonconforming=2, max_conforming_utxos=2,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3335,7 +3335,7 @@ class TestConformingModelGaps:
         try:
             coord.cfg._values["MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT"] = 2
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
             )
             await db.update_mix(mix_id, state="collecting")
             npub = "nccap2"
@@ -3363,7 +3363,7 @@ class TestConformingModelGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
                 deadline_unix=int(time.time()) - 100,  # already past
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3416,7 +3416,7 @@ class TestLowerPriorityGaps:
             txid_a, txid_b = "a1" * 32, "b2" * 32
 
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2, required_nonconforming=2,
+                output_size=100_000, required_nonconforming=2,
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3468,7 +3468,7 @@ class TestLowerPriorityGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3492,7 +3492,7 @@ class TestLowerPriorityGaps:
         coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2, required_nonconforming=2,
+                output_size=100_000, required_nonconforming=2,
                 fee_per_element=100,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3529,7 +3529,7 @@ class TestLowerPriorityGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=1, required_nonconforming=1,
+                output_size=100_000, required_nonconforming=1,
                 max_conforming_utxos=5, fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting",
@@ -3586,7 +3586,7 @@ class TestReviewGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2, required_nonconforming=2,
+                output_size=100_000, required_nonconforming=2,
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3611,7 +3611,7 @@ class TestReviewGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2, required_nonconforming=2,
+                output_size=100_000, required_nonconforming=2,
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="assembling",
@@ -3639,7 +3639,7 @@ class TestReviewGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=1, required_nonconforming=1,
+                output_size=1_000_000, required_nonconforming=1,
                 max_conforming_utxos=20, fee_per_element=0,
             )
             await db.update_mix(mix_id, state="assembling", fee_rate=30,
@@ -3678,7 +3678,7 @@ class TestReviewGaps:
             P2TR = "bc1p9j0rwcgpd28gnastlh2yweshq7sl2vxxvrpstdsx9w3m8axaxn0qg0vcg0"
 
             mix_id = await db.create_mix(
-                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                output_size=1_000_000, required_nonconforming=2,
             )
             await db.update_mix(mix_id, state="collecting")
 
@@ -3738,13 +3738,13 @@ class TestReviewGaps:
             npub = "pending_user"
             # Already paid into 2 collecting mixes.
             for txid in (TXID[0], TXID[1]):
-                m = await db.create_mix(output_size=1_000_000, min_participants=2)
+                m = await db.create_mix(output_size=1_000_000)
                 await db.update_mix(m, state="collecting")
                 p = await db.add_participant(m, npub, "")
                 await db.update_participant(p, state="paid")
 
             # A 3rd open mix exists; joining it must be refused.
-            m3 = await db.create_mix(output_size=1_000_000, min_participants=2)
+            m3 = await db.create_mix(output_size=1_000_000)
             await db.update_mix(m3, state="collecting")
             await coord._cmd_join_mix(FakeCtx(npub), m3)
 
@@ -3765,7 +3765,7 @@ class TestReviewGaps:
                       "broadcast", "completed", "cancelled"]
             ids = {}
             for s in states:
-                mid = await db.create_mix(output_size=1_000_000, min_participants=2)
+                mid = await db.create_mix(output_size=1_000_000)
                 await db.update_mix(mid, state=s)
                 ids[s] = mid
 
@@ -3789,7 +3789,6 @@ class TestReviewGaps:
             assert len(mixes) == 1
             m = mixes[0]
             assert m["output_size"] == coord.cfg.DEFAULT_OUTPUT_SIZE
-            assert m["min_participants"] == coord.cfg.DEFAULT_MIX_USER_COUNT
             assert m["required_nonconforming"] == coord.cfg.DEFAULT_REQUIRED_NONCONFORMING
             assert m["max_conforming_utxos"] == coord.cfg.MAX_CONFORMING_UTXOS
         finally:
@@ -3805,7 +3804,7 @@ class TestReviewGaps:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(
-                output_size=100_000, min_participants=2, required_nonconforming=2,
+                output_size=100_000, required_nonconforming=2,
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting")
@@ -3838,7 +3837,7 @@ class TestReviewGaps:
     async def test_cleanup_interested_is_idempotent(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
-            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            mix_id = await db.create_mix(output_size=100_000)
             await db.update_mix(mix_id, state="collecting")
             idle = await db.add_participant(mix_id, "idle2", "idle2@x")
             await coord._cleanup_interested(mix_id)

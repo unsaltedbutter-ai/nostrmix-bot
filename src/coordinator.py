@@ -271,11 +271,10 @@ class Coordinator:
             if cnt >= cap:
                 continue
             return m["id"]
-        # None compatible — spin up a fresh DEFAULT_MIX_USER_COUNT mix.
+        # None compatible — spin up a fresh default mix.
         deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
         mid = await self.db.create_mix(
             output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
-            min_participants=self.cfg.DEFAULT_MIX_USER_COUNT,
             max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
             fee_per_element=self.cfg.FEE_PER_ELEMENT,
             deadline_unix=deadline,
@@ -1423,7 +1422,8 @@ class Coordinator:
         Under-funded participants (those whose proportional fee_share would
         push them below one equal output) are dropped + refunded, and the
         fee math is re-run with the survivors. If too many drops would push
-        the mix below min_participants, fall back to cancelling the whole mix.
+        the mix below its required non-conforming count (or below 2 total),
+        fall back to cancelling the whole mix.
         """
         mix_id = mix["id"]
         output_size = mix["output_size"]
@@ -2020,7 +2020,6 @@ class Coordinator:
             deadline_unix = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
             mid = await self.db.create_mix(
                 output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
-                min_participants=self.cfg.DEFAULT_MIX_USER_COUNT,
                 max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
                 fee_per_element=self.cfg.FEE_PER_ELEMENT,
                 deadline_unix=deadline_unix,
