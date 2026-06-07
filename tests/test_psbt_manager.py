@@ -319,9 +319,14 @@ class TestPSBTManager:
     # --- S-C: tx-level field checks (nVersion / nLockTime / nSequence) ---
 
     def _modify_unsigned_tx(self, skel_hex: str, *, nVersion=None,
-                             nLockTime=None, vin_index_to_seq=None):
+                             nLockTime=None, vin_index_to_seq=None,
+                             vout_index_to_amount=None, vout_index_to_script=None):
         """Build a tampered PSBT by deserializing the skeleton, mutating
-        the unsigned_tx, and reserializing."""
+        the unsigned_tx, and reserializing. Only mutations that keep the
+        vin/vout COUNT unchanged round-trip cleanly here (count changes are
+        modelled by building a separate skeleton); this covers value/script/
+        field tampering, including sign-then-tamper attacks (partial_sigs on
+        psbt.inputs are preserved)."""
         from bitcointx.core import b2x
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
         psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel_hex))
@@ -333,6 +338,12 @@ class TestPSBTManager:
         if vin_index_to_seq:
             for i, seq in vin_index_to_seq.items():
                 tx.vin[i].nSequence = seq
+        if vout_index_to_amount:
+            for i, amt in vout_index_to_amount.items():
+                tx.vout[i].nValue = amt
+        if vout_index_to_script:
+            for i, spk in vout_index_to_script.items():
+                tx.vout[i].scriptPubKey = spk
         psbt.unsigned_tx = tx
         return b2x(psbt.serialize())
 
@@ -405,3 +416,131 @@ class TestPSBTManager:
             expected_output_addresses=[],
         )
         assert ok, f"identical round-trip should pass: {reason}"
+
+    # --- Adversarial: output tampering & structural changes -----------------
+    #
+    # The core fund-safety guarantee: a participant signs ONLY their own input
+    # and must not be able to alter where the money goes. validate_returned is
+    # the gate. These tests are the attacker's playbook — every one must be
+    # rejected, and several use a *validly-signed* return to prove the output
+    # checks fire regardless of a correct signature.
+
+    def _attacker_p2wpkh_script(self):
+        """A valid p2wpkh scriptPubKey controlled by an 'attacker' key."""
+        from bitcointx.core.key import CKey
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+        atk = CKey(b"\x99" * 32)
+        return P2WPKHBitcoinAddress.from_pubkey(atk.pub).to_scriptPubKey()
+
+    def _io(self, n_in, out_amounts):
+        """Build (inputs, outputs, keys) for build_skeleton with n_in p2wpkh
+        inputs (key i owns input i) and one output per amount in out_amounts."""
+        from bitcointx.core.key import CKey
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+        keys = [CKey(bytes([i + 1]) + b"\x55" * 31) for i in range(n_in)]
+        inputs = [{
+            "txid": (bytes([i + 1]) * 32).hex(), "vout": 0, "amount": 500_000,
+            "script_type": "p2wpkh",
+            "scriptpubkey": P2WPKHBitcoinAddress.from_pubkey(keys[i].pub).to_scriptPubKey().hex(),
+        } for i in range(n_in)]
+        addrs = [
+            "bc1q4gyakdgygyc8qweh39qxamywc9vdvrt82jsrcj",
+            "bc1q670lslr8tlv9w5kk4zw7ckha74ll6lx48tnsks",
+            "bc1qa9d476j967wv6xdq3zcxncqgufj3evm0qakga4",
+            "bc1qcsz06k58myv2az3uy35krphtw6m4rzs7jmsy96",
+        ]
+        outputs = [{"address": addrs[j], "amount": amt}
+                   for j, amt in enumerate(out_amounts)]
+        return inputs, outputs, keys
+
+    def test_validate_rejects_signed_then_inflated_own_output(self):
+        """THE headline attack: participant signs their own input correctly,
+        then bumps an output amount to pay themselves more. Even with a valid
+        signature, the output-amount check must reject it."""
+        skel, keys = self._multi_input_skeleton(n=2)
+        signed = self._sign_with(skel, [0], keys)           # legit sig on input 0
+        tampered = self._modify_unsigned_tx(signed, vout_index_to_amount={0: 100_000_000})
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=1, expected_output_addresses=[],
+            participant_input_indices=[0],
+        )
+        assert not ok, "must reject a signed return whose output amount was inflated"
+        assert "amount changed" in reason.lower(), reason
+
+    def test_validate_rejects_redirected_output_address(self):
+        """Participant signs their input, then redirects an output to their own
+        address. The scriptPubKey check must reject it."""
+        skel, keys = self._multi_input_skeleton(n=2)
+        signed = self._sign_with(skel, [0], keys)
+        tampered = self._modify_unsigned_tx(
+            signed, vout_index_to_script={1: self._attacker_p2wpkh_script()})
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=1, expected_output_addresses=[],
+            participant_input_indices=[0],
+        )
+        assert not ok, "must reject a return that redirects an output address"
+        assert "address changed" in reason.lower(), reason
+
+    def test_validate_rejects_zero_sum_theft_from_peer(self):
+        """Sum-preserving steal: raise own output, drop a peer's output by the
+        same amount (the totals still balance, so a naive miner-fee check would
+        miss it). The per-output amount check catches it."""
+        skel, keys = self._multi_input_skeleton(n=2)  # 2 outputs @ 100_000
+        signed = self._sign_with(skel, [0], keys)
+        tampered = self._modify_unsigned_tx(
+            signed, vout_index_to_amount={0: 199_000, 1: 1_000})
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=1, expected_output_addresses=[],
+            participant_input_indices=[0],
+        )
+        assert not ok, "must reject a sum-preserving reallocation between outputs"
+        assert "amount changed" in reason.lower(), reason
+
+    def test_validate_rejects_extra_output(self):
+        """Participant returns a PSBT with an extra output (e.g. siphoning the
+        miner-fee surplus to themselves). Output-count check rejects it."""
+        inputs, outputs, _keys = self._io(2, [100_000, 100_000])
+        skel = self.mgr.build_skeleton(inputs, outputs)
+        _i, outputs3, _k = self._io(2, [100_000, 100_000, 50_000])
+        returned = self.mgr.build_skeleton(inputs, outputs3)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=0, expected_output_addresses=[])
+        assert not ok, "must reject an added output"
+        assert "output count changed" in reason.lower(), reason
+
+    def test_validate_rejects_removed_output(self):
+        """Dropping an output (e.g. a peer's) must be rejected."""
+        inputs, outputs3, _keys = self._io(2, [100_000, 100_000, 100_000])
+        skel = self.mgr.build_skeleton(inputs, outputs3)
+        _i, outputs2, _k = self._io(2, [100_000, 100_000])
+        returned = self.mgr.build_skeleton(inputs, outputs2)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=0, expected_output_addresses=[])
+        assert not ok, "must reject a removed output"
+        assert "output count changed" in reason.lower(), reason
+
+    def test_validate_rejects_extra_input(self):
+        """Adding an input (e.g. trying to claim more of the pot) must be
+        rejected by the input-count check."""
+        inputs2, outputs, _keys = self._io(2, [100_000, 100_000])
+        skel = self.mgr.build_skeleton(inputs2, outputs)
+        inputs3, _o, _k = self._io(3, [100_000, 100_000])
+        returned = self.mgr.build_skeleton(inputs3, outputs)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=0, expected_output_addresses=[])
+        assert not ok, "must reject an added input"
+        assert "input count changed" in reason.lower(), reason
+
+    def test_validate_rejects_removed_input(self):
+        """Removing an input must be rejected by the input-count check."""
+        inputs3, outputs, _keys = self._io(3, [100_000, 100_000])
+        skel = self.mgr.build_skeleton(inputs3, outputs)
+        inputs2, _o, _k = self._io(2, [100_000, 100_000])
+        returned = self.mgr.build_skeleton(inputs2, outputs)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=0, expected_output_addresses=[])
+        assert not ok, "must reject a removed input"
+        assert "input count changed" in reason.lower(), reason

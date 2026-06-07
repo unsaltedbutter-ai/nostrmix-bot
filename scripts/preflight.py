@@ -85,8 +85,18 @@ async def _check_mempool(cfg: BotConfig) -> list[str]:
             problems.append("mempool API reachable but a known-confirmed tx came back unconfirmed — unexpected.")
             print("  reachable           : DEGRADED (known tx not confirmed?)")
         rate = await chain.estimate_fee_rate()
-        print(f"  fee estimate        : {rate:.2f} sat/vB "
-              f"(clamped to [{cfg.MIN_FEE_RATE_SATS}, {cfg.MAX_FEE_RATE_SATS}])")
+        # Show the breakdown so it's clear the multiplier is applied to the RAW
+        # rate first, then floored — not the other way around.
+        raw_rates = await chain._recent_block_min_feerates()
+        if raw_rates:
+            base = max(raw_rates)
+            scaled = base * cfg.FEE_MULTIPLIER
+            note = (f"raw {base:.2f} x{cfg.FEE_MULTIPLIER} = {scaled:.2f}, "
+                    f"then floor {cfg.MIN_FEE_RATE_SATS} / cap {cfg.MAX_FEE_RATE_SATS}")
+        else:
+            note = (f"from fallback; floor {cfg.MIN_FEE_RATE_SATS} / "
+                    f"cap {cfg.MAX_FEE_RATE_SATS}")
+        print(f"  fee estimate        : {rate:.2f} sat/vB  ({note})")
         if rate <= 0:
             problems.append("fee estimate returned <= 0.")
     except Exception as e:
