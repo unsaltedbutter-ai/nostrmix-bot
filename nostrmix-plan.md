@@ -479,7 +479,7 @@ If there are other flows that are required, a best guess is appropriate as long 
 - Bot says: we've added you to <east-gate> and resumes the "Signup to mix" script just after the txid,vout,address phase
 - - this let's users join the closest to completed mix quickly and easily.
 - - this needs to be atomic so we don't over-subscribe to a mix.
-- If there is no open mix, the Bot creates a `DEFAULT_MIX_USER_COUNT` person mix with `output_size = DEFAULT_OUTPUT_SIZE`. (Earlier drafts of this plan computed the output size per-user from the sum of their inputs divided by `DEFAULT_MIX_OUTPUT_COUNT`; that was abandoned because per-user output sizes fragment the anonymity set. A single shared `DEFAULT_OUTPUT_SIZE` keeps all participants in the same mix on the same size band. `DEFAULT_MIX_OUTPUT_COUNT` is therefore currently unused.)
+- If there is no open mix, the Bot creates a default mix with `output_size = DEFAULT_OUTPUT_SIZE` and `required_nonconforming = DEFAULT_REQUIRED_NONCONFORMING`. (An earlier draft computed a per-user output size from the sum of their inputs; that was abandoned because per-user output sizes fragment the anonymity set. A single shared `DEFAULT_OUTPUT_SIZE` keeps everyone in the mix on the same size band.)
 
 
 If user sends the wrong output address type for the mix, the bot should reject by saying:
@@ -647,7 +647,6 @@ SIGNING_DEADLINE_HOURS=48
 PAY_DEADLINE_HOURS=12
 MAX_GHOST_RETRIES=3
 MINIMUM_UTXO_SIZE=10000
-DEFAULT_MIX_OUTPUT_COUNT=4         # currently unused — see section 3g
 DEFAULT_MIX_USER_COUNT=3           # legacy min-participants seed for auto-created mixes
 
 # Conforming / non-conforming model (see §3i)

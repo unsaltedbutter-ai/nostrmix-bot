@@ -52,7 +52,6 @@ _DEFAULTS = {
     "PAY_DEADLINE_HOURS": 12,
     "MAX_GHOST_RETRIES": 3,
     "MINIMUM_UTXO_SIZE": 10000,
-    "DEFAULT_MIX_OUTPUT_COUNT": 4,
     "DEFAULT_MIX_USER_COUNT": 3,
 
     # --- Conforming / non-conforming UTXO model ---
@@ -301,10 +300,6 @@ class BotConfig:
     @property
     def MINIMUM_UTXO_SIZE(self) -> int:
         return self._values["MINIMUM_UTXO_SIZE"]
-
-    @property
-    def DEFAULT_MIX_OUTPUT_COUNT(self) -> int:
-        return self._values["DEFAULT_MIX_OUTPUT_COUNT"]
 
     @property
     def DEFAULT_MIX_USER_COUNT(self) -> int:

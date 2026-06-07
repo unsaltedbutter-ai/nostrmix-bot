@@ -126,8 +126,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set); also the collecting deadline and the ghost-recovery deadline extension. |
 | `MAX_GHOST_RETRIES` | `3` | int ≥ 0 | How many times a mix restarts collecting after a ghost before it cancels and refunds everyone. |
 | `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at `/commit`. |
-| `DEFAULT_MIX_USER_COUNT` | `3` | int | Seeds `min_participants` of auto-created mixes. |
-| `DEFAULT_MIX_OUTPUT_COUNT` | `4` | int | **Currently unused** (legacy; see plan §3g). |
+| `DEFAULT_MIX_USER_COUNT` | `3` | int | Seeds the (now largely vestigial) `min_participants` column of auto-created mixes. Proceed/cancel logic uses `DEFAULT_REQUIRED_NONCONFORMING` instead. |
 
 ### Conforming / non-conforming model
 
