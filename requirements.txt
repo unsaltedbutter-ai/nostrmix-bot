@@ -11,7 +11,9 @@
 # the conftest.py shim can be deleted.
 
 nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.4.0
-python-bitcointx>=1.1.0
+# Pinned: the conftest.py libsecp256k1 symbol-rename shim is written against
+# 1.1.5's loader internals. A 1.2+ release could change those and break tests.
+python-bitcointx==1.1.5
 httpx>=0.28.0
 aiosqlite>=0.20.0
 python-dotenv>=1.0.0

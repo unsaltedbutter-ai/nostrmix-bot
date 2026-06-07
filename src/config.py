@@ -74,9 +74,11 @@ _DEFAULTS = {
     # address are sent here (the participant is warned and can re-send
     # /addresses to reclaim). Blank disables it — then above-dust leftovers
     # also fold into the miner fee.
-    # PRIVACY NOTE: a fixed operator address recurring across coinjoins is a
-    # stable on-chain fingerprint that links those mixes. Prefer leaving this
-    # blank (fold-to-fee) for a privacy-maximising deployment.
+    # PRIVACY NOTE: this is a poor-privacy feature — a fixed operator address
+    # recurring across coinjoins is a stable on-chain fingerprint that links
+    # those mixes. RECOMMENDED: leave this BLANK (above-dust leftovers then fold
+    # into the miner fee, which is the most private option). Only set it if you
+    # explicitly accept that privacy cost in exchange for keeping those sats.
     "DONATION_ADDRESS": "",
 
     "BROADCAST_CHECK_INTERVAL_HOURS": 24,
