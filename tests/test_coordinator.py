@@ -3378,3 +3378,180 @@ class TestConformingModelGaps:
             assert (await db.get_mix(mix_id))["state"] == "cancelled"
         finally:
             await db.close()
+
+
+# --- Lower-priority gap closers (#8 zero-fee lifecycle, #9 zap-then-proceed,
+#     #10 solo-NC privacy floor) ---
+
+
+class TestLowerPriorityGaps:
+    async def _interested(self, db, mix_id, npub):
+        return await db.add_participant(mix_id, npub, f"{npub}@x")
+
+    async def _commit(self, coord, chain, npub, utxos, spk=FAKE_SCRIPTPUBKEY):
+        for (txid, vout, amt) in utxos:
+            chain.txouts[f"{txid}:{vout}"] = {
+                "value": amt, "scriptpubkey": spk,
+                "scriptpubkey_type": "p2wpkh", "address": "", "status": True,
+            }
+        await coord._cmd_commit_utxos(
+            FakeCtx(npub), npub,
+            [{"txid": t, "vout": v} for (t, v, _a) in utxos],
+        )
+
+    # ---- #8a: full FEE_PER_ELEMENT=0 lifecycle commit -> broadcast ----
+
+    @pytest.mark.asyncio
+    async def test_zero_fee_full_lifecycle_to_broadcast(self):
+        from bitcointx.core import b2x
+        from bitcointx.core.key import CKey, KeyStore
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+
+        coord, db, nostr, chain, lightning = await make_coord()  # FEE_PER_ELEMENT=0
+        try:
+            k_a, k_b = CKey(b"\x41" * 32), CKey(b"\x42" * 32)
+            spk_a = P2WPKHBitcoinAddress.from_pubkey(k_a.pub).to_scriptPubKey().hex()
+            spk_b = P2WPKHBitcoinAddress.from_pubkey(k_b.pub).to_scriptPubKey().hex()
+            txid_a, txid_b = "a1" * 32, "b2" * 32
+
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="collecting")
+
+            # Two non-conforming participants join entirely through the DM flow.
+            await self._interested(db, mix_id, "lcA")
+            await self._commit(coord, chain, "lcA", [(txid_a, 0, 250_000)], spk=spk_a)
+            await coord._cmd_provide_addresses(FakeCtx("lcA"), "lcA", P2WPKH_ADDRS[0:3])
+            await self._interested(db, mix_id, "lcB")
+            await self._commit(coord, chain, "lcB", [(txid_b, 0, 250_000)], spk=spk_b)
+            await coord._cmd_provide_addresses(FakeCtx("lcB"), "lcB", P2WPKH_ADDRS[3:6])
+
+            # No zap was ever requested.
+            assert not any("zap" in m.lower() for _r, m in nostr.sent_dms)
+            for npub in ("lcA", "lcB"):
+                ps = await db.get_participants_by_npub(npub)
+                assert ps[0]["state"] == "paid"
+
+            # collecting -> assembling -> signing
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+
+            # Each participant signs the skeleton and returns it via /psbt_accept.
+            for npub, k in (("lcA", k_a), ("lcB", k_b)):
+                p = (await db.get_participants_by_npub(npub))[0]
+                rd = await db.get_psbt_round(mix_id, p["id"], 1)
+                psbt = PartiallySignedBitcoinTransaction.from_binary(
+                    bytes.fromhex(rd["psbt_sent"]))
+                psbt.sign(KeyStore.from_iterable([k]))
+                await coord._cmd_accept_psbt(FakeCtx(npub), npub, b2x(psbt.serialize()))
+
+            # signing tick -> combine + broadcast
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "broadcast"
+            assert mix_after["broadcast_txid"] == "fake_broadcast_txid"
+            assert chain.broadcast_calls, "broadcast should have been attempted"
+            # Zero-fee mix: nothing was ever paid, so nothing is refunded.
+            assert lightning.refunds == []
+        finally:
+            await db.close()
+
+    # ---- #8b: cancelling a fee=0 mix refunds nobody ----
+
+    @pytest.mark.asyncio
+    async def test_zero_fee_cancel_refunds_nobody(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            pid = await db.add_participant(mix_id, "zc", "zc@x")
+            await db.add_utxo(pid, TXID[0], 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(pid, P2WPKH_ADDRS[0], 1_000_000)
+            await db.update_participant(pid, state="paid", fee_paid=0)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test cancel")
+
+            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+            assert lightning.refunds == [], "fee=0 mix has nothing to refund"
+            assert (await db.get_participant(pid))["state"] == "cancelled"
+        finally:
+            await db.close()
+
+    # ---- #9: fee>0 — zap arrives, THEN the mix proceeds ----
+
+    @pytest.mark.asyncio
+    async def test_zap_path_then_proceed(self):
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=100,
+            )
+            await db.update_mix(mix_id, state="collecting")
+
+            for npub, (txid, vout) in (("zpA", (TXID[0], 0)), ("zpB", (TXID[1], 0))):
+                await self._interested(db, mix_id, npub)
+                await self._commit(coord, chain, npub, [(txid, vout, 250_000)])
+                await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+                # Fee > 0 -> stays committed, zap requested.
+                assert (await db.get_participants_by_npub(npub))[0]["state"] == "committed"
+
+            # Before any zap, the mix must NOT proceed (no paid participants).
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "collecting"
+
+            # Zaps arrive (generous amount, comfortably over the expected fee).
+            for npub in ("zpA", "zpB"):
+                class Zap:
+                    sender_hex = npub
+                    amount_sats = 100_000
+                await coord._on_zap(Zap(), FakeCtx(npub))
+                assert (await db.get_participants_by_npub(npub))[0]["state"] == "paid"
+
+            # Now the collecting tick sees the target met and advances.
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "assembling"
+        finally:
+            await db.close()
+
+    # ---- #10: solo-NC assembled PSBT passes the privacy floor of 1 ----
+
+    @pytest.mark.asyncio
+    async def test_solo_nc_assembled_psbt_passes_privacy_floor(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=1, required_nonconforming=1,
+                max_conforming_utxos=5, fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # One non-conforming participant (-> 2 equal + change).
+            nc = await self._interested(db, mix_id, "soloNC2")
+            await self._commit(coord, chain, "soloNC2", [(TXID[0], 0, 250_000)])
+            await coord._cmd_provide_addresses(FakeCtx("soloNC2"), "soloNC2", P2WPKH_ADDRS[0:3])
+            # One conforming participant (-> 1 equal pass-through).
+            await self._interested(db, mix_id, "soloConf")
+            await self._commit(coord, chain, "soloConf", [(TXID[1], 0, 100_000)])
+            await coord._cmd_provide_addresses(FakeCtx("soloConf"), "soloConf", [P2WPKH_ADDRS[5]])
+
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))  # -> assembling
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))  # -> signing
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+
+            # The assembled skeleton must clear the privacy floor of 1
+            # (>=2 equal output_size outputs exist from distinct parties).
+            rd = await db.get_psbt_round(mix_id, nc, 1)
+            ok, msg = coord.privacy.check_psbt(rd["psbt_sent"], 1)
+            assert ok is True, msg
+        finally:
+            await db.close()

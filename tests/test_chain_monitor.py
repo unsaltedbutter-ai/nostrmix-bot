@@ -3,10 +3,12 @@
 Includes offline unit tests for the script-type normalizer and live
 integration tests that hit mempool.space using well-known Satoshi-era
 UTXOs. The live tests will fail if mempool.space is unreachable, or
-(less likely) if those famous coins ever move. To skip the live tests
-locally:
+(less likely) if those famous coins ever move.
 
-    pytest tests/test_chain_monitor.py -k 'not satoshi and not hal_finney'
+Every network-hitting test is marked `@pytest.mark.live`. For a fully
+hermetic offline run (CI, no internet), exclude them:
+
+    pytest -m 'not live'
 """
 
 import os
@@ -94,11 +96,13 @@ class TestNormalizeScriptType:
         assert _normalize_script_type("") == "p2wpkh"
 
 
+@pytest.mark.live
 class TestLiveMempoolSpace:
     """Live tests against https://mempool.space/api.
 
     These will break if mempool.space is unreachable or if Satoshi ever
-    spends his block-1 coins. We accept that risk.
+    spends his block-1 coins. We accept that risk. Marked `live` so they can
+    be excluded with `pytest -m 'not live'`.
     """
 
     @pytest.mark.asyncio
@@ -336,6 +340,7 @@ VSIZE_FIXTURES = [
 ]
 
 
+@pytest.mark.live
 class TestVsizeAccuracy:
     """Regression guard against future re-introduction of vsize typos.
 
