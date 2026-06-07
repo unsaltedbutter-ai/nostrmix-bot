@@ -42,8 +42,9 @@ falls back to the default in the tables below.
 ## Prerequisites
 
 - Python 3.12+
-- `libsecp256k1` (system library — see Install; required by the test suite's real
-  ECDSA signing)
+- `libsecp256k1` (system library — see Install). **Required at runtime**: the bot
+  cryptographically verifies each participant's returned signature, which is an EC
+  operation. (Also used by the test suite's real ECDSA signing.)
 - A Nostr secret key (nsec) for the bot
 - A zap-provider Nostr pubkey, **only if** you charge a service fee
 - BTCPay Server, **only if** you charge a service fee (to send refunds)
@@ -51,7 +52,7 @@ falls back to the default in the tables below.
 ## Install
 
 ```bash
-# 1. System dep — libsecp256k1.
+# 1. System dep — libsecp256k1 (required at runtime for signature verification).
 brew install secp256k1                  # macOS
 # or: sudo apt install libsecp256k1-dev # debian/ubuntu
 

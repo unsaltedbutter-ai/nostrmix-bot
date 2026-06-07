@@ -136,6 +136,40 @@ async def _check_relays(cfg: BotConfig) -> list[str]:
     return []
 
 
+def _check_ec() -> list[str]:
+    """The bot verifies participant signatures at runtime (validate_returned),
+    which needs libsecp256k1 to load. Sign + verify a throwaway PSBT to prove EC
+    works on this host before launch."""
+    print("\n== signature verification (libsecp256k1) ==")
+    try:
+        import src.psbt_manager as pm  # applies the secp256k1 shim on import
+        from bitcointx.core import b2x
+        from bitcointx.core.key import CKey, KeyStore
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+
+        mgr = pm.PSBTManager()
+        k = CKey(b"\x01" + b"\x55" * 31)
+        inp = [{"txid": "11" * 32, "vout": 0, "amount": 200_000,
+                "script_type": "p2wpkh",
+                "scriptpubkey": P2WPKHBitcoinAddress.from_pubkey(k.pub).to_scriptPubKey().hex()}]
+        out = [{"address": "bc1q4gyakdgygyc8qweh39qxamywc9vdvrt82jsrcj", "amount": 150_000}]
+        skel = mgr.build_skeleton(inp, out)
+        p = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel))
+        p.sign(KeyStore.from_iterable([k]))
+        ok, _why = mgr.validate_returned(
+            skel, b2x(p.serialize()), participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        if ok:
+            print("  libsecp256k1: OK (signed + verified a test PSBT)")
+            return []
+        return ["signature verification returned False on a valid test signature — EC misconfigured?"]
+    except Exception as e:
+        print(f"  libsecp256k1: FAILED ({type(e).__name__})")
+        return [f"libsecp256k1 EC unavailable ({type(e).__name__}) — the bot cannot "
+                f"verify participant signatures. Install libsecp256k1 (brew install secp256k1)."]
+
+
 async def main() -> int:
     env_path = sys.argv[1] if len(sys.argv) > 1 else BotConfig.find_env_path()
     try:
@@ -145,6 +179,7 @@ async def main() -> int:
         return 2
 
     problems = _check_config(cfg)
+    problems += _check_ec()
     problems += await _check_mempool(cfg)
     problems += await _check_relays(cfg)
 

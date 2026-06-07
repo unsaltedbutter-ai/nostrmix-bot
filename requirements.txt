@@ -1,14 +1,14 @@
 # SYSTEM DEPENDENCY (not pip-installable): libsecp256k1
 #   macOS:    brew install secp256k1
 #   debian:   apt install libsecp256k1-dev
-# Required by the test suite (real ECDSA-signed PSBTs round-tripped through
-# combine + finalize). The bot's runtime does NOT need it — participants
-# sign in their own wallets — but pytest will hard-fail without it.
+# REQUIRED AT RUNTIME: the bot cryptographically verifies each participant's
+# returned signature (PSBTManager.validate_returned), which is an EC operation.
+# Also required by the test suite. preflight.py self-checks it before launch.
 #
-# python-bitcointx 1.1.5 still calls the secp256k1_ec_privkey_* names that
-# were renamed in libsecp256k1 0.6+. conftest.py at the project root
-# bridges this; if/when bitcointx ships a release with the renamed names,
-# the conftest.py shim can be deleted.
+# python-bitcointx 1.1.5 still binds the secp256k1_ec_privkey_* names that were
+# renamed in libsecp256k1 0.6+; src/secp256k1_compat.py bridges this at runtime
+# (conftest.py imports the same shim for tests). Delete that module if/when
+# bitcointx ships a release with the renamed names.
 
 nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.4.0
 # Pinned: the conftest.py libsecp256k1 symbol-rename shim is written against

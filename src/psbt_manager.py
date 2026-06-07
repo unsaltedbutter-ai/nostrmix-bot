@@ -15,8 +15,16 @@ CRITICAL ARCHITECTURE NOTES:
 
 from __future__ import annotations
 
+import logging
 from typing import List, Dict, Optional, Tuple, Any
 from collections import Counter
+
+# validate_returned cryptographically verifies returned signatures, which is an
+# EC operation — ensure the libsecp256k1 symbol-rename shim is applied before
+# any verify() call loads the library.
+from . import secp256k1_compat  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 from bitcointx.core import (
     b2x, CTxIn, CTxOut, COutPoint, CTransaction,
@@ -280,10 +288,90 @@ class PSBTManager:
                     if i not in expected and added:
                         return False, f"Input #{i} (not yours) was signed — refusing"
 
+            # Cryptographic verification: a PRESENT signature is not enough — a
+            # troll can return a well-formed-but-wrong (or garbage) signature
+            # that passes the presence/scope checks above, sails through
+            # finalize(), and is only caught when the network rejects the
+            # broadcast (wasting the whole signing round). Verify each
+            # newly-signed input actually signs THIS input's BIP143 sighash with
+            # a key that owns the input. p2wpkh only (the allowlist); other
+            # types fall back to the presence checks. We verify against the
+            # SKELETON's tx + witness UTXO (trusted) — never the returned
+            # PSBT's, which could be tampered.
+            for i, (skel_in, ret_in) in enumerate(
+                    zip(skeleton_psbt.inputs, returned_psbt.inputs)):
+                if not _has_new_signature(skel_in, ret_in):
+                    continue
+                utxo = getattr(skel_in, "utxo", None)
+                if utxo is None:
+                    return False, f"Input #{i}: skeleton has no witness UTXO to verify against"
+                spk = bytes(utxo.scriptPubKey)
+                is_p2wpkh = len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14
+                if not is_p2wpkh:
+                    continue  # non-p2wpkh: presence-checked only
+                extracted = self._extract_signature(ret_in)
+                if extracted is None:
+                    return False, f"Input #{i}: could not read signature for verification"
+                pub_bytes, sig = extracted
+                good, why = self._verify_p2wpkh_signature(skel_tx, i, utxo, pub_bytes, sig)
+                if not good:
+                    return False, f"Input #{i} signature invalid ({why})"
+
             return True, "valid"
 
         except Exception as e:
             return False, f"Validation error: {str(e)}"
+
+    @staticmethod
+    def _extract_signature(psbt_input) -> Optional[Tuple[bytes, bytes]]:
+        """Recover (pubkey_bytes, sig_with_hashtype) from a participant's signed
+        PSBT input — whether the signature is still a partial_sig or the input
+        was auto-finalized into a p2wpkh witness ([sig, pubkey]). None if no
+        recoverable signature is present."""
+        if psbt_input.partial_sigs:
+            pub, sig = next(iter(psbt_input.partial_sigs.items()))
+            return bytes(pub), bytes(sig)
+        fsw = getattr(psbt_input, "final_script_witness", None)
+        if fsw:
+            stack = [bytes(x) for x in (fsw.stack if hasattr(fsw, "stack") else fsw)]
+            if len(stack) == 2:  # p2wpkh witness = [signature, pubkey]
+                return stack[1], stack[0]
+        return None
+
+    @staticmethod
+    def _verify_p2wpkh_signature(tx, i: int, utxo, pub_bytes: bytes,
+                                 sig: bytes) -> Tuple[bool, str]:
+        """Verify a p2wpkh signature over input i's BIP143 sighash.
+
+        Checks (in order): the pubkey hashes to the input's witness program;
+        the sig's hashtype byte is SIGHASH_ALL; the ECDSA signature verifies
+        against the sighash. Returns (ok, reason)."""
+        from bitcointx.core import Hash160
+        from bitcointx.core.key import CPubKey
+        from bitcointx.core.script import (
+            CScript, SignatureHash, SIGHASH_ALL, SIGVERSION_WITNESS_V0,
+            OP_DUP, OP_HASH160, OP_EQUALVERIFY, OP_CHECKSIG,
+        )
+        if not sig:
+            return False, "empty signature"
+        spk = bytes(utxo.scriptPubKey)
+        keyhash = spk[2:22]
+        if Hash160(pub_bytes) != keyhash:
+            return False, "pubkey does not own the input"
+        if sig[-1] != SIGHASH_ALL:
+            return False, f"hashtype 0x{sig[-1]:02x} != SIGHASH_ALL"
+        try:
+            pub = CPubKey(pub_bytes)
+            script_code = CScript(
+                [OP_DUP, OP_HASH160, keyhash, OP_EQUALVERIFY, OP_CHECKSIG])
+            sighash = SignatureHash(
+                script_code, tx, i, SIGHASH_ALL,
+                amount=utxo.nValue, sigversion=SIGVERSION_WITNESS_V0)
+            if not pub.verify(sighash, sig[:-1]):
+                return False, "ECDSA verification failed"
+        except Exception as e:
+            return False, f"verify error: {type(e).__name__}"
+        return True, "ok"
 
     # --- Combine PSBTs ---
 

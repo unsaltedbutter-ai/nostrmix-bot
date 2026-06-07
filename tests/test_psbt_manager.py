@@ -544,3 +544,76 @@ class TestPSBTManager:
             skel, returned, participant_input_count=0, expected_output_addresses=[])
         assert not ok, "must reject a removed input"
         assert "input count changed" in reason.lower(), reason
+
+    # --- Adversarial: signature VALIDITY (not just presence) ----------------
+    #
+    # validate_returned cryptographically verifies each newly-signed input, so a
+    # signature that is merely *present* but wrong/garbage is rejected at
+    # submission — not left to fail at broadcast.
+
+    def _return_with_partial_sig(self, skel_hex, idx, pubkey, sig_bytes):
+        from bitcointx.core import b2x
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        p = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel_hex))
+        p.inputs[idx].partial_sigs[pubkey] = sig_bytes
+        return b2x(p.serialize())
+
+    def test_validate_rejects_wrong_but_wellformed_signature(self):
+        """The headline troll: a structurally-valid DER signature over the WRONG
+        message, under the input owner's real pubkey. Presence checks pass; the
+        cryptographic check must reject it."""
+        from bitcointx.core.script import SIGHASH_ALL
+        skel, keys = self._multi_input_skeleton(n=2)
+        wrong = keys[0].sign(b"\x11" * 32) + bytes([SIGHASH_ALL])
+        returned = self._return_with_partial_sig(skel, 0, keys[0].pub, wrong)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        assert not ok, "must reject a wrong-but-wellformed signature"
+        assert "signature invalid" in reason.lower(), reason
+
+    def test_validate_rejects_garbage_signature_bytes(self):
+        """Pure garbage bytes as the signature are rejected."""
+        skel, keys = self._multi_input_skeleton(n=2)
+        returned = self._return_with_partial_sig(skel, 0, keys[0].pub, b"\xde\xad\xbe\xef")
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        assert not ok, "must reject garbage signature bytes"
+        assert "signature invalid" in reason.lower(), reason
+
+    def test_wrong_pubkey_partial_sig_is_structurally_impossible(self):
+        """A partial_sig placed under a pubkey that doesn't hash to a p2wpkh
+        input's keyhash is rejected by bitcointx itself (at serialize/parse), so
+        the attack can't even be encoded as a valid PSBT — belt to our own
+        'pubkey does not own the input' check."""
+        import pytest
+        from bitcointx.core.script import SIGHASH_ALL
+        skel, keys = self._multi_input_skeleton(n=2)
+        sig = keys[1].sign(b"\x11" * 32) + bytes([SIGHASH_ALL])
+        with pytest.raises(Exception):
+            # key1's pubkey on input 0 (owned by key0) — serialize must refuse.
+            self._return_with_partial_sig(skel, 0, keys[1].pub, sig)
+
+    def test_validate_rejects_non_sighash_all_flag(self):
+        """A signature with a permissive sighash flag (e.g. SIGHASH_NONE, which
+        wouldn't commit to the outputs) is rejected."""
+        SIGHASH_NONE = 0x02
+        skel, keys = self._multi_input_skeleton(n=2)
+        sig = keys[0].sign(b"\x11" * 32) + bytes([SIGHASH_NONE])
+        returned = self._return_with_partial_sig(skel, 0, keys[0].pub, sig)
+        ok, reason = self.mgr.validate_returned(
+            skel, returned, participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        assert not ok, "must reject a non-SIGHASH_ALL signature"
+        assert "signature invalid" in reason.lower(), reason
+
+    def test_validate_still_accepts_a_correct_signature(self):
+        """Positive control: a genuinely correct signature on the participant's
+        own input still passes the new cryptographic check."""
+        skel, keys = self._multi_input_skeleton(n=2)
+        signed = self._sign_with(skel, [0], keys)
+        ok, reason = self.mgr.validate_returned(
+            skel, signed, participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        assert ok, f"a correct signature must still validate: {reason}"
