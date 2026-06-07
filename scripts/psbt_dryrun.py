@@ -91,8 +91,33 @@ class _StubLightning:
         return "dryrun-refund"
 
 
+class _Ctx:
+    def __init__(self, sender_hex):
+        self.sender_hex = sender_hex
+
+
 def _btc(sats: int) -> str:
     return f"{sats/1e8:.8f} BTC ({sats} sats)"
+
+
+def _print_messages(nostr, lightning):
+    print("\n== bot messages (not sent) ==")
+    for who, msg in nostr.dms:
+        first = msg.splitlines()[0] if msg else ""
+        if first.startswith("/psbt_accept") or first.startswith("/psbt_chunk"):
+            first = first[:48] + " …(PSBT hex omitted)"
+        print(f"  -> {who}: {first}")
+    if lightning.refunds:
+        print("\n== refunds that would be attempted ==")
+        for lud16, sats, reason in lightning.refunds:
+            print(f"  -> {lud16}: {sats} sats ({reason})")
+
+
+def _rm(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 async def run(spec: dict, env_path: str) -> int:
@@ -145,17 +170,23 @@ async def run(spec: dict, env_path: str) -> int:
         output_size=output_size, fee_per_element=fee_per_element,
         required_nonconforming=required, max_conforming_utxos=max_conf,
     )
-    await db.update_mix(mix_id, state="assembling",
+    await db.update_mix(mix_id, state="collecting",
                         fee_rate=int(fee_rate) if fee_rate else 30,
                         input_type="p2wpkh", output_type="p2wpkh")
 
     sum_in = 0
+    present_conforming = 0
     print("== mix ==")
     print(f"  output_size={output_size}  required_nonconforming={required}  "
           f"max_conforming_utxos={max_conf}  fee_per_element={fee_per_element}  "
           f"fee_rate={'LIVE' if fee_rate is None else fee_rate}")
+
+    # Intake through the REAL /addresses handler so the address-count rule and
+    # the donation/loss warning fire exactly as in production.
+    print("\n== intake (/addresses, the real handler) ==")
     for p in spec["participants"]:
-        pid = await db.add_participant(mix_id, p["name"], p.get("lud16", ""))
+        name = p["name"]
+        pid = await db.add_participant(mix_id, name, p.get("lud16", ""))
         p_in = 0
         for u in p["utxos"]:
             if isinstance(u, str):
@@ -164,85 +195,103 @@ async def run(spec: dict, env_path: str) -> int:
                 txout = await chain.lookup_txout(txid, vout)
                 if not txout:
                     print(f"  ERROR: UTXO {u} not found on chain")
-                    await chain.close()
-                    await db.close()
+                    await chain.close(); await db.close(); _rm(db_path)
                     return 2
-                amt = int(txout["value"])
-                st = txout["scriptpubkey_type"]
-                spk = txout["scriptpubkey"]
+                amt = int(txout["value"]); st = txout["scriptpubkey_type"]; spk = txout["scriptpubkey"]
             else:
-                amt = int(u["amount"])
-                st = u.get("script_type", "p2wpkh")
-                txid = u.get("txid", os.urandom(32).hex())
-                vout = int(u.get("vout", 0))
+                amt = int(u["amount"]); st = u.get("script_type", "p2wpkh")
+                txid = u.get("txid", os.urandom(32).hex()); vout = int(u.get("vout", 0))
                 spk = u.get("scriptpubkey", "0014" + "00" * 20)
             await db.add_utxo(pid, txid, vout, amt, st, spk)
             p_in += amt
             sum_in += amt
-        for addr in p["addresses"]:
-            await db.add_output(pid, addr, output_size)  # amount placeholder; assembly recomputes
-        await db.update_participant(pid, state="paid")
-        kind = "non-conforming" if any(
-            (u["amount"] if isinstance(u, dict) else None) != output_size for u in p["utxos"]
-        ) else "conforming"
-        print(f"  participant {p['name']:<10} inputs={_btc(p_in)}  addrs={len(p['addresses'])}")
+            if amt == output_size:
+                present_conforming += 1
+        await db.update_participant(pid, state="committed")
+        before = len(nostr.dms)
+        await coord._cmd_provide_addresses(_Ctx(name), name, p["addresses"])
+        state = (await db.get_participant(pid))["state"]
+        new = [m for _r, m in nostr.dms[before:]]
+        verdict = ("PAID/ready" if state == "paid"
+                   else "committed (awaiting zap)" if (state == "committed" and fee_per_element > 0)
+                   else "REJECTED")
+        note = ""
+        for m in new:
+            low = m.lower()
+            line0 = m.splitlines()[0]
+            if "at least" in low and "address" in low:
+                note = "  <-- TOO FEW ADDRESSES: " + line0
+            elif "donated" in low:
+                hit = next((ln for ln in m.splitlines() if "donat" in ln.lower()), line0)
+                note = "  <-- LOSS: " + hit.strip()
+            elif "below one" in low:
+                note = "  <-- INPUTS TOO SMALL: " + line0
+        print(f"  {name:<10} inputs={_btc(p_in)} addrs={len(p['addresses'])} -> {verdict}{note}")
 
-    active = await db.get_participants_by_mix(mix_id)
-    await coord._assemble_psbt(await db.get_mix(mix_id), active)
+    paid = [p for p in await db.get_participants_by_mix(mix_id) if p["state"] == "paid"]
+    proceed, nc_count, _conf = await coord._classify_ready(await db.get_mix(mix_id), paid)
+    print("\n== readiness ==")
+    print(f"  paid participants={len(paid)}  non-conforming={nc_count}  "
+          f"conforming UTXOs present={present_conforming}")
+    if not proceed:
+        print(f"  mix would NOT advance yet — needs {required} non-conforming participant(s)"
+              + ("" if required >= 2 else " plus >=1 conforming UTXO") + ".")
+        _print_messages(nostr, lightning)
+        await chain.close(); await db.close(); _rm(db_path)
+        return 1
 
-    mix_after = await db.get_mix(mix_id)
-    state = mix_after["state"]
+    await db.update_mix(mix_id, state="assembling")
+    await coord._assemble_psbt(await db.get_mix(mix_id), paid)
+    state = (await db.get_mix(mix_id))["state"]
     print("\n== result ==")
     print(f"  mix state: {state}  ({'WOULD BROADCAST' if state == 'signing' else 'WOULD NOT proceed'})")
 
-    # Per-participant accounting.
-    print("\n== per participant ==")
+    print("\n== per participant ==  (change = computed leftover; if intake flagged"
+          " LOSS it was donated/folded, NOT received)")
     for p in await db.get_participants_by_mix(mix_id):
         print(f"  {p['npub_hex']:<10} state={p['state']:<12} "
               f"fee_share={p['fee_share']}  change={p['change_amount']}")
 
-    # The assembled PSBT (same skeleton stored for every participant in the round).
     rounds = await db.get_psbt_rounds_by_mix(mix_id)
     psbt_hex = next((r["psbt_sent"] for r in rounds if r.get("psbt_sent")), None)
     if psbt_hex:
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
         psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(psbt_hex))
+        vins = psbt.unsigned_tx.vin
         vouts = psbt.unsigned_tx.vout
         sum_out = sum(o.nValue for o in vouts)
         miner_fee = sum_in - sum_out
         eq = sum(1 for o in vouts if o.nValue == output_size)
-        vsize_est = fee_engine.estimate_total_vsize(
-            {"p2wpkh": len(psbt.unsigned_tx.vin)}, {"p2wpkh": len(vouts)})
+        actual_vsize = fee_engine.estimate_total_vsize(
+            {"p2wpkh": len(vins)}, {"p2wpkh": len(vouts)})
+        eff = miner_fee / max(actual_vsize, 1)
+        target = float(fee_rate) if fee_rate is not None else await chain.estimate_fee_rate()
+        expected = int(target * actual_vsize)
+        excess = miner_fee - expected
+        conf_unit = fee_engine.input_vsize("p2wpkh") + fee_engine.output_vsize("p2wpkh")
+        unfilled = max(0, max_conf - present_conforming)
+        conf_overpay = int(unfilled * conf_unit * target)
         print("\n== transaction ==")
-        print(f"  inputs : {len(psbt.unsigned_tx.vin)}  total {_btc(sum_in)}")
+        print(f"  inputs : {len(vins)}  total {_btc(sum_in)}")
         print(f"  outputs: {len(vouts)} ({eq} equal @ {output_size} sats)  total {_btc(sum_out)}")
-        print(f"  miner fee: {_btc(miner_fee)}  (~{miner_fee / max(vsize_est,1):.1f} sat/vB over ~{vsize_est} vB)")
+        print(f"  miner fee: {_btc(miner_fee)}  (~{eff:.1f} sat/vB effective over ~{actual_vsize} vB actual tx)")
+        if excess > 0:
+            print(f"  WHY > TARGET: at the ~{target:.1f} sat/vB target this {actual_vsize}-vB tx "
+                  f"would pay ~{expected} sats; the extra ~{excess} sats come from:")
+            print(f"     - unfilled conforming slots: assumed {max_conf}, {present_conforming} "
+                  f"present -> ~{conf_overpay} sats (lower MAX_CONFORMING_UTXOS to reduce)")
+            print(f"     - any above-dust change folded into the fee for participants who gave "
+                  f"no change address and no DONATION_ADDRESS is set (see LOSS lines above)")
         floor = max(2, required)
         ok, msg = coord.privacy.check_psbt(psbt_hex, floor)
         print(f"  privacy check (floor {floor}): {'PASS' if ok else 'FAIL'} — {msg}")
         print("\n== unsigned PSBT (import into a wallet to inspect; do NOT broadcast) ==")
         print(psbt_hex)
     else:
-        print("\n  (no PSBT assembled — see the messages below for why)")
+        print("\n  (no PSBT assembled — see messages below)")
 
-    # Messages the bot would have DM'd participants (drops, donations, prompts).
-    print("\n== bot messages (not sent) ==")
-    for who, msg in nostr.dms:
-        first = msg.splitlines()[0] if msg else ""
-        if first.startswith("/psbt_accept") or first.startswith("/psbt_chunk"):
-            first = first[:48] + " …(PSBT hex omitted)"
-        print(f"  -> {who}: {first}")
-    if lightning.refunds:
-        print("\n== refunds that would be attempted ==")
-        for lud16, sats, reason in lightning.refunds:
-            print(f"  -> {lud16}: {sats} sats ({reason})")
-
-    await chain.close()
-    await db.close()
-    try:
-        os.unlink(db_path)
-    except OSError:
-        pass
+    _print_messages(nostr, lightning)
+    await chain.close(); await db.close(); _rm(db_path)
     return 0 if state == "signing" else 1
 
 

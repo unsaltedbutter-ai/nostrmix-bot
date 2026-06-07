@@ -617,3 +617,34 @@ class TestPSBTManager:
             skel, signed, participant_input_count=1,
             expected_output_addresses=[], participant_input_indices=[0])
         assert ok, f"a correct signature must still validate: {reason}"
+
+    def test_validate_rejects_valid_sig_for_a_different_input(self):
+        """A cryptographically VALID signature, but for a different input
+        (different outpoint/amount/index -> different BIP143 sighash), placed on
+        the wrong input slot, must be rejected. One key owns both inputs so the
+        signature can even be placed there (bitcointx's pubkey-keyhash check
+        doesn't block it); our per-input sighash verification is what catches
+        it."""
+        from bitcointx.core import b2x
+        from bitcointx.core.key import CKey, KeyStore
+        from bitcointx.wallet import P2WPKHBitcoinAddress
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        k = CKey(b"\x07" + b"\x55" * 31)
+        spk = P2WPKHBitcoinAddress.from_pubkey(k.pub).to_scriptPubKey().hex()
+        inputs = [
+            {"txid": "aa" * 32, "vout": 0, "amount": 200_000, "script_type": "p2wpkh", "scriptpubkey": spk},
+            {"txid": "bb" * 32, "vout": 1, "amount": 300_000, "script_type": "p2wpkh", "scriptpubkey": spk},
+        ]
+        outputs = [{"address": "bc1q4gyakdgygyc8qweh39qxamywc9vdvrt82jsrcj", "amount": 100_000},
+                   {"address": "bc1q670lslr8tlv9w5kk4zw7ckha74ll6lx48tnsks", "amount": 100_000}]
+        skel = self.mgr.build_skeleton(inputs, outputs)
+        signed = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel))
+        signed.sign(KeyStore.from_iterable([k]))
+        sig_for_input1 = self.mgr._extract_signature(signed.inputs[1])[1]
+        forged = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(skel))
+        forged.inputs[0].partial_sigs[k.pub] = sig_for_input1  # input 1's sig on slot 0
+        ok, reason = self.mgr.validate_returned(
+            skel, b2x(forged.serialize()), participant_input_count=1,
+            expected_output_addresses=[], participant_input_indices=[0])
+        assert not ok, "must reject a valid signature applied to the wrong input"
+        assert "signature invalid" in reason.lower(), reason

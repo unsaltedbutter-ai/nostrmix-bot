@@ -514,6 +514,10 @@ Every committed UTXO is auto-classified against the mix's `output_size` (the use
 
 **Privacy floor.** The non-authoritative privacy check requires at least `max(2, required_nonconforming)` equal `output_size` outputs from at least 2 inputs (NC + conforming combined). The `max(2, …)` keeps the solo (`required_nonconforming == 1`) case honest. See §8 — this is the whole bar; stronger anonymity is achieved by re-mixing in later rounds, not by subset-sum analysis.
 
+**Input/output ordering.** At assembly the transaction's inputs and outputs are ordered deterministically (alphabetically — inputs by `txid:vout`, outputs by address) so a participant's inputs and outputs are not grouped together by position. An observer can't read mix membership off the transaction's ordering. Each participant's signing indices are re-derived against the final sorted order before the skeleton is sent.
+
+**Signature verification.** When a participant returns a signed PSBT, the bot cryptographically verifies each of their signatures (p2wpkh: pubkey owns the input, hashtype is SIGHASH_ALL, ECDSA verifies against the input's BIP143 sighash) against the trusted skeleton — not just that a signature is present. A bogus/trolling or wrong-input signature is rejected at submission rather than wasting the whole signing round at broadcast.
+
 ---
 
 ## 4. Key Edge Cases

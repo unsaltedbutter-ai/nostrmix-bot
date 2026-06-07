@@ -1244,7 +1244,10 @@ class Coordinator:
                     "amount": u["amount"],
                     "script_type": u.get("script_type", "p2wpkh"),
                     "scriptpubkey": u.get("scriptpubkey", ""),
+                    "pid": pid,  # used to re-derive input_indices after sorting
                 })
+            # Provisional indices (pre-sort). _assemble_psbt re-derives these
+            # against the final sorted input order before sending the skeleton.
             input_indices_by_pid[pid] = list(range(start_idx, start_idx + len(utxos)))
 
             # Classify: conforming (== output_size) vs non-conforming.
@@ -1598,6 +1601,18 @@ class Coordinator:
                 mix, "fee math produced an undercollecting tx",
             )
             return
+
+        # Privacy: order inputs and outputs deterministically (alphabetically by
+        # outpoint / address) so a participant's inputs and outputs aren't
+        # grouped together by position on-chain — an observer can't read mix
+        # membership off the transaction's ordering. Done AFTER the fee math so
+        # amounts are final, and we re-derive each participant's signing indices
+        # against the sorted input order (the skeleton everyone signs).
+        all_inputs.sort(key=lambda x: (x["txid"], x["vout"]))
+        all_outputs.sort(key=lambda o: (o["address"], o["amount"]))
+        input_indices_by_pid = {}
+        for idx, inp in enumerate(all_inputs):
+            input_indices_by_pid.setdefault(inp["pid"], []).append(idx)
 
         # Build the PSBT
         psbt_hex = self.psbt_mgr.build_skeleton(all_inputs, all_outputs)

@@ -3846,3 +3846,54 @@ class TestReviewGaps:
             await coord._cleanup_interested(mix_id)
         finally:
             await db.close()
+
+
+class TestInputOutputOrdering:
+    """Privacy: assembled inputs/outputs are ordered alphabetically so a
+    participant's inputs aren't grouped together by position on-chain."""
+
+    @pytest.mark.asyncio
+    async def test_inputs_sorted_and_participants_degrouped(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, required_nonconforming=2, max_conforming_utxos=0)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30,
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # A's outpoints (11, 33) interleave with B's (22, 44) once sorted.
+            a = await db.add_participant(mix_id, "ord_a", "a@x")
+            await db.add_utxo(a, "11" * 32, 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(a, "33" * 32, 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:4]:
+                await db.add_output(a, addr, 1_000_000)
+            await db.update_participant(a, state="paid")
+
+            b = await db.add_participant(mix_id, "ord_b", "b@x")
+            await db.add_utxo(b, "22" * 32, 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(b, "44" * 32, 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[4:8]:
+                await db.add_output(b, addr, 1_000_000)
+            await db.update_participant(b, state="paid")
+
+            await coord._assemble_psbt(await db.get_mix(mix_id),
+                                       await db.get_participants_by_mix(mix_id))
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+
+            import json as _json
+            ra = await db.get_psbt_round(mix_id, a, 1)
+            rb = await db.get_psbt_round(mix_id, b, 1)
+            a_idx = _json.loads(ra["input_indices"])
+            b_idx = _json.loads(rb["input_indices"])
+            # Sorted order is 11(A),22(B),33(A),44(B) -> A=[0,2], B=[1,3]:
+            # each participant's inputs are interleaved, not contiguous.
+            assert a_idx == [0, 2], a_idx
+            assert b_idx == [1, 3], b_idx
+
+            # And the PSBT's vin are in alphabetical outpoint order.
+            from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+            psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(ra["psbt_sent"]))
+            txids = [bytes(vin.prevout.hash)[::-1].hex() for vin in psbt.unsigned_tx.vin]
+            assert txids == sorted(txids), txids
+        finally:
+            await db.close()
