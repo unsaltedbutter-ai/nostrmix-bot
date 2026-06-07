@@ -95,3 +95,47 @@ class TestCommandParser:
     # called from the real flow — the fee is quoted in _cmd_provide_addresses
     # AFTER both /commit and /addresses) and were removed to avoid misleading
     # readers about when the fee is asked for.
+
+    # --- Edge cases (review gap #11) ---
+
+    def test_commit_malformed_yields_no_utxos(self):
+        """Malformed outpoints (no colon, wrong hex length) parse to an empty
+        UTXO list — the coordinator then DMs 'No UTXOs found'."""
+        for text in ("/commit deadbeef", "/commit 123:0", "/commit notxid:abc",
+                     "/commit"):
+            parsed = self.parser.parse(text)
+            assert parsed.command == "commit_utxos"
+            assert parsed.args[0] == [], f"{text!r} should yield no utxos"
+
+    def test_commit_extracts_only_wellformed_outpoints(self):
+        """A valid 64-hex:vout is extracted even when mixed with junk."""
+        good = "a" * 64 + ":2"
+        parsed = self.parser.parse(f"/commit garbage {good} alsobad:x")
+        assert parsed.command == "commit_utxos"
+        assert parsed.args[0] == [{"txid": "a" * 64, "vout": 2}]
+
+    def test_open_mixes_text_trigger(self):
+        """'open' and 'mixes' are accepted as /list synonyms (plan §3g)."""
+        for text in ("open", "open mixes", "mixes"):
+            assert self.parser.parse(text).command == "list_mixes"
+
+    def test_commands_are_case_insensitive(self):
+        assert self.parser.parse("/LIST").command == "list_mixes"
+        assert self.parser.parse("OPEN").command == "list_mixes"
+        p = self.parser.parse("/JOIN East-Gate")
+        assert p.command == "join_mix"
+        # mix id is lowercased for matching.
+        assert p.args[0] == "east-gate"
+
+    def test_join_without_name(self):
+        """/join with no mix name → join_mix with no usable mix id."""
+        parsed = self.parser.parse("/join")
+        assert parsed.command == "join_mix"
+        assert not parsed.args or not parsed.args[0]
+
+    def test_cancel_without_args_autodetect(self):
+        """/cancel with no args → exit_mix with mix_id None (coordinator
+        auto-detects when the user is in exactly one mix)."""
+        parsed = self.parser.parse("/cancel")
+        assert parsed.command == "exit_mix"
+        assert parsed.args[0] is None

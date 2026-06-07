@@ -3555,3 +3555,242 @@ class TestLowerPriorityGaps:
             assert ok is True, msg
         finally:
             await db.close()
+
+
+# --- Review gaps: _tick() dispatch, output lock, MAX_PENDING, on_ready,
+#     conforming-only-can't-fund-fee, resume, auto-create defaults ---
+
+
+class TestReviewGaps:
+    async def _interested(self, db, mix_id, npub):
+        return await db.add_participant(mix_id, npub, f"{npub}@x")
+
+    async def _commit(self, coord, chain, npub, utxos, spk=FAKE_SCRIPTPUBKEY):
+        for (txid, vout, amt) in utxos:
+            chain.txouts[f"{txid}:{vout}"] = {
+                "value": amt, "scriptpubkey": spk,
+                "scriptpubkey_type": "p2wpkh", "address": "", "status": True,
+            }
+        await coord._cmd_commit_utxos(
+            FakeCtx(npub), npub,
+            [{"txid": t, "vout": v} for (t, v, _a) in utxos],
+        )
+
+    # ---- #1 + #13: _tick() actually dispatches state transitions ----
+
+    @pytest.mark.asyncio
+    async def test_tick_dispatches_collecting_then_assembling(self):
+        """Drive the real event-loop dispatcher (_tick), not _process_mix
+        directly, so a mismatched state arm would be caught. Also stands in for
+        crash-resume: the rows are in the DB and _tick picks them up."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            for npub, txid in (("tA", TXID[0]), ("tB", TXID[1])):
+                await self._interested(db, mix_id, npub)
+                await self._commit(coord, chain, npub, [(txid, 0, 250_000)])
+                await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+
+            # First tick: collecting -> assembling (proceed gate dispatched).
+            await coord._tick()
+            assert (await db.get_mix(mix_id))["state"] == "assembling"
+            # Second tick: assembling -> signing (assembly dispatched).
+            await coord._tick()
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_tick_resumes_midflight_assembling_mix(self):
+        """A mix left in 'assembling' (as after a crash) is advanced by the
+        next _tick without any further user input."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="assembling",
+                                input_type="p2wpkh", output_type="p2wpkh")
+            for npub, txid in (("rA", TXID[0]), ("rB", TXID[1])):
+                pid = await self._interested(db, mix_id, npub)
+                await db.add_utxo(pid, txid, 0, 250_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                for a in P2WPKH_ADDRS[0:3]:
+                    await db.add_output(pid, a, 100_000)
+                await db.update_participant(pid, state="paid")
+
+            await coord._tick()
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+        finally:
+            await db.close()
+
+    # ---- #4: only NC participant under-funded, others conforming-only ----
+
+    @pytest.mark.asyncio
+    async def test_only_nc_underfunded_with_conforming_others_cancels(self):
+        """The miner fee falls entirely on non-conforming participants. If the
+        sole NC participant can't fund it (dropped at assembly), no NC survivor
+        remains to pay — the whole mix must cancel even though conforming-only
+        participants are present."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=1, required_nonconforming=1,
+                max_conforming_utxos=20, fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="assembling", fee_rate=30,
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # Sole NC participant: just above output_size, can't cover the
+            # (large, max-conforming) fee burden → dropped → 0 NC survivors.
+            nc = await db.add_participant(mix_id, "uNC", "uNC@x")
+            await db.add_utxo(nc, TXID[0], 0, 1_000_001, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(nc, P2WPKH_ADDRS[0], 1_000_000)
+            await db.update_participant(nc, state="paid")
+
+            # Two conforming-only participants (pay nothing toward the fee).
+            for npub, txid in (("cf1", TXID[1]), ("cf2", TXID[2])):
+                p = await db.add_participant(mix_id, npub, f"{npub}@x")
+                await db.add_utxo(p, txid, 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                await db.add_output(p, P2WPKH_ADDRS[5], 1_000_000)
+                await db.update_participant(p, state="paid")
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+        finally:
+            await db.close()
+
+    # ---- #5: per-mix OUTPUT type lock (first /addresses locks it) ----
+
+    @pytest.mark.asyncio
+    async def test_output_type_lock_rejects_mismatched_second_participant(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # Widen the allowlist so the rejection comes from the per-mix lock,
+            # not the operator allowlist.
+            coord.cfg._values["_accepted_output_types"] = {"p2wpkh", "p2tr"}
+            P2TR = "bc1p9j0rwcgpd28gnastlh2yweshq7sl2vxxvrpstdsx9w3m8axaxn0qg0vcg0"
+
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+
+            # Participant A locks the mix to p2wpkh outputs.
+            a = await self._interested(db, mix_id, "outA")
+            await self._commit(coord, chain, "outA", [(TXID[0], 0, 2_500_000)])
+            await coord._cmd_provide_addresses(FakeCtx("outA"), "outA", P2WPKH_ADDRS[0:3])
+            assert (await db.get_mix(mix_id))["output_type"] == "p2wpkh"
+
+            # Participant B tries p2tr → rejected by the per-mix output lock.
+            b = await self._interested(db, mix_id, "outB")
+            await self._commit(coord, chain, "outB", [(TXID[1], 0, 2_500_000)])
+            await coord._cmd_provide_addresses(
+                FakeCtx("outB"), "outB", [P2TR, P2WPKH_ADDRS[4], P2WPKH_ADDRS[5]],
+            )
+            assert await db.get_outputs_by_participant(b) == []
+            joined = " ".join(m for r, m in nostr.sent_dms if r == "outB").lower()
+            assert "locked to p2wpkh" in joined
+        finally:
+            await db.close()
+
+    # ---- #8: _on_nostr_ready initializes the Lightning payer ----
+
+    @pytest.mark.asyncio
+    async def test_on_nostr_ready_initializes_ln_payer(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            inits = []
+
+            async def _record(keys):
+                inits.append(keys)
+            coord.lightning.init_payer_with_keys = _record
+
+            class _PubKey:
+                def to_bech32(self):
+                    return "npub1botkey"
+
+            class _Keys:
+                def public_key(self):
+                    return _PubKey()
+
+            class _Handler:
+                keys = _Keys()
+
+            await coord._on_nostr_ready(_Handler())
+            assert len(inits) == 1, "LN payer must be initialized on nostr-ready"
+        finally:
+            await db.close()
+
+    # ---- #10: MAX_PENDING_MIXES cap on /join ----
+
+    @pytest.mark.asyncio
+    async def test_join_blocked_at_max_pending_mixes(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_PENDING_MIXES"] = 2
+            npub = "pending_user"
+            # Already paid into 2 collecting mixes.
+            for txid in (TXID[0], TXID[1]):
+                m = await db.create_mix(output_size=1_000_000, min_participants=2)
+                await db.update_mix(m, state="collecting")
+                p = await db.add_participant(m, npub, "")
+                await db.update_participant(p, state="paid")
+
+            # A 3rd open mix exists; joining it must be refused.
+            m3 = await db.create_mix(output_size=1_000_000, min_participants=2)
+            await db.update_mix(m3, state="collecting")
+            await coord._cmd_join_mix(FakeCtx(npub), m3)
+
+            joined = " ".join(m for r, m in nostr.sent_dms if r == npub).lower()
+            assert "already in 2 mixes" in joined
+            # No participant row was added to the 3rd mix.
+            assert await db.get_participants_by_mix(m3) == []
+        finally:
+            await db.close()
+
+    # ---- #13b: resume_unfinished surfaces mid-flight mixes ----
+
+    @pytest.mark.asyncio
+    async def test_resume_unfinished_returns_midflight_mixes(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            states = ["announced", "collecting", "assembling", "signing",
+                      "broadcast", "completed", "cancelled"]
+            ids = {}
+            for s in states:
+                mid = await db.create_mix(output_size=1_000_000, min_participants=2)
+                await db.update_mix(mid, state=s)
+                ids[s] = mid
+
+            resumed = {m["id"] for m in await db.resume_unfinished()}
+            # Active + broadcast are resumed; terminal states are not.
+            for s in ("announced", "collecting", "assembling", "signing", "broadcast"):
+                assert ids[s] in resumed, f"{s} should resume"
+            for s in ("completed", "cancelled"):
+                assert ids[s] not in resumed, f"{s} should NOT resume"
+        finally:
+            await db.close()
+
+    # ---- #16: auto-created mix uses the configured defaults ----
+
+    @pytest.mark.asyncio
+    async def test_auto_created_mix_uses_default_params(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await coord._post_daily_announcement()  # no open mixes → auto-create
+            mixes = await db.get_mixes_by_state("collecting")
+            assert len(mixes) == 1
+            m = mixes[0]
+            assert m["output_size"] == coord.cfg.DEFAULT_OUTPUT_SIZE
+            assert m["min_participants"] == coord.cfg.DEFAULT_MIX_USER_COUNT
+            assert m["required_nonconforming"] == coord.cfg.DEFAULT_REQUIRED_NONCONFORMING
+            assert m["max_conforming_utxos"] == coord.cfg.MAX_CONFORMING_UTXOS
+        finally:
+            await db.close()
