@@ -248,6 +248,41 @@ python -m pytest -m "not live" -q   # hermetic offline lane (no network)
 
 Tests that hit the live mempool.space API are marked `@pytest.mark.live`.
 
+## Local validation (before launching the bot)
+
+Two scripts let you validate the deployment in layers without launching the full
+bot or risking funds. Launching `src/main.py` itself touches no funds — it
+connects and waits; a transaction is only built/broadcast once participants
+`/commit` UTXOs and a mix reaches its non-conforming target.
+
+**`scripts/preflight.py`** — config sanity + connectivity. Loads the same config
+`main.py` uses (printing only non-secret fields), confirms mempool.space is
+reachable with a live fee estimate, and TCP-checks each relay. Run it on the
+deploy host:
+
+```bash
+python scripts/preflight.py            # uses the configured nostrmix-bot.env
+```
+
+**`scripts/psbt_dryrun.py`** — preview the exact coinjoin the bot would assemble,
+offline and without broadcasting. It runs your mix spec through the real
+`Coordinator._assemble_psbt` (temp DB, stub Nostr/Lightning), printing each
+participant's fee share + change, the transaction's outputs and miner fee, the
+privacy-check result, and the unsigned PSBT (importable into a wallet to inspect):
+
+```bash
+python scripts/psbt_dryrun.py scripts/example-mix.json
+```
+
+The example is fully offline (synthetic inputs + fixed fee rate). Swap the
+`utxos` for real `"txid:vout"` strings and drop `fee_rate` to look up real inputs
+on-chain and produce a real, importable PSBT. See the file headers for the spec
+format. Neither script broadcasts or sends a DM.
+
+Suggested order before a live coinjoin: `pytest -m "not live"` → `preflight.py` →
+`psbt_dryrun.py` → launch + DM `/list` → a controlled self-test with your own
+identities and small-value UTXOs.
+
 ## License
 
 MIT

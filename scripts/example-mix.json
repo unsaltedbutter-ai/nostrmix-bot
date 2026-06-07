@@ -1,0 +1,28 @@
+{
+  "_comment": "Offline example for psbt_dryrun.py: two non-conforming participants, synthetic inputs, fixed fee_rate (no network). Replace utxos with real 'txid:vout' strings and drop fee_rate for a live, importable PSBT.",
+  "output_size": 1000000,
+  "required_nonconforming": 2,
+  "max_conforming_utxos": 10,
+  "fee_per_element": 0,
+  "fee_rate": 30,
+  "participants": [
+    {
+      "name": "alice",
+      "utxos": [{"amount": 2500000, "script_type": "p2wpkh"}],
+      "addresses": [
+        "bc1q4gyakdgygyc8qweh39qxamywc9vdvrt82jsrcj",
+        "bc1q670lslr8tlv9w5kk4zw7ckha74ll6lx48tnsks",
+        "bc1qa9d476j967wv6xdq3zcxncqgufj3evm0qakga4"
+      ]
+    },
+    {
+      "name": "bob",
+      "utxos": [{"amount": 3000000, "script_type": "p2wpkh"}],
+      "addresses": [
+        "bc1qcsz06k58myv2az3uy35krphtw6m4rzs7jmsy96",
+        "bc1qszfu7qa9ylms987se2445s63hahh589h7w74gs",
+        "bc1qt9x5m8sq083zrrgycp2m8vaxt2tyy8e3yjuz9h"
+      ]
+    }
+  ]
+}
