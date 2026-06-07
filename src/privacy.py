@@ -1,4 +1,12 @@
-"""Privacy Module — PSBT sanity check for output partitioning."""
+"""Privacy Module — non-authoritative PSBT sanity check.
+
+The bar we enforce is intentionally simple: a mix must produce at least 2
+equal-size (output_size) outputs drawn from at least 2 inputs (non-conforming
+and conforming counted together). That breaks the 1:1 coin↔owner link, which is
+the bot's purpose. We deliberately do NOT attempt subset-sum / N!/2 partition
+counting; users who want stronger anonymity re-mix the outputs in later rounds.
+The coordinator calls check_psbt with floor = max(2, required_nonconforming).
+"""
 
 from __future__ import annotations
 

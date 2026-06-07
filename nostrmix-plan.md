@@ -516,11 +516,15 @@ Every committed UTXO is auto-classified against the mix's `output_size` (the use
 - **≥ dust, change address supplied:** a normal change output back to the participant.
 - **≥ dust, no change address:** the participant is **warned at `/addresses`** ("~N sats will be donated — re-send with one more address to keep it") and, at assembly, the excess is paid to `DONATION_ADDRESS` if configured, otherwise folded into the miner fee. The equal outputs are never sacrificed to make room for change (`nc_output_plan`). PRIVACY NOTE: a fixed `DONATION_ADDRESS` recurring across coinjoins is a linkable on-chain fingerprint; leaving it blank (fold-to-fee) is the privacy-maximising default.
 
-**Privacy floor.** The non-authoritative privacy check requires at least `required_nonconforming` equal `output_size` outputs (the "N distinct equal-output contributors" guard); conforming UTXOs only add more.
+**Privacy floor.** The non-authoritative privacy check requires at least `max(2, required_nonconforming)` equal `output_size` outputs from at least 2 inputs (NC + conforming combined). The `max(2, …)` keeps the solo (`required_nonconforming == 1`) case honest. See §8 — this is the whole bar; stronger anonymity is achieved by re-mixing in later rounds, not by subset-sum analysis.
 
 ---
 
 ## 4. Key Edge Cases
+
+### Stale "interested" cleanup
+
+A participant who `/join`s but never `/commit`s sits in the `interested` state with no UTXOs or outputs. When the mix leaves the collecting phase (advances to `assembling`), these never-committed stragglers are deleted (and DM'd) so they stop counting against the user's `MAX_PENDING_MIXES` / one-at-a-time gate and leave no on-disk trace. End-of-life phases already handle their own cleanup — cancellation scrubs all participant rows, and confirmation destroys them — so this only needs to fire on the collecting→assembling transition. (`committed`-but-unpaid participants are handled separately by the `PAY_DEADLINE_HOURS` timeout.)
 
 ### Ghosting Recovery
 
@@ -588,7 +592,7 @@ We should not update database state without preserving the dependent state, such
 │   ├── fee_engine.py          # vsize calc, fee distribution
 │   ├── command_parser.py      # rigid DM command protocol
 │   ├── database.py            # SQLite access layer (aiosqlite)
-│   ├── privacy.py             # module for inspecting PSBT for checking at least N!/2 valid output partitionings exist
+│   ├── privacy.py             # sanity-check PSBT: >=2 equal-size outputs from >=2 inputs (see §8)
 │   └── schema.sql             # CREATE TABLE statements
 ├── tests/
 │   └── <add tests as necessary to cover common and error cases>
@@ -596,7 +600,7 @@ We should not update database state without preserving the dependent state, such
 └── README.md
 ```
 
-Privacy.py doesn't need to be fully authoratative. It only needs a sanity check on the PSBT. A simple: "are there at least as many identical outputs as there are participants?" 3 participants, at least 3 identical outputs.
+Privacy.py is a non-authoritative sanity check, not a full anonymity analysis. The bar we enforce: **a mix must produce at least 2 equal-size outputs drawn from at least 2 inputs (non-conforming and conforming inputs counted together).** That is the minimum that achieves the bot's purpose — breaking the 1:1 link between a coin and its owner by giving each mixed output ≥1 indistinguishable sibling. Concretely the check requires `max(2, required_nonconforming)` identical `output_size` outputs to be present before signing. Higher anonymity is the user's choice: they can run the resulting coins through additional mixing rounds. We deliberately do NOT attempt subset-sum / N!/2 partition counting.
 
 ---
 
@@ -734,7 +738,7 @@ The app should not accept MIN_PARTICIPANTS_DEFAULT < 2. It should upgrade the va
 
 - **Unit tests**: each component independently with mocked Nostr relays, LND, and mempool API
 - **Integration**: manual testing with Operator's own nostr accounts and UTXOs
-- **Privacy smoke test**: before a mix we will inspect the PSBT for subset-sum analysis on the transaction; verify at least N!/2 valid output partitionings exist. 
+- **Privacy smoke test**: before signing, inspect the PSBT and confirm the minimum-viable mixing structure — **at least 2 equal-size (`output_size`) outputs, produced from at least 2 inputs (non-conforming + conforming combined)**. This is the bar the bot guarantees (`max(2, required_nonconforming)` identical outputs). We intentionally do NOT perform subset-sum / N!/2 partition counting; users who want stronger anonymity re-mix the outputs in subsequent rounds. 
 
 
 

@@ -1166,10 +1166,40 @@ class Coordinator:
         solo_ok = required >= 2 or conforming_present
         return (nc_count >= required and solo_ok), nc_count, conforming_present
 
+    async def _cleanup_interested(self, mix_id: str):
+        """Drop participants still in 'interested' (joined via /join but never
+        successfully /commit-ed) when the mix leaves the collecting phase.
+
+        An 'interested' row has no UTXOs or outputs (those are created at
+        /commit, which also moves the row to 'committed'), so there's nothing
+        on-chain to release — we just delete the row. Leaving it would (a) keep
+        counting against the user's MAX_PENDING_MIXES / one-at-a-time gate and
+        (b) leave their npub on disk for a mix they aren't part of. Idempotent:
+        a second call finds no 'interested' rows. End-of-life phases handle
+        their own cleanup (cancel scrubs all rows; confirmation destroys them).
+        """
+        participants = await self.db.get_participants_by_mix(mix_id)
+        for p in participants:
+            if p["state"] != "interested":
+                continue
+            try:
+                await self.nostr.send_dm(
+                    p["npub_hex"],
+                    f"Mix {mix_id} has started without you — you never sent "
+                    f"/commit. Use /list to find another open mix.",
+                )
+            except Exception:
+                pass
+            await self.db.delete_participant(p["id"])
+
     async def _proceed_to_assembling(self, mix: Dict, active: List[Dict]):
         """Move mix from collecting to assembling."""
         mix_id = mix["id"]
         await self.db.update_mix(mix_id, state="assembling")
+
+        # Drop never-committed 'interested' stragglers now that the mix is
+        # leaving the collecting phase.
+        await self._cleanup_interested(mix_id)
 
         # Notify participants
         for p in active:
@@ -1575,10 +1605,13 @@ class Coordinator:
             await self._cancel_and_refund(mix, "failed to build skeleton PSBT")
             return
 
-        # Privacy check — floor is the required non-conforming participant count
-        # (each contributes >=1 equal output; conforming UTXOs add more). This
-        # is the "N distinct equal-output contributors" sanity guard.
-        privacy_floor = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+        # Privacy check — the bar is >=2 equal-size outputs from >=2 inputs
+        # (NC + conforming combined). Floor at max(2, required_nonconforming):
+        # each NC participant contributes >=1 equal output, conforming UTXOs add
+        # more, and the solo (required==1) case is still held to the >=2 minimum.
+        # Non-authoritative; users seeking more anonymity re-mix in later rounds.
+        required_nc = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+        privacy_floor = max(2, required_nc)
         privacy_pass, privacy_msg = self.privacy.check_psbt(psbt_hex, privacy_floor)
         if not privacy_pass:
             logger.warning(f"Privacy check failed for {mix_id}: {privacy_msg}")

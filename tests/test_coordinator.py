@@ -3794,3 +3794,56 @@ class TestReviewGaps:
             assert m["max_conforming_utxos"] == coord.cfg.MAX_CONFORMING_UTXOS
         finally:
             await db.close()
+
+    # ---- interested cleanup when the mix leaves collecting ----
+
+    @pytest.mark.asyncio
+    async def test_interested_dropped_when_mix_advances(self):
+        """A participant who /join-ed but never /commit-ed (state 'interested')
+        is removed when the mix proceeds to assembling, freeing their slot and
+        leaving no on-disk trace."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=100_000, min_participants=2, required_nonconforming=2,
+                fee_per_element=0,
+            )
+            await db.update_mix(mix_id, state="collecting")
+
+            # Two paid non-conforming participants → target met.
+            for npub, txid in (("iA", TXID[0]), ("iB", TXID[1])):
+                pid = await db.add_participant(mix_id, npub, f"{npub}@x")
+                await db.add_utxo(pid, txid, 0, 250_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                for a in P2WPKH_ADDRS[0:3]:
+                    await db.add_output(pid, a, 100_000)
+                await db.update_participant(pid, state="paid")
+
+            # A straggler who only /join-ed.
+            idle = await db.add_participant(mix_id, "idler", "idler@x")
+            assert (await db.get_participant(idle))["state"] == "interested"
+
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            assert (await db.get_mix(mix_id))["state"] == "assembling"
+            # The interested straggler is gone; the paid two remain.
+            assert await db.get_participant(idle) is None
+            assert {p["npub_hex"] for p in await db.get_participants_by_mix(mix_id)} == {"iA", "iB"}
+            # And they were told.
+            assert any(r == "idler" and "without you" in m.lower()
+                       for r, m in nostr.sent_dms)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_interested_is_idempotent(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000, min_participants=2)
+            await db.update_mix(mix_id, state="collecting")
+            idle = await db.add_participant(mix_id, "idle2", "idle2@x")
+            await coord._cleanup_interested(mix_id)
+            assert await db.get_participant(idle) is None
+            # Second call is a no-op (no interested rows left).
+            await coord._cleanup_interested(mix_id)
+        finally:
+            await db.close()
