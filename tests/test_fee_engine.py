@@ -188,7 +188,6 @@ class TestFeeEngine:
         ]
         _v, total_miner_fee, results = self.engine.calculate_all_fees(
             participants, output_size=1_000_000, fee_rate=30,
-            max_conforming_utxos=10,
         )
         nc, conf = results[0], results[1]
         assert conf.fee_share_sats == 0
@@ -202,24 +201,22 @@ class TestFeeEngine:
         assert nc.fee_share_sats >= total_miner_fee - 2
 
     def test_conforming_burden_split_evenly_across_nc(self):
-        """The assumed conforming burden (max_conforming_utxos) is split evenly
-        across non-conforming participants and is independent of how many
-        conforming UTXOs actually showed up."""
+        """The conforming burden (sized from the ACTUAL conforming UTXOs present)
+        is split evenly across the non-conforming participants."""
         two_nc = [self._nc(5_000_000, 3, 1), self._nc(5_000_000, 3, 1)]
-        # Same two NC participants, but compute with vs without a conforming cap.
         _v0, fee0, r0 = self.engine.calculate_all_fees(
-            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=0,
-        )
+            two_nc, output_size=1_000_000, fee_rate=30)          # 0 conforming
+        with_conf = two_nc + [self._conforming_only(4)]          # 4 conforming UTXOs
         _v1, fee1, r1 = self.engine.calculate_all_fees(
-            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
-        )
-        # Adding a conforming burden raises the total fee...
+            with_conf, output_size=1_000_000, fee_rate=30)
+        # Actual conforming UTXOs raise the total fee...
         assert fee1 > fee0
-        # ...and each identical NC participant absorbs half of the extra,
-        # roughly evenly (allow 1 sat for the remainder going to the last).
+        # ...split evenly across the two NC participants (remainder to the last).
         extra_each = (fee1 - fee0) // 2
         assert abs(r1[0].fee_share_sats - r0[0].fee_share_sats - extra_each) <= 2
         assert abs(r1[1].fee_share_sats - r0[1].fee_share_sats - extra_each) <= 2
+        # The conforming-only participant pays none of it.
+        assert r1[2].fee_share_sats == 0
 
     def test_mixed_conforming_and_nonconforming_participant(self):
         """Gap #1 (unit): a participant bringing BOTH a conforming UTXO and a
@@ -237,7 +234,6 @@ class TestFeeEngine:
         plain = self._nc(3_000_000, 3, 1)
         _v, _fee, results = self.engine.calculate_all_fees(
             [mixed, plain], output_size=1_000_000, fee_rate=30,
-            max_conforming_utxos=5,
         )
         rmix = results[0]
         assert rmix.is_nonconforming
@@ -256,20 +252,18 @@ class TestFeeEngine:
             + rmix.change_sats
         assert total_out == 3_500_000 - rmix.fee_share_sats
 
-    def test_total_fee_independent_of_conforming_fill(self):
-        """Gap #6 (unit): the miner fee is computed assuming max_conforming_utxos
-        regardless of how many conforming UTXOs actually arrive — so a mix that
-        proceeds under-filled over-collects (higher effective rate)."""
+    def test_total_fee_uses_actual_conforming_and_hits_target_rate(self):
+        """The fee is sized from the ACTUAL conforming UTXOs present (not a cap),
+        so it scales with the real fill AND the total equals vsize × rate (no
+        over-collection)."""
         two_nc = [self._nc(5_000_000, 3, 1), self._nc(5_000_000, 3, 1)]
-        _v0, fee_none, r_none = self.engine.calculate_all_fees(
-            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
-        )
-        with_conf = two_nc + [self._conforming_only(2)]
-        _v1, fee_two, r_two = self.engine.calculate_all_fees(
-            with_conf, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
-        )
-        # Same total fee and same NC shares whether 0 or 2 conforming present:
-        # the burden is always charged for the full cap of 10.
-        assert fee_none == fee_two
-        assert r_none[0].fee_share_sats == r_two[0].fee_share_sats
-        assert r_none[1].fee_share_sats == r_two[1].fee_share_sats
+        _v0, fee0, _r0 = self.engine.calculate_all_fees(
+            two_nc, output_size=1_000_000, fee_rate=30)
+        _v2, fee2, _r2 = self.engine.calculate_all_fees(
+            two_nc + [self._conforming_only(2)], output_size=1_000_000, fee_rate=30)
+        v4, fee4, _r4 = self.engine.calculate_all_fees(
+            two_nc + [self._conforming_only(4)], output_size=1_000_000, fee_rate=30)
+        # More actual conforming -> higher total fee (NC subsidise them).
+        assert fee0 < fee2 < fee4
+        # And the total fee is the real vsize at the target rate (no over-collect).
+        assert abs(fee4 - int(v4 * 30)) <= 2

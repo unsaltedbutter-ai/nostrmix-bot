@@ -268,20 +268,20 @@ async def run(spec: dict, env_path: str) -> int:
         target = float(fee_rate) if fee_rate is not None else await chain.estimate_fee_rate()
         expected = int(target * actual_vsize)
         excess = miner_fee - expected
-        conf_unit = fee_engine.input_vsize("p2wpkh") + fee_engine.output_vsize("p2wpkh")
-        unfilled = max(0, max_conf - present_conforming)
-        conf_overpay = int(unfilled * conf_unit * target)
         print("\n== transaction ==")
-        print(f"  inputs : {len(vins)}  total {_btc(sum_in)}")
+        print(f"  inputs : {len(vins)}  total {_btc(sum_in)}  (conforming present: {present_conforming})")
         print(f"  outputs: {len(vouts)} ({eq} equal @ {output_size} sats)  total {_btc(sum_out)}")
-        print(f"  miner fee: {_btc(miner_fee)}  (~{eff:.1f} sat/vB effective over ~{actual_vsize} vB actual tx)")
-        if excess > 0:
-            print(f"  WHY > TARGET: at the ~{target:.1f} sat/vB target this {actual_vsize}-vB tx "
-                  f"would pay ~{expected} sats; the extra ~{excess} sats come from:")
-            print(f"     - unfilled conforming slots: assumed {max_conf}, {present_conforming} "
-                  f"present -> ~{conf_overpay} sats (lower MAX_CONFORMING_UTXOS to reduce)")
-            print(f"     - any above-dust change folded into the fee for participants who gave "
-                  f"no change address and no DONATION_ADDRESS is set (see LOSS lines above)")
+        print(f"  miner fee: {_btc(miner_fee)}  (~{eff:.1f} sat/vB effective over ~{actual_vsize} vB)")
+        # The fee is sized from the ACTUAL conforming present, so the effective
+        # rate matches the target unless above-dust change was folded into the
+        # fee (a participant with no change address and no DONATION_ADDRESS set).
+        if excess > 200:
+            print(f"  NOTE: ~{excess} sats above the ~{target:.1f} sat/vB target for this "
+                  f"{actual_vsize}-vB tx — above-dust change folded into the fee for "
+                  f"participant(s) who gave no change address and no DONATION_ADDRESS is set "
+                  f"(see LOSS lines above).")
+        else:
+            print(f"  effective rate matches the ~{target:.1f} sat/vB target.")
         floor = max(2, required)
         ok, msg = coord.privacy.check_psbt(psbt_hex, floor)
         print(f"  privacy check (floor {floor}): {'PASS' if ok else 'FAIL'} — {msg}")

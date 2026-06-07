@@ -17,9 +17,9 @@ mix's `output_size`:
 
 A mix is sized by an **exact number of non-conforming participants** it waits for
 (`required_nonconforming`) plus a **cap on conforming UTXOs** it will absorb
-(`max_conforming_utxos`). The miner fee is computed assuming the conforming cap is
-full and split evenly across the non-conforming participants, so each one's share
-is deterministic.
+(`max_conforming_utxos`). The miner fee is computed from the **actual** number of
+conforming UTXOs present at assembly (the cap only bounds intake) and split evenly
+across the non-conforming participants, so the effective rate hits the target.
 
 ## Quick Start
 
@@ -133,7 +133,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
 | `DEFAULT_REQUIRED_NONCONFORMING` | `3` | int ≥ 1 (clamped up to 1) | Exact number of non-conforming participants an auto-created mix waits for before assembling. Also the even-split denominator for the conforming miner-fee burden. |
-| `MAX_CONFORMING_UTXOS` | `10` | int ≥ 0 | Max conforming UTXOs a mix absorbs. The miner fee is computed **as if** this many are present (deterministic); under-fill just pays a slightly higher effective rate. |
+| `MAX_CONFORMING_UTXOS` | `10` | int ≥ 0 | Max conforming UTXOs a mix absorbs (bounds intake during collecting). The miner fee is sized from the **actual** conforming present at assembly, not this cap. |
 | `MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT` | `10` | int ≥ 1 | Cap on non-conforming UTXOs one participant may commit. |
 | `DONATION_ADDRESS` | `""` | bitcoin address; **recommended blank** | Where an above-dust leftover goes when a non-conforming participant supplies no change address (they're warned first). **Poor-privacy feature — recommended to leave blank**, in which case the leftover folds into the miner fee (most private). A fixed address recurring across coinjoins is a linkable on-chain fingerprint; only set it if you accept that cost to keep those sats. |
 

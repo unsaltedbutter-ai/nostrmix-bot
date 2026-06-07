@@ -136,7 +136,11 @@ class PSBTManager:
 
         # 2. Build PSBT from unsigned_tx — constructor creates PSBT_Input and
         #    PSBT_Output objects for each vin/vout entry automatically.
-        psbt = PartiallySignedBitcoinTransaction(unsigned_tx=unsigned_tx)
+        # version=0 explicitly: emit a BIP174 v0 PSBT (with the global
+        # unsigned_tx) for the widest wallet compatibility. This is bitcointx's
+        # default, but we pin it so a future library default (e.g. v2/BIP370)
+        # can't silently change the format participants' wallets must parse.
+        psbt = PartiallySignedBitcoinTransaction(unsigned_tx=unsigned_tx, version=0)
 
         # 3. Set the actual prevout UTXO on each input so that:
         #    - participants can sign (need prevout script to compute sighash)

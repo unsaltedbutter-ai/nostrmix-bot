@@ -618,6 +618,18 @@ class TestPSBTManager:
             expected_output_addresses=[], participant_input_indices=[0])
         assert ok, f"a correct signature must still validate: {reason}"
 
+    def test_build_skeleton_emits_v0_psbt(self):
+        """Compatibility: skeletons must be BIP174 v0 (global unsigned_tx,
+        version 0), not v2/BIP370, so participants' wallets can parse them."""
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        skel = self._build_skeleton_with_input("ab" * 32)
+        raw = bytes.fromhex(skel)
+        psbt = PartiallySignedBitcoinTransaction.from_binary(raw)
+        assert psbt.version == 0, f"expected PSBT v0, got v{psbt.version}"
+        assert psbt.unsigned_tx is not None, "v0 PSBT must carry the global unsigned_tx"
+        # No PSBT_GLOBAL_VERSION (0xfb) key should be present for v0.
+        assert b"\x01\xfb" not in raw, "v0 PSBT should not write a global version field"
+
     def test_validate_rejects_valid_sig_for_a_different_input(self):
         """A cryptographically VALID signature, but for a different input
         (different outpoint/amount/index -> different BIP143 sighash), placed on

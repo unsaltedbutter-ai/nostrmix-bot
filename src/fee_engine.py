@@ -200,7 +200,6 @@ class FeeEngine:
 
     def calculate_all_fees(self, participants_data: List[Dict],
                            output_size: int, fee_rate: float,
-                           max_conforming_utxos: int = 0,
                            conf_input_type: str = "p2wpkh",
                            conf_output_type: str = "p2wpkh") -> Tuple[int, int, List[FeeResult]]:
         """Calculate fees under the conforming / non-conforming model.
@@ -217,11 +216,15 @@ class FeeEngine:
                 - is_nonconforming: True if they brought >=1 non-conforming UTXO
             output_size: standardized equal output size
             fee_rate: sats/vbyte
-            max_conforming_utxos: cap the mix will absorb; the conforming miner
-                burden is computed assuming this many and split evenly across
-                the non-conforming participants (deterministic, fill-independent).
             conf_input_type / conf_output_type: script types used to size the
-                assumed conforming input/output vbytes.
+                conforming input/output vbytes.
+
+        The conforming miner burden is computed from the ACTUAL number of
+        conforming UTXOs present (summed from participants_data), not the mix's
+        MAX_CONFORMING_UTXOS cap. The cap only bounds intake during collecting;
+        by the time fees are computed (assembly, the frozen participant set that
+        is sent for signing) the real conforming count is known, so we target
+        the correct fee rather than over-collecting for slots that never filled.
 
         Returns: (total_fee_vsize, total_miner_fee, list of FeeResult)
 
@@ -231,18 +234,20 @@ class FeeEngine:
           * each non-conforming participant pays a proportional share of the
             *non-conforming portion* of the tx (overhead + NC inputs + NC-derived
             outputs), by their input+output vsize weight, PLUS an even 1/N slice
-            of the conforming burden (max_conforming_utxos assumed).
+            of the conforming burden (the ACTUAL conforming UTXOs present).
         """
         nc = [p for p in participants_data if p.get("is_nonconforming")]
         num_nc = len(nc)
         overhead = self._vsize.overhead
 
-        # Conforming burden — assumed at the cap so the fee is deterministic and
-        # independent of how many conforming UTXOs actually showed up. If fewer
-        # arrive, the over-collected sats simply pay a higher effective rate.
+        # Conforming burden — sized from the ACTUAL conforming UTXOs present in
+        # this (frozen) participant set, so the total fee matches the real tx
+        # vsize at the target rate. Split evenly across the non-conforming
+        # participants (conforming-only participants pay nothing).
+        present_conforming = sum(p.get("conforming_count", 0) for p in participants_data)
         conf_unit_vsize = (self.input_vsize(conf_input_type)
                            + self.output_vsize(conf_output_type))
-        conforming_burden_vsize = max(0, max_conforming_utxos) * conf_unit_vsize
+        conforming_burden_vsize = present_conforming * conf_unit_vsize
         conforming_burden_fee = int(conforming_burden_vsize * fee_rate)
 
         def _nc_layout(rec: Dict, fee_share: int) -> Tuple[int, int, int]:

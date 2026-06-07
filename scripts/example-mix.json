@@ -1,10 +1,9 @@
 {
-  "_comment": "Offline example for psbt_dryrun.py: two non-conforming participants, synthetic inputs, fixed fee_rate (no network). Replace utxos with real 'txid:vout' strings and drop fee_rate for a live, importable PSBT.",
+  "_comment": "Example for psbt_dryrun.py: two non-conforming participants with synthetic input amounts. fee_rate is OMITTED, so the script fetches the live mempool.space estimate (needs network). Add a numeric \"fee_rate\" to pin it offline; replace utxos with real \"txid:vout\" strings for a live, importable PSBT.",
   "output_size": 1000000,
   "required_nonconforming": 2,
   "max_conforming_utxos": 10,
   "fee_per_element": 0,
-  "fee_rate": 30,
   "participants": [
     {
       "name": "alice",

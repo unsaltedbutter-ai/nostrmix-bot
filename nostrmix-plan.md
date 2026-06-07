@@ -55,9 +55,10 @@ CREATE TABLE mixes (
     -- Conforming/non-conforming model:
     --   required_nonconforming = exact number of non-conforming participants the
     --     mix waits for before assembling (also the fee-split denominator).
-    --   max_conforming_utxos   = cap on conforming UTXOs absorbed; the miner fee
-    --     is computed assuming this many and split evenly across the
-    --     non-conforming participants (deterministic, fill-independent).
+    --   max_conforming_utxos   = cap on conforming UTXOs the mix absorbs
+    --     (bounds intake during collecting). The miner fee is sized from the
+    --     ACTUAL conforming present at assembly, split evenly across the
+    --     non-conforming participants.
     required_nonconforming INTEGER NOT NULL DEFAULT 3,
     max_conforming_utxos INTEGER NOT NULL DEFAULT 10,
     fee_rate        INTEGER DEFAULT 30,        -- sats/vbyte, set at assembly
@@ -231,15 +232,15 @@ Charged at commitment: `fee_per_element × (non_conforming_inputs + non_conformi
 - Partial payments are the same as no payment
 
 **Tier 2 — On-chain miner fee (Bitcoin)**
-Calculated at assembly, based on vsize, **assuming the mix fills to `max_conforming_utxos` conforming UTXOs** so the figure is deterministic. Only non-conforming participants pay it.
+Calculated at assembly, based on vsize, using the **actual** number of conforming UTXOs present in the frozen participant set (not the `max_conforming_utxos` cap). Only non-conforming participants pay it; the cap merely bounds intake during collecting.
 
-Algorithm:
+Algorithm (`present_conforming` = conforming UTXOs actually present):
 
 ```
-conforming_burden    = max_conforming_utxos × (conf_in_vsize + conf_out_vsize) × fee_rate
+conforming_burden    = present_conforming × (conf_in_vsize + conf_out_vsize) × fee_rate
 nonconforming_vsize  = overhead + Σ(nc_inputs_vsize) + Σ(nc_derived_outputs_vsize)
 nonconforming_fee    = nonconforming_vsize × fee_rate
-total_miner_fee      = nonconforming_fee + conforming_burden
+total_miner_fee      = nonconforming_fee + conforming_burden   # == actual tx vsize × fee_rate
 
 For each NON-conforming participant (N of them):
   own        = nonconforming_fee × (their_nc_input+output_vsize) / total_nc_weight   # proportional
@@ -252,7 +253,7 @@ For each CONFORMING-only participant:
 ```
 
 - vsizes (e.g. 68/31 in earlier drafts) come from env on a per address-type basis.
-- If fewer than `max_conforming_utxos` conforming UTXOs actually arrive, the over-collected sats remain allocated to the miner fee (a slightly higher effective rate). This is accepted.
+- Because the burden uses the actual conforming count, `total_miner_fee == actual tx vsize × fee_rate` — the effective rate hits the target (no over-collection). The `fee_rate` itself is a live estimate (max of recent-blocks min-feerate × `FEE_MULTIPLIER`, clamped). A participant's leftover that has no change address, or is below the dust threshold, still folds into the miner fee.
 
 Users should pay the miner fee proportional to the number of input and outputs they are contributing to the join.
 The user doesn't directly tell us how many outputs they want. The tell us the input(s) and they provide us with n output addresses. The maximum number of outputs they can receive is the number of addresses they give us, but we calculate the number we will create based upon miner fee & minimum utxo size.
@@ -499,11 +500,11 @@ Every committed UTXO is auto-classified against the mix's `output_size` (the use
 
 **Mix sizing.** Each mix predefines two numbers:
 - `required_nonconforming` — the **exact** number of non-conforming *participants* the mix waits for. Participant-counted, not UTXO-counted: one participant may bring several non-conforming UTXOs (capped per participant by `MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT`).
-- `max_conforming_utxos` — the maximum number of conforming *UTXOs* the mix will absorb (a mining-fee burden the non-conforming participants subsidise).
+- `max_conforming_utxos` — the maximum number of conforming *UTXOs* the mix will absorb (bounds intake during collecting). Conforming UTXOs are a mining-fee burden the non-conforming participants subsidise — sized from the actual count present, not this cap.
 
 **Proceeding.** A mix advances to assembling as soon as it has `required_nonconforming` non-conforming participants — it does **not** wait for conforming UTXOs — **except** when `required_nonconforming == 1`, where it must also have ≥1 conforming UTXO so there are ≥2 equal outputs from distinct parties. If the deadline passes before the exact target is met, the mix cancels and refunds.
 
-**Miner fee.** Computed assuming the mix fills to `max_conforming_utxos` (deterministic). The conforming burden is split **evenly** across the non-conforming participants; each also pays a proportional share of the non-conforming portion of the tx (see §3e). Under-filled conforming slots → slightly higher effective fee (accepted).
+**Miner fee.** Computed from the **actual** conforming UTXOs present at assembly (the `max_conforming_utxos` cap only bounds intake during collecting). The conforming burden is split **evenly** across the non-conforming participants; each also pays a proportional share of the non-conforming portion of the tx (see §3e). The total equals the real tx vsize × the live fee rate, so the effective rate hits the target.
 
 **Addresses.** One fresh address per conforming UTXO, plus at least one for a non-conforming participant's equal output. So the **required floor** is `(conforming_count + 1)` for a non-conforming participant, or `max(conforming_count, 1)` for a conforming-only one. A change address is **optional** — the `/commit` guidance still *recommends* one address per mixed output plus one for change, so users don't donate change unintentionally.
 

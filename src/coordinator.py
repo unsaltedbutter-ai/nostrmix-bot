@@ -1456,20 +1456,19 @@ class Coordinator:
         # hasn't fired yet would be included with no zap on file.
         active = [p for p in active if p["state"] in ("paid", "signing")]
 
-        # Conforming-model fee inputs. The miner fee assumes the mix fills to
-        # max_conforming_utxos; that burden is split evenly across the
-        # non-conforming participants (deterministic). Conforming input/output
-        # vbytes are sized from the mix's locked types (fallback p2wpkh).
-        max_conforming = mix.get("max_conforming_utxos")
-        if max_conforming is None:
-            max_conforming = self.cfg.MAX_CONFORMING_UTXOS
+        # Conforming-model fee inputs. The miner fee is computed from the ACTUAL
+        # conforming UTXOs in this frozen participant set (the cap,
+        # MAX_CONFORMING_UTXOS, only bounded intake during collecting), so we
+        # target the correct fee instead of over-collecting for unfilled slots.
+        # The conforming burden is split evenly across the non-conforming
+        # participants; conforming input/output vbytes use the mix's locked
+        # types (fallback p2wpkh).
         conf_in_type = mix.get("input_type") or "p2wpkh"
         conf_out_type = mix.get("output_type") or "p2wpkh"
 
         def _calc(pdata):
             return self.fee_engine.calculate_all_fees(
                 pdata, output_size, fee_rate,
-                max_conforming_utxos=max_conforming,
                 conf_input_type=conf_in_type, conf_output_type=conf_out_type,
             )
 
