@@ -395,17 +395,25 @@ class TestVsizeAccuracy:
             f"for actual vsize {actual}"
         )
 
+    # Output script types our vsize map models. A tx with any other output
+    # type (notably OP_RETURN, whose data payload we don't size) isn't a fair
+    # test of "does our per-type estimate cover a modeled tx" — it would fall
+    # back to the p2wpkh figure and under-count.
+    _MODELED_OUTPUT_TYPES = {"p2pkh", "p2sh", "p2wpkh", "p2wsh", "p2tr"}
+
     @pytest.mark.asyncio
     async def test_p2tr_estimate_covers_real_vsize(self):
         """Live-hunt a recent block for a pure-p2tr tx and check it against
-        our estimate — BUT only count it if every input looks like a
-        key-path spend (witness is a single 64-or-65 byte signature).
-        Script-path spends carry merkle proofs + script bytes and are
-        deliberately not modelled by our config's 60-vbyte estimate.
+        our estimate — BUT only count it if (a) every input is a key-path
+        spend (witness is a single 64-or-65 byte signature; script-path spends
+        carry merkle proofs + script bytes our 60-vbyte estimate doesn't model)
+        AND (b) every output is a type our vsize map models (skip OP_RETURN /
+        nonstandard outputs, which fall back to the p2wpkh figure and would
+        under-count).
 
-        If no clean key-path candidate shows up in the recent chain
-        (some periods are heavy on Ordinals / inscriptions which use
-        script-path), the test skips rather than going red."""
+        If no clean candidate shows up in the recent chain (some periods are
+        heavy on Ordinals / inscriptions / OP_RETURN), the test skips rather
+        than going red."""
         cm = ChainMonitor()
         try:
             tip = int((await cm._client.get(f"{cm._api_base}/blocks/tip/height")).text)
@@ -433,9 +441,17 @@ class TestVsizeAccuracy:
                         if len(w) != 1:
                             return False
                         return len(w[0]) // 2 in (64, 65)  # hex → bytes
-                    if all(_is_key_path(vi) for vi in stub["vin"]):
-                        found_tx = stub
-                        break
+                    if not all(_is_key_path(vi) for vi in stub["vin"]):
+                        continue
+                    # Outputs must all be types we model (no OP_RETURN etc.).
+                    out_types = {
+                        _normalize_script_type(vo.get("scriptpubkey_type", ""))
+                        for vo in stub["vout"]
+                    }
+                    if not out_types <= self._MODELED_OUTPUT_TYPES:
+                        continue
+                    found_tx = stub
+                    break
                 if found_tx:
                     break
         finally:
@@ -443,8 +459,8 @@ class TestVsizeAccuracy:
 
         if found_tx is None:
             pytest.skip(
-                "no pure-p2tr key-path tx in last 6 blocks "
-                "(recent chain is heavy on script-path spends?)"
+                "no p2tr key-path tx with all-modeled outputs in last 6 blocks "
+                "(recent chain is heavy on script-path / OP_RETURN?)"
             )
 
         vsize_calc = VsizeCalculator()
