@@ -122,15 +122,38 @@ class TestFeeEngine:
         clamped = self.engine.clamp_fee_rate(30)
         assert clamped == 30
 
+    @staticmethod
+    def _nc(total, naddr, ninputs, itype="p2wpkh", conforming=0):
+        """Build a non-conforming participant_data record (new format)."""
+        return {
+            "total_sats": total,
+            "num_addresses": naddr,
+            "conforming_count": conforming,
+            "nonconforming_total_sats": total - conforming * 1_000_000,
+            "nonconforming_inputs_by_type": {itype: ninputs},
+            "output_type": "p2wpkh",
+            "is_nonconforming": True,
+        }
+
+    @staticmethod
+    def _conforming_only(count):
+        """A participant who brought only conforming UTXOs (free pass-through)."""
+        return {
+            "total_sats": count * 1_000_000,
+            "num_addresses": count,
+            "conforming_count": count,
+            "nonconforming_total_sats": 0,
+            "nonconforming_inputs_by_type": {},
+            "output_type": "p2wpkh",
+            "is_nonconforming": False,
+        }
+
     def test_calculate_all_fees_simple(self):
-        """Test fee calculation with per-type data."""
+        """Three non-conforming participants, no conforming cap."""
         participants = [
-            {"num_inputs": 2, "total_sats": 5_000_000, "num_addresses": 3,
-             "inputs_by_type": {"p2wpkh": 2}, "outputs_by_type": {"p2wpkh": 3}},
-            {"num_inputs": 3, "total_sats": 8_000_000, "num_addresses": 4,
-             "inputs_by_type": {"p2wpkh": 3}, "outputs_by_type": {"p2wpkh": 4}},
-            {"num_inputs": 1, "total_sats": 2_000_000, "num_addresses": 3,
-             "inputs_by_type": {"p2wpkh": 1}, "outputs_by_type": {"p2wpkh": 3}},
+            self._nc(5_000_000, 3, 2),
+            self._nc(8_000_000, 4, 3),
+            self._nc(2_000_000, 3, 1),
         ]
         total_vsize, total_miner_fee, results = self.engine.calculate_all_fees(
             participants, output_size=1_000_000, fee_rate=30
@@ -141,14 +164,13 @@ class TestFeeEngine:
         for r in results:
             assert isinstance(r, FeeResult)
             assert r.service_fee_sats > 0
+            assert r.fee_share_sats > 0
 
     def test_calculate_all_fees_mixed_types(self):
-        """Test fee calculation with mixed input types."""
+        """Mixed non-conforming input types."""
         participants = [
-            {"num_inputs": 2, "total_sats": 5_000_000, "num_addresses": 3,
-             "inputs_by_type": {"p2wpkh": 1, "p2tr": 1}, "outputs_by_type": {"p2wpkh": 3}},
-            {"num_inputs": 1, "total_sats": 3_000_000, "num_addresses": 2,
-             "inputs_by_type": {"p2pkh": 1}, "outputs_by_type": {"p2sh": 2}},
+            self._nc(5_000_000, 3, 2, itype="p2wpkh"),
+            self._nc(3_000_000, 2, 1, itype="p2tr"),
         ]
         total_vsize, total_miner_fee, results = self.engine.calculate_all_fees(
             participants, output_size=1_000_000, fee_rate=20
@@ -156,3 +178,98 @@ class TestFeeEngine:
         assert total_vsize > 0
         assert total_miner_fee > 0
         assert len(results) == 2
+
+    def test_conforming_only_participant_pays_nothing(self):
+        """A conforming-only participant pays no service fee and no miner fee;
+        the non-conforming participant carries the whole fee."""
+        participants = [
+            self._nc(5_000_000, 3, 2),
+            self._conforming_only(2),
+        ]
+        _v, total_miner_fee, results = self.engine.calculate_all_fees(
+            participants, output_size=1_000_000, fee_rate=30,
+            max_conforming_utxos=10,
+        )
+        nc, conf = results[0], results[1]
+        assert conf.fee_share_sats == 0
+        assert conf.service_fee_sats == 0
+        assert conf.conforming_count == 2
+        # The conforming-only participant's equal outputs come 1:1 from their
+        # conforming UTXOs (laid out by the coordinator), not NC-derived.
+        assert conf.num_equal_outputs == 0
+        assert nc.fee_share_sats > 0
+        # The lone NC participant covers the entire miner fee.
+        assert nc.fee_share_sats >= total_miner_fee - 2
+
+    def test_conforming_burden_split_evenly_across_nc(self):
+        """The assumed conforming burden (max_conforming_utxos) is split evenly
+        across non-conforming participants and is independent of how many
+        conforming UTXOs actually showed up."""
+        two_nc = [self._nc(5_000_000, 3, 1), self._nc(5_000_000, 3, 1)]
+        # Same two NC participants, but compute with vs without a conforming cap.
+        _v0, fee0, r0 = self.engine.calculate_all_fees(
+            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=0,
+        )
+        _v1, fee1, r1 = self.engine.calculate_all_fees(
+            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
+        )
+        # Adding a conforming burden raises the total fee...
+        assert fee1 > fee0
+        # ...and each identical NC participant absorbs half of the extra,
+        # roughly evenly (allow 1 sat for the remainder going to the last).
+        extra_each = (fee1 - fee0) // 2
+        assert abs(r1[0].fee_share_sats - r0[0].fee_share_sats - extra_each) <= 2
+        assert abs(r1[1].fee_share_sats - r0[1].fee_share_sats - extra_each) <= 2
+
+    def test_mixed_conforming_and_nonconforming_participant(self):
+        """Gap #1 (unit): a participant bringing BOTH a conforming UTXO and a
+        non-conforming UTXO. Equal outputs/fee come from the NON-conforming
+        portion only; the conforming UTXO is a free pass-through."""
+        mixed = {
+            "total_sats": 1_000_000 + 2_500_000,
+            "num_addresses": 4,
+            "conforming_count": 1,
+            "nonconforming_total_sats": 2_500_000,
+            "nonconforming_inputs_by_type": {"p2wpkh": 1},
+            "output_type": "p2wpkh",
+            "is_nonconforming": True,
+        }
+        plain = self._nc(3_000_000, 3, 1)
+        _v, _fee, results = self.engine.calculate_all_fees(
+            [mixed, plain], output_size=1_000_000, fee_rate=30,
+            max_conforming_utxos=5,
+        )
+        rmix = results[0]
+        assert rmix.is_nonconforming
+        assert rmix.conforming_count == 1
+        # NC-derived equal outputs come from 2.5M only → 2, NOT from 3.5M.
+        assert rmix.num_equal_outputs == 2
+        assert rmix.fee_share_sats > 0
+        # Service fee counts only the 1 non-conforming input + its NC outputs,
+        # never the conforming UTXO (engine fee_per_element == 100 here).
+        assert rmix.service_fee_sats == 100 * (
+            1 + rmix.num_equal_outputs + rmix.num_change_outputs
+        )
+        # Conforming sats are preserved: total out == total in − fee_share.
+        # total out = conforming(1)*size + nc_equal*size + change.
+        total_out = (rmix.conforming_count + rmix.num_equal_outputs) * 1_000_000 \
+            + rmix.change_sats
+        assert total_out == 3_500_000 - rmix.fee_share_sats
+
+    def test_total_fee_independent_of_conforming_fill(self):
+        """Gap #6 (unit): the miner fee is computed assuming max_conforming_utxos
+        regardless of how many conforming UTXOs actually arrive — so a mix that
+        proceeds under-filled over-collects (higher effective rate)."""
+        two_nc = [self._nc(5_000_000, 3, 1), self._nc(5_000_000, 3, 1)]
+        _v0, fee_none, r_none = self.engine.calculate_all_fees(
+            two_nc, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
+        )
+        with_conf = two_nc + [self._conforming_only(2)]
+        _v1, fee_two, r_two = self.engine.calculate_all_fees(
+            with_conf, output_size=1_000_000, fee_rate=30, max_conforming_utxos=10,
+        )
+        # Same total fee and same NC shares whether 0 or 2 conforming present:
+        # the burden is always charged for the full cap of 10.
+        assert fee_none == fee_two
+        assert r_none[0].fee_share_sats == r_two[0].fee_share_sats
+        assert r_none[1].fee_share_sats == r_two[1].fee_share_sats

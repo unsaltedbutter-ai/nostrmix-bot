@@ -54,6 +54,41 @@ class TestDatabase:
             assert mix["output_size"] == 1_000_000
             assert mix["min_participants"] == 3
             assert mix["state"] == "announced"
+            # Conforming/non-conforming columns default in when not supplied.
+            assert mix["required_nonconforming"] == 3
+            assert mix["max_conforming_utxos"] == 10
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_create_mix_with_conforming_params(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(
+                output_size=500_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=4,
+            )
+            mix = await db.get_mix(mid)
+            assert mix["required_nonconforming"] == 2
+            assert mix["max_conforming_utxos"] == 4
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_utxos_for_mix_spans_participants(self):
+        db = await make_db()
+        try:
+            mid = await db.create_mix(1_000_000, 2)
+            p1 = await db.add_participant(mid, "n1", "")
+            p2 = await db.add_participant(mid, "n2", "")
+            await db.add_utxo(p1, "11" * 32, 0, 1_000_000, "p2wpkh")
+            await db.add_utxo(p2, "22" * 32, 0, 2_000_000, "p2wpkh")
+            rows = await db.get_utxos_for_mix(mid)
+            assert len(rows) == 2
+            # Conforming count (amount == output_size) is computable from the rows.
+            conforming = sum(1 for r in rows if r["amount"] == 1_000_000)
+            assert conforming == 1
+            assert all("participant_state" in r for r in rows)
         finally:
             await db.close()
 

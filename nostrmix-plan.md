@@ -20,7 +20,8 @@ Some basics:
 - payment of miner fee: the bot will assemble the transaction out of all participant's inputs, will allocate BTC to the outputs equally, and will use left over funds to pay the miner fee.
 - The bitcoin miner fee is calculated based upon looking at recent blockchain activity, applying a multiple, such as 1.5x which is controlled by an env variable, and this amount is deducted from participants outputs in equal amounts so that outputs remain equal and the miner fee is paid.
 - The on-chain need not be "known later." it can be precalculated based upon current/recent blockchain activity and adding a multiplier to give a buffer. If the blockchain becomes significantly more busy & expensive to get a confirmation it is acceptable for the join to take longer to become confirmed.
-- There will only be one zap (per participant) required to become a participant in the join.
+- Paying a service fee (a zap to the bot) is **optional and off by default**. `FEE_PER_ELEMENT` defaults to `0`; at 0 the bot requests no zap, skips the `paid`/pay-deadline gate, and tells the user they're all set. When `FEE_PER_ELEMENT > 0` there is one zap (per participant) required, charged only on the participant's **non-conforming** inputs and their derived outputs (see "Conforming vs non-conforming UTXOs" below).
+- **Conforming vs non-conforming UTXOs** (see §3i): a UTXO whose amount equals the mix's `output_size` is *conforming* — it is moved 1-input→1-output unchanged, costs no service fee and no miner fee. Any other UTXO is *non-conforming* — it is carved into equal `output_size` outputs + change, and its owner pays the miner fee. A mix is sized by an exact target number of *non-conforming participants* and a cap on the number of *conforming UTXOs* it will absorb.
 - all inputs must be of the same key type (such as p2wpkh). The cost per input/output should come from env variables so it can be raised or lowered if the example table (below) proves to be incorrect.
 - all outputs must be of the same key type as the inputs (such as p2wpkh).
 - let's us setup the database so that the same npub participant can be a party to more than one pending mix. This could result in the participant being asked to sign more than one PSBT at a time. We will need to match their reply to us against the n number of mixes they belong to. This should be a relatively small number. We can cap them to 5 simultaneous mixes, but let's use an env variable for the maximum allowed.
@@ -49,11 +50,19 @@ File: `schema.sql`
 ```sql
 CREATE TABLE mixes (
     id              TEXT PRIMARY KEY,          -- east-gate
-    output_size     INTEGER NOT NULL,          -- sats (1_000_000 = 0.01 BTC)
+    output_size     INTEGER NOT NULL,          -- sats (1_000_000 = 0.01 BTC); a UTXO of exactly this size is "conforming"
     min_participants INTEGER NOT NULL DEFAULT 3,
     max_participants INTEGER,
+    -- Conforming/non-conforming model:
+    --   required_nonconforming = exact number of non-conforming participants the
+    --     mix waits for before assembling (also the fee-split denominator).
+    --   max_conforming_utxos   = cap on conforming UTXOs absorbed; the miner fee
+    --     is computed assuming this many and split evenly across the
+    --     non-conforming participants (deterministic, fill-independent).
+    required_nonconforming INTEGER NOT NULL DEFAULT 3,
+    max_conforming_utxos INTEGER NOT NULL DEFAULT 10,
     fee_rate        INTEGER DEFAULT 30,        -- sats/vbyte, set at assembly
-    fee_per_element INTEGER DEFAULT 100,       -- sats, zap fee per input+output
+    fee_per_element INTEGER DEFAULT 0,         -- sats, service-fee zap per NON-conforming element; 0 = no zap
     state           TEXT NOT NULL DEFAULT 'announced',
     -- announced | collecting | assembling | signing | broadcast | completed | cancelled
     deadline_unix   INTEGER,
@@ -212,33 +221,39 @@ Uses `python-bitcoinlib`.
 
 ### 3e. Fee Engine (File: `fee_engine.py`)
 
-Two-tier fee model:
+Two-tier fee model. **Both tiers fall only on non-conforming inputs/outputs**; conforming UTXOs (amount == `output_size`) are free 1→1 pass-throughs and pay neither tier.
 
-**Tier 1 — Service fee (Lightning zap)**
-Charged at commitment: `fee_per_element × (inputs + outputs)`. Known upfront, paid via zap.
-The participant sends a zap using their nostr client. We do not need to do anything to create the invoice.
+**Tier 1 — Service fee (Lightning zap) — OPTIONAL, off by default**
+`FEE_PER_ELEMENT` defaults to `0`. When 0, no zap is requested: the participant goes straight from `committed` to `paid` after `/addresses` and is told there's no fee. When `> 0`:
+Charged at commitment: `fee_per_element × (non_conforming_inputs + non_conforming_used_outputs)`. Known upfront, paid via zap.
 - we tell the user to send us input information (txids & vouts) and output addresses and we calculate the amount and tell the user to zap us ### sats.
 - we record their information (npub and inputs/output) and await a zap of at least the correct amount
 - when the zap arrives, we know who sent it (npub) and we compare the amount to what we were waiting for and mark the user as a paid member if they paid enough.
 - Partial payments are the same as no payment
 
 **Tier 2 — On-chain miner fee (Bitcoin)**
-Calculated when all participants are known, based on actual vsize.
+Calculated at assembly, based on vsize, **assuming the mix fills to `max_conforming_utxos` conforming UTXOs** so the figure is deterministic. Only non-conforming participants pay it.
 
 Algorithm:
 
 ```
-1. total_vsize = overhead + sum(participant_inputs × 68) + sum(participant_outputs × 31)
-2. total_miner_fee = total_vsize × fee_rate
-3. For each participant:
-     weight = (num_inputs × 68) + (num_outputs × 31) + overhead_share
-     proportional = total_miner_fee × weight / total_weight
-     actual_fee = clamp(proportional, participant.min_fee, participant.max_fee)
-     surplus = sum(participant.inputs) - (num_fixed_outputs × output_size)
-     change = surplus - actual_fee
+conforming_burden    = max_conforming_utxos × (conf_in_vsize + conf_out_vsize) × fee_rate
+nonconforming_vsize  = overhead + Σ(nc_inputs_vsize) + Σ(nc_derived_outputs_vsize)
+nonconforming_fee    = nonconforming_vsize × fee_rate
+total_miner_fee      = nonconforming_fee + conforming_burden
+
+For each NON-conforming participant (N of them):
+  own        = nonconforming_fee × (their_nc_input+output_vsize) / total_nc_weight   # proportional
+  burden     = conforming_burden / N                                                 # split evenly
+  fee_share  = own + burden
+  surplus    = sum(their_non_conforming_inputs) − (nc_equal_outputs × output_size)
+  change     = surplus − fee_share
+For each CONFORMING-only participant:
+  fee_share  = 0     # free pass-through, miner fee subsidised by the non-conforming participants
 ```
 
-- 68 & 31 above are example values that will come out of env on a per address-type basis.
+- vsizes (e.g. 68/31 in earlier drafts) come from env on a per address-type basis.
+- If fewer than `max_conforming_utxos` conforming UTXOs actually arrive, the over-collected sats remain allocated to the miner fee (a slightly higher effective rate). This is accepted.
 
 Users should pay the miner fee proportional to the number of input and outputs they are contributing to the join.
 The user doesn't directly tell us how many outputs they want. The tell us the input(s) and they provide us with n output addresses. The maximum number of outputs they can receive is the number of addresses they give us, but we calculate the number we will create based upon miner fee & minimum utxo size.
@@ -377,6 +392,8 @@ async def run():
 This is a summary of some of what command_parser.py needs to handle.
 If there are other flows that are required, a best guess is appropriate as long as it is written in a way that permits updating later.
 
+> **Note (optional fee + conforming UTXOs):** the zap steps below only apply when `FEE_PER_ELEMENT > 0` and the participant brought non-conforming UTXOs. With the default `FEE_PER_ELEMENT=0`, or for a conforming-only participant, the bot skips the zap prompt, marks the participant `paid` immediately after `/addresses`, and replies "No service fee — you're all set." See §3i for conforming/non-conforming classification.
+
 ### Signup to mix (needing 2+ more people)
 - Participant DMs: "list" or "open mixes" (or something similar)
 - Bot replies with summmary or open mixes, including a short identifier such as:
@@ -476,6 +493,30 @@ Two layers of script-type enforcement, both implemented:
 2. **Per-mix lock** (columns: `mixes.input_type`, `mixes.output_type`) — set by the first successful `/commit` and first `/addresses` to that mix. Subsequent commits/addresses must match the lock. This keeps the anonymity set within a mix to one type even when the operator allowlist permits multiple.
 
 The MVP keeps the allowlist single-entry (`p2wpkh`), which makes the per-mix lock redundant but already in place for the day the allowlist is widened.
+
+### 3i. Conforming vs non-conforming UTXOs
+
+Every committed UTXO is auto-classified against the mix's `output_size` (the user never declares which kind it is):
+
+- **Conforming** (`amount == output_size`): moved 1-input → 1-output unchanged to a fresh address. Pays **no service fee and no miner fee**. Can be contributed by anyone — a dedicated "conforming-only" participant, or alongside a non-conforming participant's own UTXOs. Conforming UTXOs exist to grow the anonymity set cheaply.
+- **Non-conforming** (`amount != output_size`): carved into equal `output_size` outputs + change. Its owner pays the miner fee (and the optional service fee). A non-conforming participant's **total inputs must be ≥ `output_size`**.
+
+**Mix sizing.** Each mix predefines two numbers:
+- `required_nonconforming` — the **exact** number of non-conforming *participants* the mix waits for. Participant-counted, not UTXO-counted: one participant may bring several non-conforming UTXOs (capped per participant by `MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT`).
+- `max_conforming_utxos` — the maximum number of conforming *UTXOs* the mix will absorb (a mining-fee burden the non-conforming participants subsidise).
+
+**Proceeding.** A mix advances to assembling as soon as it has `required_nonconforming` non-conforming participants — it does **not** wait for conforming UTXOs — **except** when `required_nonconforming == 1`, where it must also have ≥1 conforming UTXO so there are ≥2 equal outputs from distinct parties. If the deadline passes before the exact target is met, the mix cancels and refunds.
+
+**Miner fee.** Computed assuming the mix fills to `max_conforming_utxos` (deterministic). The conforming burden is split **evenly** across the non-conforming participants; each also pays a proportional share of the non-conforming portion of the tx (see §3e). Under-filled conforming slots → slightly higher effective fee (accepted).
+
+**Addresses.** One fresh address per conforming UTXO, plus at least one for a non-conforming participant's equal output. So the **required floor** is `(conforming_count + 1)` for a non-conforming participant, or `max(conforming_count, 1)` for a conforming-only one. A change address is **optional** — the `/commit` guidance still *recommends* one address per mixed output plus one for change, so users don't donate change unintentionally.
+
+**Leftover / change donation.** After the equal outputs and miner fee, any leftover from a non-conforming participant is handled by size against `MINIMUM_UTXO_SIZE` (the dust threshold):
+- **< dust:** folded into the miner fee (it can't form a spendable output).
+- **≥ dust, change address supplied:** a normal change output back to the participant.
+- **≥ dust, no change address:** the participant is **warned at `/addresses`** ("~N sats will be donated — re-send with one more address to keep it") and, at assembly, the excess is paid to `DONATION_ADDRESS` if configured, otherwise folded into the miner fee. The equal outputs are never sacrificed to make room for change (`nc_output_plan`). PRIVACY NOTE: a fixed `DONATION_ADDRESS` recurring across coinjoins is a linkable on-chain fingerprint; leaving it blank (fold-to-fee) is the privacy-maximising default.
+
+**Privacy floor.** The non-authoritative privacy check requires at least `required_nonconforming` equal `output_size` outputs (the "N distinct equal-output contributors" guard); conforming UTXOs only add more.
 
 ---
 
@@ -583,7 +624,10 @@ BTCPAY_API_KEY=456def...
 
 
 # Fee defaults
-FEE_PER_ELEMENT=100
+# Service fee (zap) per NON-conforming element (input + used output). 0 = no
+# zap requested (optional service fee, off by default). Conforming UTXOs are
+# always free regardless of this value.
+FEE_PER_ELEMENT=0
 FEE_MULTIPLIER=1.5
 MIN_FEE_RATE_SATS=1.5
 MAX_FEE_RATE_SATS=510
@@ -600,7 +644,16 @@ PAY_DEADLINE_HOURS=12
 MAX_GHOST_RETRIES=3
 MINIMUM_UTXO_SIZE=10000
 DEFAULT_MIX_OUTPUT_COUNT=4         # currently unused — see section 3g
-DEFAULT_MIX_USER_COUNT=3
+DEFAULT_MIX_USER_COUNT=3           # legacy min-participants seed for auto-created mixes
+
+# Conforming / non-conforming model (see §3i)
+DEFAULT_REQUIRED_NONCONFORMING=3              # exact # of non-conforming participants a new mix waits for
+MAX_CONFORMING_UTXOS=10                       # max conforming UTXOs a mix absorbs (miner fee assumes this many)
+MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT=10    # per-participant cap on non-conforming UTXOs
+# Above-dust change with no change address is paid here (else folded into the
+# miner fee). Blank = disabled. PRIVACY: a recurring operator address links
+# coinjoins on-chain; prefer leaving blank.
+DONATION_ADDRESS=
 
 # Operator script-type allowlist (comma-separated). Gates which UTXO types
 # the bot will accept at /commit and which output address types at /addresses.

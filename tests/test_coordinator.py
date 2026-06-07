@@ -155,8 +155,12 @@ class FakeLightningHandler:
 _db_paths: List[str] = []
 
 
-async def make_coord():
-    """Build a Coordinator wired to fakes + temp db."""
+async def make_coord(fee_per_element=None):
+    """Build a Coordinator wired to fakes + temp db.
+
+    ``fee_per_element`` overrides the config default (now 0) so tests that
+    exercise the service-fee / zap path can opt into a non-zero fee.
+    """
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
     _db_paths.append(db_path)
@@ -169,6 +173,8 @@ async def make_coord():
 
     # BotConfig falls back to its _DEFAULTS table when the env path doesn't exist.
     cfg = BotConfig("/nonexistent-env-for-tests.env")
+    if fee_per_element is not None:
+        cfg._values["FEE_PER_ELEMENT"] = fee_per_element
 
     nostr = FakeNostrHandler()
     chain = FakeChainMonitor()
@@ -346,11 +352,14 @@ class TestProvideAddressesPaidState:
 
     @pytest.mark.asyncio
     async def test_committed_participant_still_prompted_for_zap(self):
-        coord, db, nostr, chain, lightning = await make_coord()
+        # Service fee enabled (default is now 0 / no zap).
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
-            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
+                                         fee_per_element=100)
             npub = "npub_committed"
             pid = await db.add_participant(mix_id, npub, "")
+            # Non-conforming UTXO (!= output_size) so the service fee applies.
             await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.update_participant(pid, state="committed")
 
@@ -360,6 +369,30 @@ class TestProvideAddressesPaidState:
 
             last_dm = nostr.sent_dms[-1][1].lower()
             assert "zap" in last_dm
+            # Stays 'committed' until the zap arrives.
+            assert (await db.get_participant(pid))["state"] == "committed"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_zero_fee_skips_zap_and_marks_paid(self):
+        # Default config: FEE_PER_ELEMENT == 0 → no zap, straight to 'paid'.
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=3)
+            npub = "npub_nofee"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_provide_addresses(
+                FakeCtx(npub), npub, P2WPKH_ADDRS[0:3],
+            )
+
+            last_dm = nostr.sent_dms[-1][1].lower()
+            assert "zap" not in last_dm
+            assert "no service fee" in last_dm
+            assert (await db.get_participant(pid))["state"] == "paid"
         finally:
             await db.close()
 
@@ -1589,10 +1622,10 @@ class TestBroadcast409TreatedAsSuccess:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
-                                         max_participants=10)
+                                         max_participants=10, required_nonconforming=2)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
-            # Two well-funded participants.
+            # Two well-funded non-conforming participants.
             rich1 = await db.add_participant(mix_id, "rich1", "rich1@x")
             await db.update_participant(rich1, state="paid", fee_paid=500)
             await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -1605,12 +1638,13 @@ class TestBroadcast409TreatedAsSuccess:
             for addr in P2WPKH_ADDRS[3:6]:
                 await db.add_output(rich2, addr, 1_000_000)
 
-            # The under-funded one: exactly output_size sats. Passes the
-            # /addresses check (where estimated_fee_share=0) but fails at
-            # assembly once the proportional miner fee is applied.
+            # The under-funded one: a NON-conforming UTXO just barely above
+            # output_size. Passes the /addresses check (estimated_fee_share=0)
+            # but its non-conforming inputs can't fund one equal output once the
+            # proportional miner fee + conforming-burden share are applied.
             poor = await db.add_participant(mix_id, "poor", "poor@x")
             await db.update_participant(poor, state="paid", fee_paid=300)
-            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_001, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
 
             active = await db.get_participants_by_mix(mix_id)
@@ -1664,10 +1698,11 @@ class TestBroadcast409TreatedAsSuccess:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(output_size=1_000_000, min_participants=3,
-                                         max_participants=10)
+                                         max_participants=10, required_nonconforming=3)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
-            # Two rich + one poor. Dropping poor leaves 2 < min=3.
+            # Two rich + one poor. required_nonconforming=3; dropping poor
+            # leaves 2 non-conforming survivors < 3 → cancel the whole mix.
             rich1 = await db.add_participant(mix_id, "rich1m", "rich1m@x")
             await db.update_participant(rich1, state="paid", fee_paid=500)
             await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -1682,7 +1717,7 @@ class TestBroadcast409TreatedAsSuccess:
 
             poor = await db.add_participant(mix_id, "poorm", "poorm@x")
             await db.update_participant(poor, state="paid", fee_paid=300)
-            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_001, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
 
             active = await db.get_participants_by_mix(mix_id)
@@ -2159,11 +2194,12 @@ class TestOutpointReleasedOnCancel:
         coord, db, nostr, chain, lightning = await make_coord()
         try:
             mix_id = await db.create_mix(output_size=1_000_000, min_participants=2,
-                                         max_participants=10)
+                                         max_participants=10, required_nonconforming=2)
             await db.update_mix(mix_id, state="assembling", fee_rate=30)
 
             # Pattern from TestBroadcast409TreatedAsSuccess: two well-funded
-            # + one under-funded; the latter is dropped on assembly.
+            # + one under-funded (non-conforming, just above output_size); the
+            # latter is dropped on assembly.
             rich1 = await db.add_participant(mix_id, "rich_d1", "r1@x")
             await db.update_participant(rich1, state="paid", fee_paid=500)
             await db.add_utxo(rich1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
@@ -2178,7 +2214,7 @@ class TestOutpointReleasedOnCancel:
 
             poor = await db.add_participant(mix_id, "poor_d", "p@x")
             await db.update_participant(poor, state="paid", fee_paid=300)
-            await db.add_utxo(poor, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(poor, TXID[2], 0, 1_000_001, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.add_output(poor, P2WPKH_ADDRS[6], 1_000_000)
 
             await coord._assemble_psbt(await db.get_mix(mix_id),
@@ -2664,20 +2700,24 @@ class TestSumInvariantCancelsBadFeeMath:
             from src.fee_engine import FeeResult
             real_calc = coord.fee_engine.calculate_all_fees
 
-            def zero_fee_calc(participants_data, output_size, fee_rate):
+            def zero_fee_calc(participants_data, output_size, fee_rate, **kwargs):
                 # Build results where fee_share is 0 and change_sats =
-                # total_sats - num_equal * output_size → no miner fee.
+                # total_sats - num_equal * output_size → no miner fee. The
+                # new signature accepts the conforming-model kwargs and ignores
+                # them (this stub forces the degenerate zero-fee case).
                 results = []
                 for p in participants_data:
                     n_eq = p["total_sats"] // output_size
                     change = p["total_sats"] - n_eq * output_size
                     results.append(FeeResult(
-                        total_inputs=p["num_inputs"], total_sats=p["total_sats"],
+                        total_inputs=0, total_sats=p["total_sats"],
                         num_equal_outputs=n_eq,
                         num_change_outputs=1 if change >= 10000 else 0,
                         fee_share_sats=0,
                         change_sats=change if change >= 10000 else 0,
-                        service_fee_sats=500,
+                        service_fee_sats=0,
+                        conforming_count=p.get("conforming_count", 0),
+                        is_nonconforming=p.get("is_nonconforming", True),
                     ))
                 # total_vsize > 0 so MIN_FEE_RATE_SATS × vsize > 0 too.
                 return (200, 0, results)
@@ -2813,3 +2853,528 @@ class TestFeeRateConfigKnob:
         cfg = BotConfig("/nonexistent-env-for-tests.env")
         # Default from _DEFAULTS in src/config.py.
         assert cfg.FEE_LOOKBACK_BLOCKS == 6
+
+
+# --- Conforming / non-conforming UTXO model ---
+
+
+class TestConformingModel:
+    """Coverage for the conforming/non-conforming feature: classification at
+    /commit (caps), the conforming-only free flow, the optional service fee,
+    the required-non-conforming proceed gate, and mixed assembly."""
+
+    async def _interested(self, coord, db, mix_id, npub):
+        pid = await db.add_participant(mix_id, npub, f"{npub}@x")
+        return pid
+
+    @pytest.mark.asyncio
+    async def test_commit_enforces_conforming_cap(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_confcap"
+            pid = await self._interested(coord, db, mix_id, npub)
+
+            # Three conforming UTXOs (== output_size); cap is 2.
+            for v in (0, 1, 2):
+                chain.txouts[f"{TXID[0]}:{v}"] = _fake_txout(1_000_000)
+            utxos = [{"txid": TXID[0], "vout": v} for v in (0, 1, 2)]
+            await coord._cmd_commit_utxos(FakeCtx(npub), npub, utxos)
+
+            stored = await db.get_utxos_by_participant(pid)
+            assert len(stored) == 2, "conforming cap should have capped to 2"
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "conforming" in joined and "cap" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_commit_enforces_per_participant_nonconforming_cap(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT"] = 1
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_nccap"
+            pid = await self._interested(coord, db, mix_id, npub)
+
+            # Two non-conforming UTXOs; per-participant cap is 1.
+            for v in (0, 1):
+                chain.txouts[f"{TXID[1]}:{v}"] = _fake_txout(1_500_000)
+            utxos = [{"txid": TXID[1], "vout": v} for v in (0, 1)]
+            await coord._cmd_commit_utxos(FakeCtx(npub), npub, utxos)
+
+            stored = await db.get_utxos_by_participant(pid)
+            assert len(stored) == 1
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "non-conforming" in joined and "limit" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_conforming_only_participant_free_no_zap(self):
+        # Even with a service fee configured, a conforming-only participant
+        # pays nothing and is marked paid straight away.
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, fee_per_element=100,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_confonly"
+            pid = await self._interested(coord, db, mix_id, npub)
+            await db.add_utxo(pid, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            # One conforming UTXO → one address suffices.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "paid"
+            last = nostr.sent_dms[-1][1].lower()
+            assert "zap" not in last and "no service fee" in last
+            outs = await db.get_outputs_by_participant(pid)
+            assert len(outs) == 1 and outs[0]["amount"] == 1_000_000
+            assert outs[0]["is_change"] in (0, False)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_conforming_only_address_count_enforced(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_addrcount"
+            pid = await self._interested(coord, db, mix_id, npub)
+            # Two conforming UTXOs need two fresh addresses.
+            await db.add_utxo(pid, TXID[3], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(pid, TXID[3], 1, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+            assert "at least 2" in nostr.sent_dms[-1][1].lower()
+            assert (await db.get_participant(pid))["state"] == "committed"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_nonconforming_total_below_output_size_rejected(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, min_participants=2)
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_small"
+            pid = await self._interested(coord, db, mix_id, npub)
+            # Non-conforming but too small to fund one full output.
+            await db.add_utxo(pid, TXID[4], 0, 400_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_provide_addresses(
+                FakeCtx(npub), npub, P2WPKH_ADDRS[0:2],
+            )
+            assert "below one" in nostr.sent_dms[-1][1].lower()
+            assert (await db.get_participant(pid))["state"] == "committed"
+        finally:
+            await db.close()
+
+    async def _add_paid_nc(self, db, mix_id, npub, vout, total=2_000_000):
+        pid = await db.add_participant(mix_id, npub, f"{npub}@x")
+        await db.add_utxo(pid, TXID[0], vout, total, "p2wpkh", FAKE_SCRIPTPUBKEY)
+        await db.add_output(pid, P2WPKH_ADDRS[vout % len(P2WPKH_ADDRS)], 1_000_000)
+        await db.update_participant(pid, state="paid")
+        return pid
+
+    @pytest.mark.asyncio
+    async def test_proceed_waits_for_required_nonconforming(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            # One paid NC participant — not enough yet.
+            await self._add_paid_nc(db, mix_id, "ncA", 0)
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "collecting"
+
+            # Second NC participant → target met → advances to assembling.
+            await self._add_paid_nc(db, mix_id, "ncB", 1)
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "assembling"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_solo_nonconforming_needs_a_conforming_utxo(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=1, required_nonconforming=1,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            # Single NC participant, no conforming present → must NOT proceed.
+            await self._add_paid_nc(db, mix_id, "soloNC", 0)
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "collecting"
+
+            # A conforming-only participant joins → now there are >=2 equal
+            # outputs from distinct parties → proceed.
+            cpid = await db.add_participant(mix_id, "conf", "conf@x")
+            await db.add_utxo(cpid, TXID[1], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(cpid, P2WPKH_ADDRS[5], 1_000_000)
+            await db.update_participant(cpid, state="paid")
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert (await db.get_mix(mix_id))["state"] == "assembling"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_assembly_with_conforming_participant_pays_no_fee(self):
+        """Two non-conforming + one conforming-only participant assemble. The
+        conforming-only participant's fee_share is 0; the NC participants carry
+        the miner fee; the tx is built and advances to signing."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="assembling", fee_rate=30,
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            nc1 = await db.add_participant(mix_id, "asmNC1", "n1@x")
+            await db.update_participant(nc1, state="paid", fee_paid=0)
+            await db.add_utxo(nc1, TXID[0], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(nc1, addr, 1_000_000)
+
+            nc2 = await db.add_participant(mix_id, "asmNC2", "n2@x")
+            await db.update_participant(nc2, state="paid", fee_paid=0)
+            await db.add_utxo(nc2, TXID[1], 0, 3_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            for addr in P2WPKH_ADDRS[3:6]:
+                await db.add_output(nc2, addr, 1_000_000)
+
+            conf = await db.add_participant(mix_id, "asmConf", "c@x")
+            await db.update_participant(conf, state="paid", fee_paid=0)
+            await db.add_utxo(conf, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(conf, P2WPKH_ADDRS[6], 1_000_000)
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+            # Conforming-only participant: no miner fee deducted.
+            assert (await db.get_participant(conf))["fee_share"] in (0, None) or \
+                (await db.get_participant(conf))["fee_share"] == 0
+            # NC participants carry a positive fee share.
+            assert (await db.get_participant(nc1))["fee_share"] > 0
+            assert (await db.get_participant(nc2))["fee_share"] > 0
+            # All three got a PSBT round / are signing.
+            for pid in (nc1, nc2, conf):
+                assert (await db.get_participant(pid))["state"] == "signing"
+        finally:
+            await db.close()
+
+
+# --- Conforming / non-conforming model: gap-closing tests ---
+
+
+class TestConformingModelGaps:
+    """Closes the highest-priority gaps from the status doc's critical analysis:
+    mixed conforming+NC participant (layout + assembly), conforming-only
+    multi-UTXO layout, cap accumulation across participants/commits, and the
+    mix-level deadline cancel when the non-conforming target is never met."""
+
+    async def _interested(self, db, mix_id, npub):
+        return await db.add_participant(mix_id, npub, f"{npub}@x")
+
+    async def _commit(self, coord, chain, npub, utxos):
+        """utxos: list of (txid, vout, amount). Sets chain txouts then commits."""
+        for (txid, vout, amt) in utxos:
+            chain.txouts[f"{txid}:{vout}"] = _fake_txout(amt)
+        await coord._cmd_commit_utxos(
+            FakeCtx(npub), npub,
+            [{"txid": t, "vout": v} for (t, v, _a) in utxos],
+        )
+
+    # ---- Gap #1: a participant bringing BOTH conforming and non-conforming ----
+
+    @pytest.mark.asyncio
+    async def test_mixed_participant_addresses_layout(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "mixed1"
+            pid = await self._interested(db, mix_id, npub)
+            # 1 conforming (1M) + 1 non-conforming (2.5M).
+            await self._commit(coord, chain, npub, [
+                (TXID[0], 0, 1_000_000),
+                (TXID[0], 1, 2_500_000),
+            ])
+            # NC participant needs conforming(1) + 2 = 3 addresses; give 4.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:4])
+
+            outs = await db.get_outputs_by_participant(pid)
+            # Layout: conforming(1M, not change) + 2 NC equal(1M) + change(0.5M).
+            assert len(outs) == 4
+            assert outs[0]["amount"] == 1_000_000 and not outs[0]["is_change"]
+            equal_1m = [o for o in outs if o["amount"] == 1_000_000]
+            assert len(equal_1m) == 3  # 1 conforming + 2 NC-derived
+            changes = [o for o in outs if o["is_change"]]
+            assert len(changes) == 1 and changes[0]["amount"] == 500_000
+            # FEE_PER_ELEMENT=0 → straight to paid, no zap.
+            assert (await db.get_participant(pid))["state"] == "paid"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_mixed_participant_too_few_addresses_rejected(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "mixed_few"
+            pid = await self._interested(db, mix_id, npub)
+            await self._commit(coord, chain, npub, [
+                (TXID[0], 0, 1_000_000),   # conforming
+                (TXID[0], 1, 2_500_000),   # non-conforming
+            ])
+            # Floor is conforming(1) + 1 = 2 (change address optional). Give
+            # only 1 → rejected, stays committed.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+            assert "at least 2" in nostr.sent_dms[-1][1].lower()
+            assert (await db.get_participant(pid))["state"] == "committed"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_above_dust_leftover_donated_when_no_change_address(self, caplog):
+        """Dust-donation feature: a non-conforming participant who supplies only
+        an equal-output address (no change address) and has above-dust leftover
+        is warned at /addresses and the excess is paid to DONATION_ADDRESS at
+        assembly."""
+        import logging
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["DONATION_ADDRESS"] = P2WPKH_ADDRS[7]
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # A: pure NC 2.5M, only ONE address → 1 equal output, ~1.5M donated.
+            a = await self._interested(db, mix_id, "donA")
+            await self._commit(coord, chain, "donA", [(TXID[0], 0, 2_500_000)])
+            await coord._cmd_provide_addresses(FakeCtx("donA"), "donA", [P2WPKH_ADDRS[0]])
+            warn = nostr.sent_dms[-1][1].lower()
+            assert "donated" in warn and "re-send /addresses" in warn
+            assert (await db.get_participant(a))["state"] == "paid"
+            # Only the equal output is stored — the donation is added at assembly.
+            outs = await db.get_outputs_by_participant(a)
+            assert len(outs) == 1 and outs[0]["amount"] == 1_000_000
+
+            # B: normal NC with enough addresses.
+            b = await self._interested(db, mix_id, "donB")
+            await self._commit(coord, chain, "donB", [(TXID[1], 0, 3_000_000)])
+            await coord._cmd_provide_addresses(FakeCtx("donB"), "donB", P2WPKH_ADDRS[2:5])
+
+            with caplog.at_level(logging.INFO, logger="src.coordinator"):
+                await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+                await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+            logs = " ".join(r.message.lower() for r in caplog.records)
+            assert "donated" in logs  # assembly emitted the donation log line
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_above_dust_leftover_folds_to_fee_without_donation_address(self):
+        """When no DONATION_ADDRESS is configured, an above-dust leftover with no
+        change address folds into the miner fee (no operator output)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # DONATION_ADDRESS left blank (default).
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+            a = await self._interested(db, mix_id, "feeA")
+            await self._commit(coord, chain, "feeA", [(TXID[0], 0, 2_500_000)])
+            await coord._cmd_provide_addresses(FakeCtx("feeA"), "feeA", [P2WPKH_ADDRS[0]])
+            b = await self._interested(db, mix_id, "feeB")
+            await self._commit(coord, chain, "feeB", [(TXID[1], 0, 3_000_000)])
+            await coord._cmd_provide_addresses(FakeCtx("feeB"), "feeB", P2WPKH_ADDRS[2:5])
+
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            # Reaches signing; the leftover became miner fee (no donation output,
+            # no crash from a missing donation address).
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_mixed_participant_assembly_preserves_conforming(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # Mixed: 1 conforming + 1 NC; plain: NC only.
+            mixed = await self._interested(db, mix_id, "mx")
+            await self._commit(coord, chain, "mx", [
+                (TXID[0], 0, 1_000_000), (TXID[0], 1, 2_500_000),
+            ])
+            await coord._cmd_provide_addresses(FakeCtx("mx"), "mx", P2WPKH_ADDRS[0:4])
+
+            plain = await self._interested(db, mix_id, "pl")
+            await self._commit(coord, chain, "pl", [(TXID[1], 0, 3_000_000)])
+            await coord._cmd_provide_addresses(FakeCtx("pl"), "pl", P2WPKH_ADDRS[4:7])
+
+            # collecting → assembling → signing
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+            mp = await db.get_participant(mixed)
+            pp = await db.get_participant(plain)
+            # Both non-conforming participants carry a positive miner-fee share.
+            assert mp["fee_share"] > 0 and pp["fee_share"] > 0
+            # Conforming preservation: mixed participant's total outputs (which
+            # the PSBT pays to their addresses) == total inputs − fee_share.
+            # change_amount is persisted; equal outputs are full output_size.
+            # total_out = (conforming + nc_equal)*size + change == 3.5M − fee.
+            # We can't read nc_equal directly post-assembly, but the sum
+            # invariant having passed (state==signing) guarantees it.
+            assert mp["change_amount"] >= 0
+        finally:
+            await db.close()
+
+    # ---- Gap #2: conforming-only with >=2 UTXOs → >=2 equal outputs ----
+
+    @pytest.mark.asyncio
+    async def test_conforming_only_two_utxos_two_outputs(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "conf2"
+            pid = await self._interested(db, mix_id, npub)
+            await self._commit(coord, chain, npub, [
+                (TXID[2], 0, 1_000_000), (TXID[2], 1, 1_000_000),
+            ])
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:2])
+
+            outs = await db.get_outputs_by_participant(pid)
+            assert len(outs) == 2
+            assert all(o["amount"] == 1_000_000 and not o["is_change"] for o in outs)
+            assert (await db.get_participant(pid))["state"] == "paid"
+        finally:
+            await db.close()
+
+    # ---- Gap #3: conforming cap accumulates across participants ----
+
+    @pytest.mark.asyncio
+    async def test_conforming_cap_accumulates_across_participants(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2,
+                required_nonconforming=2, max_conforming_utxos=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+
+            a = await self._interested(db, mix_id, "capA")
+            await self._commit(coord, chain, "capA", [
+                (TXID[0], 0, 1_000_000), (TXID[0], 1, 1_000_000),  # fills cap (2)
+            ])
+            assert len(await db.get_utxos_by_participant(a)) == 2
+
+            b = await self._interested(db, mix_id, "capB")
+            await self._commit(coord, chain, "capB", [(TXID[1], 0, 1_000_000)])
+            # B's conforming UTXO is rejected — the mix-wide cap is already full.
+            assert len(await db.get_utxos_by_participant(b)) == 0
+            joined = " ".join(m for r, m in nostr.sent_dms if r == "capB").lower()
+            assert "conforming" in joined and "cap" in joined
+        finally:
+            await db.close()
+
+    # ---- Gap #4: per-participant NC cap accumulates across multiple commits ----
+
+    @pytest.mark.asyncio
+    async def test_nonconforming_cap_accumulates_across_commits(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT"] = 2
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+            )
+            await db.update_mix(mix_id, state="collecting")
+            npub = "nccap2"
+            pid = await self._interested(db, mix_id, npub)
+
+            # First commit: 1 NC.
+            await self._commit(coord, chain, npub, [(TXID[3], 0, 1_500_000)])
+            assert len(await db.get_utxos_by_participant(pid)) == 1
+
+            # Second commit: 2 more NC; only 1 fits under the cap of 2.
+            await self._commit(coord, chain, npub, [
+                (TXID[3], 1, 1_600_000), (TXID[3], 2, 1_700_000),
+            ])
+            stored = await db.get_utxos_by_participant(pid)
+            assert len(stored) == 2
+            joined = " ".join(m for r, m in nostr.sent_dms if r == npub).lower()
+            assert "non-conforming" in joined and "limit" in joined
+        finally:
+            await db.close()
+
+    # ---- Gap #5: deadline cancels when the NC target is never met ----
+
+    @pytest.mark.asyncio
+    async def test_deadline_cancels_when_target_not_met(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, min_participants=2, required_nonconforming=2,
+                deadline_unix=int(time.time()) - 100,  # already past
+            )
+            await db.update_mix(mix_id, state="collecting")
+            # Only ONE non-conforming participant is ready — below the target of 2.
+            pid = await db.add_participant(mix_id, "lonely", "lonely@x")
+            await db.add_utxo(pid, TXID[0], 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(pid, P2WPKH_ADDRS[0], 1_000_000)
+            await db.update_participant(pid, state="paid")
+
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+        finally:
+            await db.close()

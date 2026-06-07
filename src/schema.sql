@@ -3,11 +3,19 @@
 
 CREATE TABLE IF NOT EXISTS mixes (
     id              TEXT PRIMARY KEY,          -- human-readable name (east-gate)
-    output_size     INTEGER NOT NULL,          -- sats per equal output
+    output_size     INTEGER NOT NULL,          -- sats per equal output; a UTXO of exactly this size is "conforming"
     min_participants INTEGER NOT NULL DEFAULT 3,
     max_participants INTEGER,
+    -- Conforming/non-conforming model:
+    --   required_nonconforming = exact number of non-conforming participants
+    --     the mix waits for before assembling (the fee-split denominator).
+    --   max_conforming_utxos   = cap on conforming UTXOs the mix absorbs; the
+    --     miner fee is computed assuming this many, split evenly across the
+    --     non-conforming participants.
+    required_nonconforming INTEGER NOT NULL DEFAULT 3,
+    max_conforming_utxos INTEGER NOT NULL DEFAULT 10,
     fee_rate        INTEGER DEFAULT 30,        -- sats/vbyte, set at assembly
-    fee_per_element INTEGER DEFAULT 100,       -- sats, zap fee per input+output
+    fee_per_element INTEGER DEFAULT 0,         -- sats, service-fee zap per non-conforming element; 0 = no zap
     state           TEXT NOT NULL DEFAULT 'announced',
     -- announced | collecting | assembling | signing | broadcast | completed | cancelled
     deadline_unix   INTEGER,

@@ -26,7 +26,12 @@ _DEFAULTS = {
     "BTCPAY_API_KEY": "",
 
     # Fee defaults
-    "FEE_PER_ELEMENT": 100,
+    # Service fee (Lightning zap) per non-conforming element (input + used
+    # output). 0 disables the zap entirely: no payment is requested, the
+    # 'paid' gate is skipped, and conforming UTXOs are always free regardless.
+    # Conforming inputs/outputs NEVER incur a service fee; only non-conforming
+    # elements are counted when this is > 0.
+    "FEE_PER_ELEMENT": 0,
     "FEE_MULTIPLIER": 1.5,
     "MIN_FEE_RATE_SATS": 1.5,
     "MAX_FEE_RATE_SATS": 510,
@@ -49,6 +54,31 @@ _DEFAULTS = {
     "MINIMUM_UTXO_SIZE": 10000,
     "DEFAULT_MIX_OUTPUT_COUNT": 4,
     "DEFAULT_MIX_USER_COUNT": 3,
+
+    # --- Conforming / non-conforming UTXO model ---
+    # A UTXO is "conforming" when its amount == the mix's output_size: it is
+    # moved 1-input→1-output unchanged, pays NO service fee and NO miner fee.
+    # A "non-conforming" UTXO (amount != output_size) is carved into equal
+    # output_size outputs plus change, and its owner pays the miner fee.
+    #
+    # Mixes are sized by the number of *non-conforming participants* they
+    # require (an exact target), plus a cap on how many *conforming UTXOs*
+    # they will absorb (a mining-fee burden the non-conforming participants
+    # subsidise). Defaults below seed auto-created mixes.
+    "DEFAULT_REQUIRED_NONCONFORMING": 3,   # exact # of non-conforming participants a new mix waits for
+    "MAX_CONFORMING_UTXOS": 10,            # max conforming UTXOs a mix will absorb (fee assumes this many)
+    "MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT": 10,  # cap on NC UTXOs one participant may bring
+
+    # Address to receive donated above-dust change when a non-conforming
+    # participant supplies fewer addresses than their outputs need. Below-dust
+    # leftovers fold into the miner fee; above-dust leftovers without a change
+    # address are sent here (the participant is warned and can re-send
+    # /addresses to reclaim). Blank disables it — then above-dust leftovers
+    # also fold into the miner fee.
+    # PRIVACY NOTE: a fixed operator address recurring across coinjoins is a
+    # stable on-chain fingerprint that links those mixes. Prefer leaving this
+    # blank (fold-to-fee) for a privacy-maximising deployment.
+    "DONATION_ADDRESS": "",
 
     "BROADCAST_CHECK_INTERVAL_HOURS": 24,
     # Hour-of-day (UTC) at which the daily announcement post fires. 14 UTC =
@@ -128,6 +158,17 @@ class BotConfig:
         # Enforce MIN_PARTICIPANTS_DEFAULT >= 2
         if self.MIN_PARTICIPANTS_DEFAULT < 2:
             self._values["MIN_PARTICIPANTS_DEFAULT"] = 2
+
+        # A mix must require at least one non-conforming participant — they are
+        # the only parties that pay the miner fee, so a zero-NC mix could never
+        # fund a broadcast. Upgrade to 1 rather than reject (mirrors the
+        # MIN_PARTICIPANTS_DEFAULT clamp above).
+        if self.DEFAULT_REQUIRED_NONCONFORMING < 1:
+            self._values["DEFAULT_REQUIRED_NONCONFORMING"] = 1
+
+        # Service fee can't be negative. 0 is valid (disables zaps).
+        if self.FEE_PER_ELEMENT < 0:
+            self._values["FEE_PER_ELEMENT"] = 0
 
         # DEFAULT_OUTPUT_SIZE must be >= MINIMUM_UTXO_SIZE — otherwise every
         # equal output we produce is below Bitcoin's standardness dust limit
@@ -268,6 +309,22 @@ class BotConfig:
     @property
     def DEFAULT_MIX_USER_COUNT(self) -> int:
         return self._values["DEFAULT_MIX_USER_COUNT"]
+
+    @property
+    def DEFAULT_REQUIRED_NONCONFORMING(self) -> int:
+        return self._values["DEFAULT_REQUIRED_NONCONFORMING"]
+
+    @property
+    def MAX_CONFORMING_UTXOS(self) -> int:
+        return self._values["MAX_CONFORMING_UTXOS"]
+
+    @property
+    def MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT(self) -> int:
+        return self._values["MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT"]
+
+    @property
+    def DONATION_ADDRESS(self) -> str:
+        return self._values["DONATION_ADDRESS"]
 
     @property
     def BROADCAST_CHECK_INTERVAL_HOURS(self) -> int:

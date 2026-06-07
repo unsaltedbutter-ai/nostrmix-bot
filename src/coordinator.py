@@ -279,6 +279,8 @@ class Coordinator:
             max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
             fee_per_element=self.cfg.FEE_PER_ELEMENT,
             deadline_unix=deadline,
+            required_nonconforming=self.cfg.DEFAULT_REQUIRED_NONCONFORMING,
+            max_conforming_utxos=self.cfg.MAX_CONFORMING_UTXOS,
         )
         await self.db.update_mix(mid, state="collecting", input_type=input_type)
         logger.info("Auto-created mix %s for input_type=%s", tokens.m(mid), input_type)
@@ -357,6 +359,27 @@ class Coordinator:
         locked_input_type: Optional[str] = mix.get("input_type") if mix else None
         candidate_lock_type: Optional[str] = locked_input_type
 
+        # Conforming / non-conforming caps. A conforming UTXO (amount ==
+        # output_size) is a 1->1 free pass-through; the mix absorbs at most
+        # max_conforming_utxos of them (a miner-fee burden the non-conforming
+        # participants subsidise). A participant may bring at most
+        # MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT non-conforming UTXOs.
+        output_size = mix["output_size"] if mix else self.cfg.DEFAULT_OUTPUT_SIZE
+        max_conforming = mix.get("max_conforming_utxos") if mix else None
+        if max_conforming is None:
+            max_conforming = self.cfg.MAX_CONFORMING_UTXOS
+        max_nc_per_p = self.cfg.MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT
+        mix_conforming_existing = sum(
+            1 for u in await self.db.get_utxos_for_mix(mix_id)
+            if u["amount"] == output_size
+        )
+        pid_nc_existing = sum(
+            1 for u in await self.db.get_utxos_by_participant(pid)
+            if u["amount"] != output_size
+        )
+        accepted_conforming = 0
+        accepted_nc = 0
+
         # M2: batch rejections into a single summary DM instead of spamming
         # one DM per bad UTXO. A user pasting 50 outpoints (or a griefer
         # pasting nonsense) used to get one DM per row; that exhausts the
@@ -424,6 +447,23 @@ class Coordinator:
                 )
                 continue
 
+            # Conforming/non-conforming cap enforcement.
+            is_conforming = (amount == output_size)
+            if is_conforming:
+                if mix_conforming_existing + accepted_conforming + 1 > max_conforming:
+                    rejections.append(
+                        (outpoint,
+                         f"conforming-UTXO cap ({max_conforming}) for this mix is full"),
+                    )
+                    continue
+            else:
+                if pid_nc_existing + accepted_nc + 1 > max_nc_per_p:
+                    rejections.append(
+                        (outpoint,
+                         f"over the {max_nc_per_p} non-conforming UTXO limit per participant"),
+                    )
+                    continue
+
             try:
                 await self.db.add_utxo(pid, txid, vout, amount, script_type, scriptpubkey)
             except sqlite3.IntegrityError:
@@ -432,6 +472,10 @@ class Coordinator:
                 )
                 continue
             await self.db.mark_utxo_used(pid, txid, vout)
+            if is_conforming:
+                accepted_conforming += 1
+            else:
+                accepted_nc += 1
             valid_utxos.append({"txid": txid, "vout": vout, "amount": amount, "script_type": script_type, "scriptpubkey": scriptpubkey})
             total_sats += amount
 
@@ -452,17 +496,36 @@ class Coordinator:
         # Update participant state
         await self.db.update_participant(pid, state="committed")
 
-        # Tell them we need addresses now
+        # Address requirement depends on the conforming/non-conforming split of
+        # ALL the participant's committed UTXOs (this commit + any prior ones).
+        all_utxos = await self.db.get_utxos_by_participant(pid)
+        conforming_total = sum(1 for u in all_utxos if u["amount"] == output_size)
+        has_nc = any(u["amount"] != output_size for u in all_utxos)
+        # Required floor: one fresh address per conforming UTXO, plus at least
+        # one for a non-conforming participant's equal output. We RECOMMEND one
+        # more for change so leftover sats aren't donated unintentionally.
+        min_addrs = (conforming_total + 1) if has_nc else max(conforming_total, 1)
+        recommended = (conforming_total + 2) if has_nc else max(conforming_total, 1)
+        guidance = (
+            f"Provide at least {min_addrs} output address(es) with /addresses "
+            f"<addr1> <addr2> ..."
+        )
+        if has_nc:
+            guidance += (
+                f"\nTip: send one address per mixed output PLUS one for change "
+                f"(≈{recommended} total). Without a change address, any above-dust "
+                f"leftover is donated."
+            )
         await self.nostr.send_dm(
             npub_hex,
             f"{len(valid_utxos)} UTXO(s) registered, total {total_sats / 1e8:.4f} BTC.\n"
-            f"Provide {len(valid_utxos) + 1}+ output addresses with /addresses <addr1> <addr2> ..."
+            + guidance
         )
 
     async def _cmd_provide_addresses(self, ctx: SenderContext, npub_hex: str, addrs: List[str]):
         """Handle /addresses <addr> ... — register output addresses."""
-        if len(addrs) < 2:
-            await self.nostr.send_dm(npub_hex, "You need to send us at least 2 addresses.")
+        if not addrs:
+            await self.nostr.send_dm(npub_hex, "Send me at least one output address.")
             return
 
         # Operator allowlist for output types. Reject the whole batch if any
@@ -547,63 +610,119 @@ class Coordinator:
                 )
                 return
 
-        # Get participant's UTXOs to calculate fee
-        utxos = await self.db.get_utxos_by_participant(pid)
-        num_inputs = len(utxos)
-        total_sats = sum(u["amount"] for u in utxos)
-
+        # Get participant's UTXOs and classify against the mix's output size.
         output_size = mix["output_size"]
-        fee_per_element = mix["fee_per_element"]
+        utxos = await self.db.get_utxos_by_participant(pid)
+        total_sats = sum(u["amount"] for u in utxos)
+        conforming_count = sum(1 for u in utxos if u["amount"] == output_size)
+        num_nc_inputs = sum(1 for u in utxos if u["amount"] != output_size)
+        is_nc = num_nc_inputs > 0
+        nc_total = sum(u["amount"] for u in utxos if u["amount"] != output_size)
 
-        # Calculate service fee using the FeeEngine
-        service_fee = self.fee_engine.calculate_service_fee(num_inputs, len(addrs))
+        # Address-count rule: one fresh address per conforming UTXO, plus at
+        # least one for a non-conforming participant's equal output. A change
+        # address is OPTIONAL — if omitted, any above-dust leftover is donated
+        # (and the user is warned) rather than blocking the join.
+        min_addrs = (conforming_count + 1) if is_nc else max(conforming_count, 1)
+        if len(addrs) < min_addrs:
+            await self.nostr.send_dm(
+                npub_hex,
+                f"This commit needs at least {min_addrs} output address(es) "
+                f"({conforming_count} conforming UTXO(s)"
+                + (" + an equal output" if is_nc else "")
+                + f"). You sent {len(addrs)}.",
+            )
+            return
 
-        # Determine outputs
-        num_equal, num_change, eq_amt, chg_amt = self.fee_engine.determine_outputs(
-            total_sats, output_size, len(addrs),
-            0,  # estimated miner fee (to be finalized later)
-            service_fee,
+        # Non-conforming participants must bring enough to fund at least one
+        # full equal output (Q4: total inputs >= output_size).
+        if is_nc and total_sats < output_size:
+            await self.nostr.send_dm(
+                npub_hex,
+                f"Your inputs total {total_sats} sats, below one {output_size}-sat "
+                f"output. Commit more before joining as a mixer.",
+            )
+            return
+
+        # Preliminary non-conforming output layout (real miner fee is unknown
+        # until assembly, so estimate with fee_share=0 — the maximum equal-output
+        # count; assembly only ever trims it). nc_output_plan never sacrifices an
+        # equal output to make room for change.
+        addrs_for_nc = max(0, len(addrs) - conforming_count)
+        num_equal, num_change, chg_amt = self.fee_engine.nc_output_plan(
+            nc_total, output_size, addrs_for_nc, 0,
         )
+        total_equal = conforming_count + num_equal
+        # Spare address for the above-dust leftover? If not, it gets donated.
+        spare_change_addr = addrs_for_nc > num_equal
+        will_donate = bool(num_change) and chg_amt > 0 and not spare_change_addr
 
-        num_used_outputs = num_equal + num_change
-
-        if num_used_outputs == 0:
+        if total_equal == 0:
             await self.nostr.send_dm(npub_hex, "Your inputs are insufficient for even one output.")
             return
 
-        # Store addresses. If this is a ghost-recovery resubmission, clear the
+        # Service fee — charged ONLY on non-conforming inputs and their derived
+        # outputs. Conforming pass-throughs are always free. With
+        # FEE_PER_ELEMENT=0 this is 0 and no zap is requested.
+        service_fee = self.fee_engine.calculate_service_fee(
+            num_nc_inputs, num_equal + num_change,
+            fee_per_element=mix.get("fee_per_element"),
+        )
+
+        # Store outputs. If this is a ghost-recovery resubmission, clear the
         # stale outputs first so we don't double-count.
         if already_paid:
             await self.db.delete_outputs_by_participant(pid)
 
-        # Save them in order: equal outputs use first num_equal addresses, then
-        # one change output at index num_equal (if change is large enough).
-        for i, addr in enumerate(addrs):
-            amount = output_size if i < num_equal else (chg_amt if i == num_equal else 0)
-            if amount > 0:
-                await self.db.add_output(pid, addr, amount, is_change=(i >= num_equal))
+        # Lay out in order: conforming pass-throughs, then NC equal outputs, then
+        # a change output ONLY if the participant supplied a spare address. The
+        # donation case (no spare address) is NOT stored here — it's added to the
+        # tx at assembly, paid to DONATION_ADDRESS (or folded into the fee).
+        idx = 0
+        for _ in range(conforming_count):
+            if idx < len(addrs):
+                await self.db.add_output(pid, addrs[idx], output_size, is_change=False)
+                idx += 1
+        for _ in range(num_equal):
+            if idx < len(addrs):
+                await self.db.add_output(pid, addrs[idx], output_size, is_change=False)
+                idx += 1
+        if num_change > 0 and chg_amt > 0 and spare_change_addr and idx < len(addrs):
+            await self.db.add_output(pid, addrs[idx], chg_amt, is_change=True)
+            idx += 1
 
-        # Calculate final service fee
-        final_service_fee = self.fee_engine.calculate_service_fee(num_inputs, num_used_outputs)
-
+        # State transition + messaging. 'paid' is the universal ready state.
+        summary = (
+            f"{total_equal} output(s) @ {output_size / 1e8:.4f} BTC each"
+            + (f" + {chg_amt / 1e8:.4f} BTC change" if num_change and chg_amt > 0 and spare_change_addr else "")
+            + "."
+        )
+        # Warn about an above-dust leftover that will be donated for lack of a
+        # change address. Approximate (real fee is applied at assembly).
+        donation_note = ""
+        if will_donate:
+            donation_note = (
+                f"\n⚠️ ~{chg_amt} sats of change will be DONATED — you didn't include "
+                f"a change address. Re-send /addresses with {len(addrs) + 1} addresses "
+                f"(one extra) to keep it."
+            )
         if already_paid:
-            # No zap prompt — they've already paid in a prior round.
+            new_state = "paid"
             await self.nostr.send_dm(
                 npub_hex,
-                f"{num_equal} outputs @ {eq_amt / 1e8:.4f} BTC each."
-                + (f" + {chg_amt / 1e8:.4f} BTC change." if num_change and chg_amt > 0 else "")
-                + "\nYou're already paid up; waiting for the mix to refill."
+                summary + donation_note + "\nYou're already paid up; waiting for the mix to refill.",
+            )
+        elif service_fee <= 0:
+            new_state = "paid"
+            await self.nostr.send_dm(
+                npub_hex, summary + donation_note + f"\nNo service fee — you're all set for {mix_id}.",
             )
         else:
+            new_state = "committed"
             await self.nostr.send_dm(
                 npub_hex,
-                f"{num_equal} outputs @ {eq_amt / 1e8:.4f} BTC each."
-                + (f" + {chg_amt / 1e8:.4f} BTC change." if num_change and chg_amt > 0 else "")
-                + f"\nPay {final_service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}."
+                summary + donation_note + f"\nPay {service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}.",
             )
-
-        # Preserve 'paid' across resubmission; only move 'committed' rows forward.
-        new_state = "paid" if already_paid else "committed"
         await self.db.update_participant(pid, state=new_state, change_amount=chg_amt)
 
         # Set the mix-level output lock if this was the first /addresses.
@@ -842,15 +961,23 @@ class Coordinator:
         if not mix:
             return
 
-        # Calculate expected fee
+        # Calculate expected service fee. Only NON-conforming inputs and their
+        # derived outputs are charged; conforming UTXOs (amount == output_size)
+        # are free pass-throughs. Conforming outputs and NC-equal outputs both
+        # have amount == output_size, so we can't tell them apart by value —
+        # subtract the conforming UTXO count from the total used outputs to get
+        # the NC-derived output count.
         utxos = await self.db.get_utxos_by_participant(pid)
         outputs = await self.db.get_outputs_by_participant(pid)
-        num_inputs = len(utxos)
+        output_size = mix["output_size"]
+        nc_inputs = sum(1 for u in utxos if u["amount"] != output_size)
+        conforming_count = sum(1 for u in utxos if u["amount"] == output_size)
+        total_used = sum(1 for o in outputs if o["amount"] > 0)
+        nc_used = max(0, total_used - conforming_count)
 
-        # Count used outputs (those with positive amount)
-        num_used = sum(1 for o in outputs if o["amount"] > 0)
-
-        expected_fee = self.fee_engine.calculate_service_fee(num_inputs, num_used)
+        expected_fee = self.fee_engine.calculate_service_fee(
+            nc_inputs, nc_used, fee_per_element=mix.get("fee_per_element"),
+        )
 
         # Validate payment — partial payments are the same as no payment
         if amount_sats >= expected_fee:
@@ -868,15 +995,9 @@ class Coordinator:
                 )
             await self.db.update_participant(pid, fee_paid=amount_sats, state="paid")
             await self.nostr.send_dm(npub_hex, f"Payment of {amount_sats} sats accepted for {mix_id}.")
-
-            # Check if mix is now full
-            count = await self.db.count_participants_by_mix(mix_id, exclude_states=["cancelled", "ghosted", "refunding", "refunded", "refund_failed"])
-            max_part = mix.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
-            min_part = mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT)
-
-            if count >= max_part or count >= min_part:
-                # Proceed to assembly if already enough
-                pass  # coordinator will handle in event loop
+            # The collecting-state tick checks readiness (_classify_ready) and
+            # advances the mix to assembling once the non-conforming target is
+            # met — no need to duplicate that decision here.
         else:
             await self.nostr.send_dm(
                 npub_hex,
@@ -984,17 +1105,26 @@ class Coordinator:
                 active = [p for p in active if p["state"] not in ("cancelled", "ghosted", "completed",
                                                           "refunding", "refunded", "refund_failed")]
 
-                # Mix-level deadline
-                deadline = mix.get("deadline_unix")
-                if deadline and now >= deadline:
-                    # Only paid participants count toward the proceed-or-cancel decision.
-                    paid = [p for p in active if p["state"] == "paid"]
-                    if len(paid) < 2:
-                        await self._cancel_and_refund(mix, "not enough participants")
-                    elif len(paid) < mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT):
-                        await self._cancel_and_refund(mix, "not enough participants")
-                    else:
-                        await self._proceed_to_assembling(mix, paid)
+                # Proceed as soon as the non-conforming target is met — we do
+                # NOT wait for conforming UTXOs (unless a solo-NC mix, which
+                # needs >=1 conforming so there are >=2 equal outputs). 'paid'
+                # is the universal ready state: with a service fee it means the
+                # zap arrived; with FEE_PER_ELEMENT=0 it's set right after
+                # /addresses (no zap needed).
+                ready = [p for p in active if p["state"] == "paid"]
+                proceed, _nc, _conf = await self._classify_ready(mix, ready)
+                if proceed:
+                    await self._proceed_to_assembling(mix, ready)
+                else:
+                    deadline = mix.get("deadline_unix")
+                    if deadline and now >= deadline:
+                        # We wait for the EXACT non-conforming target; if the
+                        # deadline arrives before we reach it, the deterministic
+                        # fee split can't be honoured — cancel and refund.
+                        await self._cancel_and_refund(
+                            mix,
+                            "deadline passed before the non-conforming target was met",
+                        )
 
             case "assembling":
                 await self._assemble_psbt(mix, active)
@@ -1011,6 +1141,31 @@ class Coordinator:
                 # Clean up old completed mixes
                 pass
 
+    async def _classify_ready(self, mix: Dict, ready: List[Dict]) -> Tuple[bool, int, bool]:
+        """Decide whether a collecting mix can advance to assembling.
+
+        ``ready`` is the list of 'paid' participants (the universal
+        ready-to-assemble state). Returns (proceed, nc_count, conforming_present):
+
+        - nc_count: how many ready participants brought >=1 non-conforming UTXO
+        - conforming_present: whether any conforming UTXO is present among ready
+        - proceed: nc_count >= required_nonconforming, AND (required >= 2 OR a
+          conforming UTXO is present) — the solo-NC guard guarantees >=2 equal
+          outputs from distinct parties before we ever sign.
+        """
+        output_size = mix["output_size"]
+        required = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+        nc_count = 0
+        conforming_present = False
+        for p in ready:
+            utxos = await self.db.get_utxos_by_participant(p["id"])
+            if any(u["amount"] != output_size for u in utxos):
+                nc_count += 1
+            if any(u["amount"] == output_size for u in utxos):
+                conforming_present = True
+        solo_ok = required >= 2 or conforming_present
+        return (nc_count >= required and solo_ok), nc_count, conforming_present
+
     async def _proceed_to_assembling(self, mix: Dict, active: List[Dict]):
         """Move mix from collecting to assembling."""
         mix_id = mix["id"]
@@ -1023,7 +1178,7 @@ class Coordinator:
                 self.parser.format_psbt_request(mix_id, self.cfg.SIGNING_DEADLINE_HOURS),
             )
 
-    async def _gather_assembly_data(self, active: List[Dict]) -> Tuple[
+    async def _gather_assembly_data(self, active: List[Dict], output_size: int) -> Tuple[
             List[Dict], List[Dict], Dict[str, List[str]], Dict[str, List[int]]]:
         """Build the four parallel structures _assemble_psbt needs:
 
@@ -1032,6 +1187,10 @@ class Coordinator:
         - addrs_by_pid: each participant's addresses (used to lay out outputs)
         - input_indices_by_pid: which vin indices each participant must sign
           (used by /psbt_accept's strict per-input check)
+
+        Each participant's UTXOs are classified against ``output_size``:
+        conforming (amount == output_size, free 1->1 pass-through) vs
+        non-conforming (carved into equal outputs + change; pays the miner fee).
 
         Kept as a helper so the under-funded-drop retry path (C2) can re-build
         these for the surviving participants without duplicating logic.
@@ -1059,24 +1218,36 @@ class Coordinator:
                 })
             input_indices_by_pid[pid] = list(range(start_idx, start_idx + len(utxos)))
 
-            ibt: Dict[str, int] = {}
-            for u in utxos:
-                st = u.get("script_type", "p2wpkh")
-                ibt[st] = ibt.get(st, 0) + 1
+            # Classify: conforming (== output_size) vs non-conforming.
+            conforming = [u for u in utxos if u["amount"] == output_size]
+            nonconf = [u for u in utxos if u["amount"] != output_size]
+            nc_total = sum(u["amount"] for u in nonconf)
 
-            obt: Dict[str, int] = {}
-            for addr in addrs_in_order:
-                addr_type = self.psbt_mgr._address_type(addr)
-                obt[addr_type] = obt.get(addr_type, 0) + 1
+            nc_ibt: Dict[str, int] = {}
+            for u in nonconf:
+                st = u.get("script_type", "p2wpkh")
+                nc_ibt[st] = nc_ibt.get(st, 0) + 1
+
+            # Output script type — all of a participant's addresses are the same
+            # type (per-mix output lock), so peek at the first; fall back p2wpkh.
+            if addrs_in_order:
+                try:
+                    output_type = self.psbt_mgr._address_type(addrs_in_order[0])
+                except Exception:
+                    output_type = "p2wpkh"
+            else:
+                output_type = "p2wpkh"
 
             participants_data.append({
                 "pid": pid,
                 "npub_hex": p["npub_hex"],
-                "num_inputs": len(utxos),
                 "total_sats": total_sats,
                 "num_addresses": len(addrs_in_order),
-                "inputs_by_type": ibt,
-                "outputs_by_type": obt if obt else {"p2wpkh": 0},
+                "conforming_count": len(conforming),
+                "nonconforming_total_sats": nc_total,
+                "nonconforming_inputs_by_type": nc_ibt,
+                "output_type": output_type,
+                "is_nonconforming": len(nonconf) > 0,
             })
             addrs_by_pid[pid] = addrs_in_order
 
@@ -1251,72 +1422,46 @@ class Coordinator:
         # not ghosted") — without this guard, a participant whose pay-timeout
         # hasn't fired yet would be included with no zap on file.
         active = [p for p in active if p["state"] in ("paid", "signing")]
-        min_part = mix.get("min_participants", self.cfg.MIN_PARTICIPANTS_DEFAULT)
 
-        # First pass: gather + fee math.
-        all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
-            await self._gather_assembly_data(active)
-        total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
-            participants_data, output_size, fee_rate,
-        )
+        # Conforming-model fee inputs. The miner fee assumes the mix fills to
+        # max_conforming_utxos; that burden is split evenly across the
+        # non-conforming participants (deterministic). Conforming input/output
+        # vbytes are sized from the mix's locked types (fallback p2wpkh).
+        max_conforming = mix.get("max_conforming_utxos")
+        if max_conforming is None:
+            max_conforming = self.cfg.MAX_CONFORMING_UTXOS
+        conf_in_type = mix.get("input_type") or "p2wpkh"
+        conf_out_type = mix.get("output_type") or "p2wpkh"
 
-        # S-A: iterate the fee math. The first pass used each participant's
-        # num_addresses_provided as their output-count contribution to total
-        # vsize, but determine_outputs may trim to fewer actual outputs.
-        # That overestimates vsize → overestimates total_miner_fee → each
-        # participant's fee_share is inflated and the miner overcollects.
-        # Rebuild outputs_by_type from the trimmed counts and re-run until
-        # stable (or after a couple of passes — it's monotonically
-        # converging because trimming output count can only ever reduce
-        # the next pass's miner fee, never grow it).
-        for _iter in range(3):
-            changed = False
-            for rec, fr in zip(participants_data, fee_results):
-                actual_used = fr.num_equal_outputs + fr.num_change_outputs
-                # Distribute actual_used across the address types the
-                # participant provided. We trim from the LAST type in
-                # iteration order so the same-type-everywhere case (the
-                # only one the allowlist actually permits today) collapses
-                # cleanly to {primary_type: actual_used}.
-                obt = dict(rec.get("outputs_by_type") or {})
-                declared = sum(obt.values())
-                if declared == actual_used or actual_used == 0:
-                    continue
-                if actual_used >= declared:
-                    continue  # determine_outputs never grows past declared
-                # Trim down to actual_used. Walk types and reduce.
-                remaining = actual_used
-                trimmed: Dict[str, int] = {}
-                for k, v in obt.items():
-                    take = min(v, remaining)
-                    if take > 0:
-                        trimmed[k] = take
-                    remaining -= take
-                    if remaining <= 0:
-                        break
-                if trimmed != obt:
-                    rec["outputs_by_type"] = trimmed
-                    rec["num_addresses"] = actual_used
-                    changed = True
-            if not changed:
-                break
-            total_vsize, total_miner_fee, fee_results = (
-                self.fee_engine.calculate_all_fees(
-                    participants_data, output_size, fee_rate,
-                )
+        def _calc(pdata):
+            return self.fee_engine.calculate_all_fees(
+                pdata, output_size, fee_rate,
+                max_conforming_utxos=max_conforming,
+                conf_input_type=conf_in_type, conf_output_type=conf_out_type,
             )
+
+        # First pass: gather + fee math. (The S-A output-trim iteration now
+        # lives inside calculate_all_fees, which sizes NC-derived outputs at
+        # the real fee share rather than the declared address count.)
+        all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
+            await self._gather_assembly_data(active, output_size)
+        total_vsize, total_miner_fee, fee_results = _calc(participants_data)
 
         if total_miner_fee <= 0:
             await self._cancel_and_refund(mix, "invalid fee calculation")
             return
 
-        # C2: identify participants whose share would zero out their outputs.
-        # Drop them, refund, and retry with the survivors. One retry only —
-        # if survivors are STILL under-funded the situation is pathological
-        # (or the mix was misconfigured) and we cancel everyone.
+        # C2: a non-conforming participant whose NC inputs can't fund one equal
+        # output after their fee share (num_equal_outputs == 0) is dropped +
+        # refunded, then the fee math re-runs with the survivors. Conforming-only
+        # participants are never under-funded (their outputs are free
+        # pass-throughs). After dropping, the mix must still have at least the
+        # required number of non-conforming participants (the exact target it
+        # advanced on) AND >=2 participants overall; otherwise cancel.
+        required_nc = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
         underfunded_pids = {
             rec["pid"] for rec, fr in zip(participants_data, fee_results)
-            if fr.num_equal_outputs == 0
+            if fr.is_nonconforming and fr.num_equal_outputs == 0
         }
         if underfunded_pids:
             survivors_active = []
@@ -1326,27 +1471,23 @@ class Coordinator:
                 else:
                     survivors_active.append(p)
 
-            if len(survivors_active) < min_part:
-                # The whole mix can't proceed — fall back to the existing
-                # cancel-and-refund path for the survivors.
-                await self._cancel_and_refund(
-                    mix, "not enough participants after dropping under-funded",
-                )
-                return
-
             # Rebuild with survivors and re-run the fee math.
             active = survivors_active
             all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
-                await self._gather_assembly_data(active)
-            total_vsize, total_miner_fee, fee_results = self.fee_engine.calculate_all_fees(
-                participants_data, output_size, fee_rate,
-            )
+                await self._gather_assembly_data(active, output_size)
+            total_vsize, total_miner_fee, fee_results = _calc(participants_data)
 
-            if total_miner_fee <= 0 or any(fr.num_equal_outputs == 0 for fr in fee_results):
-                # Still bad after one drop pass — give up to avoid a
-                # potentially-infinite cascade. Operator can dig into logs.
+            nc_survivors = sum(1 for fr in fee_results if fr.is_nonconforming)
+            still_underfunded = any(
+                fr.is_nonconforming and fr.num_equal_outputs == 0
+                for fr in fee_results
+            )
+            if (len(survivors_active) < 2 or nc_survivors < required_nc
+                    or total_miner_fee <= 0 or still_underfunded):
+                # Can't honour the required non-conforming target after the
+                # drop — fall back to cancelling the whole mix and refunding.
                 await self._cancel_and_refund(
-                    mix, "still under-funded after pruning",
+                    mix, "not enough participants after dropping under-funded",
                 )
                 return
 
@@ -1354,15 +1495,45 @@ class Coordinator:
         # participant's change is reduced by their fee_share; if change drops
         # below MINIMUM_UTXO_SIZE it's dropped entirely (those sats become
         # additional miner fee, per the plan).
+        donation_address = (self.cfg.DONATION_ADDRESS or "").strip()
         all_outputs: List[Dict] = []
         for rec, fr in zip(participants_data, fee_results):
             addrs = addrs_by_pid[rec["pid"]]
-            for i in range(fr.num_equal_outputs):
-                all_outputs.append({"address": addrs[i], "amount": output_size})
+            idx = 0
+            # 1) conforming pass-throughs: one output_size output per conforming
+            #    UTXO, using the participant's first addresses.
+            for _ in range(fr.conforming_count):
+                if idx < len(addrs):
+                    all_outputs.append({"address": addrs[idx], "amount": output_size})
+                    idx += 1
+            # 2) equal outputs carved from non-conforming inputs.
+            for _ in range(fr.num_equal_outputs):
+                if idx < len(addrs):
+                    all_outputs.append({"address": addrs[idx], "amount": output_size})
+                    idx += 1
+            # 3) the above-dust leftover (num_change=1). If the participant
+            #    supplied a spare address, it's their change. If not, it's
+            #    donated: to DONATION_ADDRESS if configured, otherwise folded
+            #    into the miner fee (output omitted). Sub-dust leftovers never
+            #    reach here (num_change=0) — they always fold into the fee.
             if fr.num_change_outputs > 0 and fr.change_sats > 0:
-                change_idx = fr.num_equal_outputs
-                if change_idx < len(addrs):
-                    all_outputs.append({"address": addrs[change_idx], "amount": fr.change_sats})
+                if idx < len(addrs):
+                    all_outputs.append({"address": addrs[idx], "amount": fr.change_sats})
+                    idx += 1
+                elif donation_address:
+                    all_outputs.append({"address": donation_address, "amount": fr.change_sats})
+                    logger.info(
+                        "Mix %s: participant %s donated %d sats (no change address)",
+                        tokens.m(mix_id), tokens.p(rec["npub_hex"]), fr.change_sats,
+                    )
+                else:
+                    # No donation address configured → the leftover stays in the
+                    # tx as additional miner fee (output omitted).
+                    logger.info(
+                        "Mix %s: participant %s left %d above-dust sats to the "
+                        "miner fee (no change address, no DONATION_ADDRESS)",
+                        tokens.m(mix_id), tokens.p(rec["npub_hex"]), fr.change_sats,
+                    )
             # Persist the final accounting for transparency / debugging.
             await self.db.update_participant(
                 rec["pid"],
@@ -1404,9 +1575,11 @@ class Coordinator:
             await self._cancel_and_refund(mix, "failed to build skeleton PSBT")
             return
 
-        # Privacy check
-        num_participants = len(active)
-        privacy_pass, privacy_msg = self.privacy.check_psbt(psbt_hex, num_participants)
+        # Privacy check — floor is the required non-conforming participant count
+        # (each contributes >=1 equal output; conforming UTXOs add more). This
+        # is the "N distinct equal-output contributors" sanity guard.
+        privacy_floor = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+        privacy_pass, privacy_msg = self.privacy.check_psbt(psbt_hex, privacy_floor)
         if not privacy_pass:
             logger.warning(f"Privacy check failed for {mix_id}: {privacy_msg}")
             # Continue anyway — the plan says non-authoritative
@@ -1818,6 +1991,8 @@ class Coordinator:
                 max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
                 fee_per_element=self.cfg.FEE_PER_ELEMENT,
                 deadline_unix=deadline_unix,
+                required_nonconforming=self.cfg.DEFAULT_REQUIRED_NONCONFORMING,
+                max_conforming_utxos=self.cfg.MAX_CONFORMING_UTXOS,
             )
             await self.db.update_mix(mid, state="collecting",
                                      deadline_unix=deadline_unix)

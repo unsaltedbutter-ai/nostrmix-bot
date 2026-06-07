@@ -42,6 +42,34 @@ RECENT_SPENT_ADDRESS = "bc1qp6ywl60yfva7z62h3qe7jmepc0y246dl0arfk4"
 # A confirmed transaction (block 949683). Used for is_confirmed coverage.
 CONFIRMED_TXID = "088da5e483176f89b73848bd709a135684587e889a41fe120e5846a1ae82167d"
 
+# ---------------------------------------------------------------------------
+# PUBLIC ON-CHAIN TEST VECTORS — these are random, arbitrary mainnet UTXOs
+# pulled from public blocks purely as fixed reference points for the live
+# mempool.space integration tests. They are NOT owned, controlled, or
+# associated with this project or its operator in any way; they are simply
+# immutable historical facts on the public blockchain (an already-spent
+# output, and a 15-year-dormant output) chosen so the assertions stay stable.
+# ---------------------------------------------------------------------------
+
+# SPENT vector — a random tx in block 950000 spent this output. The output
+# itself is the 8th output (vout index 7) of funding tx 483b…fe255 (block
+# 949977): 950,000 sats, p2wpkh. It was consumed by spender tx c0ec…fd54
+# in block 950000, so is_utxo_spent must report True.
+PUBLIC_SPENT_FUNDING_TXID = "483b612fa7ff6706bb6314eaff9db13eab693d8d228d30dda595b339851fe255"
+PUBLIC_SPENT_VOUT = 7
+PUBLIC_SPENT_VALUE = 950_000
+PUBLIC_SPENT_ADDRESS = "bc1qsxsjsxvkq8f92q20espjn77jjy2jvwj73yqx04"
+PUBLIC_SPENT_SPENDER_TXID = "c0ec0101478f0e9616773ed587778a0c0d78b289126400d9fb3a9ae7926dfd54"
+
+# UNSPENT vector — a random output from block 100001 that has sat untouched
+# for ~15 years. It is output #2 (vout index 1) of funding tx 05d0…48cb:
+# 5,000,000 sats (0.05 BTC), p2pkh. Could in principle be spent one day; we
+# accept that small risk for a stable "unspent" assertion.
+PUBLIC_UNSPENT_TXID = "05d07bb2de2bda1115409f99bf6b626d23ecb6bed810d8be263352988e4548cb"
+PUBLIC_UNSPENT_VOUT = 1
+PUBLIC_UNSPENT_VALUE = 5_000_000
+PUBLIC_UNSPENT_ADDRESS = "19kmtcoDHC25WkXrBBLFAjsFGVKgM1SHtp"
+
 
 class TestNormalizeScriptType:
     def test_segwit_v0_p2wpkh(self):
@@ -174,6 +202,55 @@ class TestLiveMempoolSpace:
         finally:
             await cm.close()
         assert spent is True
+
+    # --- Public on-chain vectors (random arbitrary mainnet UTXOs, NOT ours) ---
+
+    @pytest.mark.asyncio
+    async def test_public_spent_utxo_reports_spent(self):
+        """Random public output 483b…fe255:7 (8th output, block 949977,
+        950,000 sats p2wpkh) was spent by tx c0ec…fd54 in block 950000.
+        Verifies lookup returns the prevout details and is_utxo_spent → True.
+
+        This is arbitrary public blockchain data, not the project's own.
+        """
+        cm = ChainMonitor()
+        try:
+            txout = await cm.lookup_txout(
+                PUBLIC_SPENT_FUNDING_TXID, PUBLIC_SPENT_VOUT,
+            )
+            spent = await cm.is_utxo_spent(
+                PUBLIC_SPENT_FUNDING_TXID, PUBLIC_SPENT_VOUT,
+            )
+        finally:
+            await cm.close()
+
+        assert txout is not None
+        assert txout["value"] == PUBLIC_SPENT_VALUE
+        assert txout["address"] == PUBLIC_SPENT_ADDRESS
+        assert txout["scriptpubkey_type"] == "p2wpkh"
+        assert spent is True, "this public output was spent in block 950000"
+
+    @pytest.mark.asyncio
+    async def test_public_unspent_utxo_reports_unspent(self):
+        """Random public output 05d0…48cb:1 (output #2 of 2, block 100001,
+        0.05 BTC p2pkh to 19kmt…SHtp) has been dormant ~15 years. Verifies
+        lookup returns the prevout details and is_utxo_spent → False.
+
+        This is arbitrary public blockchain data, not the project's own. It
+        could in principle be spent some day, which would flip this assertion.
+        """
+        cm = ChainMonitor()
+        try:
+            txout = await cm.lookup_txout(PUBLIC_UNSPENT_TXID, PUBLIC_UNSPENT_VOUT)
+            spent = await cm.is_utxo_spent(PUBLIC_UNSPENT_TXID, PUBLIC_UNSPENT_VOUT)
+        finally:
+            await cm.close()
+
+        assert txout is not None
+        assert txout["value"] == PUBLIC_UNSPENT_VALUE  # 0.05 BTC
+        assert txout["address"] == PUBLIC_UNSPENT_ADDRESS
+        assert txout["scriptpubkey_type"] == "p2pkh"
+        assert spent is False, "this public output has never been spent"
 
     # --- Confirmation check on a known-confirmed tx ---
 

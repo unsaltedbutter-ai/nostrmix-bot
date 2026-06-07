@@ -30,10 +30,17 @@ class TestBotConfig:
 
         assert cfg.NOSTR_PRIVATE_KEY_NPUB == "nsec1abc..."
         assert cfg.ZAP_PROVIDER_PUBKEY_HEX == "def..."
-        assert cfg.FEE_PER_ELEMENT == 100
+        # Service fee now defaults to 0 (zaps optional, off by default).
+        assert cfg.FEE_PER_ELEMENT == 0
         assert cfg.MIN_FEE_RATE_SATS == 1.5
         assert cfg.MIN_PARTICIPANTS_DEFAULT == 3
         assert cfg.MINIMUM_UTXO_SIZE == 10000
+        # Conforming/non-conforming model defaults.
+        assert cfg.DEFAULT_REQUIRED_NONCONFORMING == 3
+        assert cfg.MAX_CONFORMING_UTXOS == 10
+        assert cfg.MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT == 10
+        # Donation address disabled by default (privacy-preserving fold-to-fee).
+        assert cfg.DONATION_ADDRESS == ""
         assert cfg.DB_PATH == "./bot.db"
         assert cfg.BOT_NAME == "butterbot"
         assert isinstance(cfg.NOSTR_RELAYS, list)

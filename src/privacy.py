@@ -18,7 +18,12 @@ class PrivacyCheck:
     def check_psbt(self, psbt_hex: str, num_participants: int) -> Tuple[bool, str]:
         """Check if a PSBT meets minimum privacy requirements.
 
-        At minimum: at least N equal outputs for N participants.
+        ``num_participants`` is the anonymity-set floor. Under the
+        conforming/non-conforming model the coordinator passes the mix's
+        required non-conforming participant count (N distinct equal-output
+        contributors); conforming UTXOs only add more equal outputs. The check
+        is a non-authoritative sanity guard: there must be at least N outputs,
+        and the largest equal-value group must be at least N.
         """
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 

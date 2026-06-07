@@ -146,11 +146,21 @@ class CommandParser:
         for mix in active_mixes:
             name = mix.get("id", "unknown")
             output_btc = mix.get("output_size", 0) / 1e8
-            # Count participants
             state = mix.get("state", "collecting")
+            req = mix.get("required_nonconforming")
+            cap = mix.get("max_conforming_utxos")
+            extra = ""
+            if req:
+                extra += f" Needs {req} mixer(s)."
+            if cap:
+                extra += (
+                    f" Up to {cap} same-size ({output_btc:.4f} BTC) UTXOs welcome "
+                    f"free of charge."
+                )
             lines.append(
-                f"mix {name}: {output_btc:.4f} BTC outputs, "
-                f"{state}, p2wpkh addresses only."
+                f"mix {name}: {output_btc:.4f} BTC outputs ({state})."
+                + extra
+                + " p2wpkh addresses only."
             )
         return "\n".join(lines)
 

@@ -67,16 +67,20 @@ class Database:
 
     async def create_mix(self, output_size: int, min_participants: int = 3,
                          max_participants: Optional[int] = None,
-                         fee_per_element: int = 100,
-                         deadline_unix: Optional[int] = None) -> str:
+                         fee_per_element: int = 0,
+                         deadline_unix: Optional[int] = None,
+                         required_nonconforming: int = 3,
+                         max_conforming_utxos: int = 10) -> str:
         mid = _hex_id()
         now = _now()
         deadline = deadline_unix if deadline_unix is not None else now + 3600 * 12  # 12 hour default
         await self._execute(
             """INSERT INTO mixes (id, output_size, min_participants, max_participants,
+               required_nonconforming, max_conforming_utxos,
                fee_per_element, state, deadline_unix, created_at_unix, updated_at_unix)
-               VALUES (?, ?, ?, ?, ?, 'announced', ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'announced', ?, ?, ?)""",
             (mid, output_size, min_participants, max_participants,
+             required_nonconforming, max_conforming_utxos,
              fee_per_element, deadline, now, now),
         )
         await self._conn.commit()
@@ -213,6 +217,17 @@ class Database:
         return await self._fetchall(
             "SELECT * FROM utxos WHERE participant_id = ? ORDER BY created_at_unix",
             (participant_id,),
+        )
+
+    async def get_utxos_for_mix(self, mix_id: str) -> List[Dict]:
+        """All utxos rows for any participant in `mix_id`, with the owning
+        participant's state attached. Used to count conforming UTXOs and
+        classify non-conforming participants for the proceed/fee logic."""
+        return await self._fetchall(
+            """SELECT u.*, p.state AS participant_state, p.npub_hex AS npub_hex
+               FROM utxos u JOIN participants p ON u.participant_id = p.id
+               WHERE p.mix_id = ? ORDER BY u.created_at_unix""",
+            (mix_id,),
         )
 
     async def get_utxo(self, txid: str, vout: int) -> Optional[Dict]:
