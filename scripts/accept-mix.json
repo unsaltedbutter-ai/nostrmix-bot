@@ -1,5 +1,5 @@
 {
-  "_comment": "Example for psbt_accept.py. fee_rate is PINNED (required) so the re-assembled skeleton is byte-identical to the one your wallet signed. Use real \"txid:vout\" inputs so the PSBT is importable and signable. Pass 1: run with no signed_psbt -> prints the skeleton + per-participant signing indices. Sign in your wallet, paste each result into signed_psbt, re-run for Pass 2.",
+  "_comment": "Example for psbt_accept.py. State persists in the --db file across passes (like the bot), so the skeleton is assembled once and the fee_rate need NOT be re-supplied on pass 2. fee_rate is OPTIONAL: omit for a live estimate, or pin a number to run fully offline (pinned here so the example needs no network). Use real \"txid:vout\" inputs so the PSBT is importable and signable. Pass 1: run with no signed_psbt -> prints the skeleton + per-participant signing indices. Sign in your wallet, paste each result into signed_psbt, re-run (same --db) for Pass 2.",
   "output_size": 1000000,
   "required_nonconforming": 2,
   "max_conforming_utxos": 10,
