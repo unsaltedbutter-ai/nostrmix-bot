@@ -135,7 +135,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | `DEFAULT_REQUIRED_NONCONFORMING` | `3` | int ≥ 1 (clamped up to 1) | Exact number of non-conforming participants an auto-created mix waits for before assembling. Also the even-split denominator for the conforming miner-fee burden. |
 | `MAX_CONFORMING_UTXOS` | `10` | int ≥ 0 | Max conforming UTXOs a mix absorbs (bounds intake during collecting). The miner fee is sized from the **actual** conforming present at assembly, not this cap. |
 | `MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT` | `10` | int ≥ 1 | Cap on non-conforming UTXOs one participant may commit. |
-| `DONATION_ADDRESS` | `""` | bitcoin address; **recommended blank** | Where an above-dust leftover goes when a non-conforming participant supplies no change address (they're warned first). **Poor-privacy feature — recommended to leave blank**, in which case the leftover folds into the miner fee (most private). A fixed address recurring across coinjoins is a linkable on-chain fingerprint; only set it if you accept that cost to keep those sats. |
+| `DONATION_ADDRESS` | `""` | bitcoin address; **recommended blank** | Where an above-dust leftover goes **only** when a non-conforming participant supplies a *single* address (no room for change). With ≥2 addresses the leftover becomes the participant's own oversized change instead, so this rarely fires. **Poor-privacy feature — recommended to leave blank**, in which case the leftover folds into the miner fee (most private). A fixed address recurring across coinjoins is a linkable on-chain fingerprint; only set it if you accept that cost to keep those sats. |
 
 ### Scheduling & broadcast
 
@@ -231,8 +231,11 @@ Commands are matched case-insensitively; the `/` prefix is optional for `list`.
 - `/join <mix_name>` — join a mix
 - `/commit <txid:vout> ...` — register UTXOs (may be sent more than once)
 - `/addresses <addr1> <addr2> ...` — provide output addresses (one per conforming
-  UTXO; non-conforming participants need ≥1 more for an equal output, and one more
-  for change or the above-dust leftover is donated)
+  UTXO; non-conforming participants need ≥1 more for an equal output, plus one more
+  to receive change. The address count caps your outputs: if you supply too few,
+  the bot turns your last address into an (oversized) change output rather than
+  burning the leftover — so you get fewer mixed outputs but keep the sats. Only
+  with a single address and an above-dust leftover is that excess donated/folded.)
 - `/psbt_accept <hex>` — return a signed PSBT (or `/psbt_chunk <i>/<n> <hex>` for
   large PSBTs)
 - `/cancel [mix_name]` — exit a mix (auto-detects when you're in exactly one)

@@ -645,8 +645,10 @@ class Coordinator:
 
         # Preliminary non-conforming output layout (real miner fee is unknown
         # until assembly, so estimate with fee_share=0 — the maximum equal-output
-        # count; assembly only ever trims it). nc_output_plan never sacrifices an
-        # equal output to make room for change.
+        # count; assembly only ever trims it). When addresses are the binding
+        # constraint, nc_output_plan gives back the last equal slot so an
+        # above-dust leftover becomes change rather than being burnt/donated
+        # (needs >=2 addresses).
         addrs_for_nc = max(0, len(addrs) - conforming_count)
         num_equal, num_change, chg_amt = self.fee_engine.nc_output_plan(
             nc_total, output_size, addrs_for_nc, 0,

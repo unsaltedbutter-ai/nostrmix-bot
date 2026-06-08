@@ -174,16 +174,27 @@ class FeeEngine:
 
     def nc_output_plan(self, nc_total: int, output_size: int,
                        addrs_for_nc: int, fee_share: int) -> Tuple[int, int, int]:
-        """Non-conforming output layout that does NOT steal an equal-output slot
-        to make room for change.
+        """Non-conforming output layout.
 
-        Returns (num_equal, num_change, change_sats). Unlike determine_outputs,
-        this keeps the maximum number of equal outputs the funds + addresses
-        allow; ``num_change`` is 1 whenever the leftover after equal outputs
-        clears the dust threshold (MINIMUM_UTXO_SIZE). Whether that extra output
-        becomes the participant's change (if they supplied a spare address) or a
-        donation (if they didn't) is decided by the coordinator at layout time.
-        A sub-dust leftover is absorbed into the miner fee (num_change=0).
+        Returns (num_equal, num_change, change_sats).
+
+        Goal: maximise equal (mixed) outputs, but NEVER burn an above-dust
+        leftover when the participant gave us somewhere to send it. The address
+        count is the hard cap on outputs — a participant who supplies A NC
+        addresses gets at most A outputs.
+
+          * If the funds are the binding constraint (fewer equal outputs than
+            addresses), the spare address holds the above-dust leftover as change.
+          * If addresses are the binding constraint (equal outputs would consume
+            every address) AND there's an above-dust leftover, we sacrifice the
+            LAST equal output so its address can hold the change instead — even
+            though that change then exceeds output_size. Giving up one mixed
+            output is far better than burning 10ks/100ks of sats. This needs
+            >=2 addresses (so >=1 mixed output survives); with a single address
+            there's no slot to spare, so the leftover is left for the coordinator
+            to donate/fold (num_change=1 but no spare address).
+          * A sub-dust leftover is always absorbed into the miner fee
+            (num_change=0) — too small to be worth its own output.
         """
         available = nc_total - fee_share
         if available <= 0 or addrs_for_nc <= 0:
@@ -192,9 +203,21 @@ class FeeEngine:
         if num_equal == 0:
             return (0, 0, 0)
         remainder = available - num_equal * output_size
-        if remainder >= self._minimum_utxo_size:
+        if remainder < self._minimum_utxo_size:
+            return (num_equal, 0, 0)
+        # Above-dust leftover. If a spare address is free (funds-bound), it
+        # becomes change there.
+        if num_equal < addrs_for_nc:
             return (num_equal, 1, remainder)
-        return (num_equal, 0, 0)
+        # Address-bound: every address is taken by an equal output. Rather than
+        # burn/donate the leftover, give back the last equal slot and roll its
+        # output_size into the change (change > output_size). Requires >=2
+        # addresses so at least one mixed output remains.
+        if addrs_for_nc >= 2:
+            num_equal -= 1
+            return (num_equal, 1, available - num_equal * output_size)
+        # Single address, fully used: nothing to spare. Caller donates/folds.
+        return (num_equal, 1, remainder)
 
     # --- Full calculation ---
 
@@ -251,11 +274,11 @@ class FeeEngine:
         conforming_burden_fee = int(conforming_burden_vsize * fee_rate)
 
         def _nc_layout(rec: Dict, fee_share: int) -> Tuple[int, int, int]:
-            """(num_equal, num_change, change_sats) carved from NC inputs. Uses
-            nc_output_plan so an equal output is never sacrificed for change —
-            an above-dust leftover with no spare address is donated instead
-            (decided at layout time), and counts as one extra output here for
-            vsize/fee purposes."""
+            """(num_equal, num_change, change_sats) carved from NC inputs via
+            nc_output_plan. With >=2 addresses an above-dust leftover always
+            lands in a change output (the plan gives back the last equal slot if
+            needed) rather than being burnt; only the single-address case can
+            still donate/fold. The change output counts for vsize/fee here."""
             addrs_for_nc = max(0, rec.get("num_addresses", 0)
                                - rec.get("conforming_count", 0))
             return self.nc_output_plan(

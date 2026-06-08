@@ -267,3 +267,61 @@ class TestFeeEngine:
         assert fee0 < fee2 < fee4
         # And the total fee is the real vsize at the target rate (no over-collect).
         assert abs(fee4 - int(v4 * 30)) <= 2
+
+
+class TestNcOutputPlan:
+    """nc_output_plan: never burn an above-dust leftover when the participant
+    gave us somewhere to put it. Address count is the hard output cap."""
+
+    def setup_method(self):
+        self.engine = FeeEngine(
+            fee_per_element=0, min_fee_rate_sats=1.5, max_fee_rate_sats=510,
+            overhead_vsize=10, minimum_utxo_size=10_000,
+        )
+
+    def test_funds_bound_spare_address_holds_change(self):
+        """Fewer equal outputs than addresses -> the spare address takes the
+        above-dust leftover as ordinary change (<= output_size here)."""
+        # 1.5M with 3 addresses, size 1M: 1 equal + 0.5M change, address to spare.
+        ne, nch, chg = self.engine.nc_output_plan(1_500_000, 1_000_000, 3, 0)
+        assert (ne, nch, chg) == (1, 1, 500_000)
+
+    def test_address_bound_sacrifices_last_equal_to_avoid_burn(self):
+        """Every address would be an equal output AND there's an above-dust
+        leftover -> give back the last equal slot so its address holds the
+        change (which now EXCEEDS output_size), rather than burning the sats."""
+        # 2.5M, only 2 addresses, size 1M: naive plan = 2 equal + 0.5M with no
+        # address -> burn. New plan: 1 equal + 1.5M change. Nothing burnt.
+        ne, nch, chg = self.engine.nc_output_plan(2_500_000, 1_000_000, 2, 0)
+        assert (ne, nch, chg) == (1, 1, 1_500_000)
+        assert chg > 1_000_000  # oversized change is acceptable
+        # Conservation: every sat is in an output (no burn).
+        assert ne * 1_000_000 + chg == 2_500_000
+
+    def test_single_address_fully_used_leaves_leftover_for_caller(self):
+        """One address, fully consumed by an equal output, above-dust leftover:
+        no slot to spare (giving it up = zero mixed outputs), so num_change=1
+        but the coordinator must donate/fold (no spare address to land it)."""
+        ne, nch, chg = self.engine.nc_output_plan(2_500_000, 1_000_000, 1, 0)
+        assert ne == 1 and nch == 1 and chg == 1_500_000
+        # num_equal == addrs_for_nc and addrs == 1: caller can't place it.
+
+    def test_subdust_leftover_folds_into_fee(self):
+        """A sub-dust leftover is never worth its own output -> folded (no
+        change), even when an address is free."""
+        ne, nch, chg = self.engine.nc_output_plan(1_005_000, 1_000_000, 3, 0)
+        assert (ne, nch, chg) == (1, 0, 0)
+
+    def test_exact_fit_no_change(self):
+        """Funds divide evenly into equal outputs -> no change at all."""
+        ne, nch, chg = self.engine.nc_output_plan(3_000_000, 1_000_000, 5, 0)
+        assert (ne, nch, chg) == (3, 0, 0)
+
+    def test_fee_share_can_trigger_the_sacrifice(self):
+        """The miner-fee bite shrinks 'available'; the plan still avoids a burn
+        when addresses are the binding constraint."""
+        # 2.0M, 2 addresses, size 1M, fee 5000: available 1.995M -> naive 1 equal
+        # + 0.995M change with a spare address (funds-bound, not address-bound).
+        ne, nch, chg = self.engine.nc_output_plan(2_000_000, 1_000_000, 2, 5_000)
+        assert ne == 1 and nch == 1
+        assert ne * 1_000_000 + chg == 1_995_000  # all available sats placed

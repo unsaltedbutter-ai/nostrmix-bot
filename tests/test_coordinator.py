@@ -3236,6 +3236,68 @@ class TestConformingModelGaps:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_address_bound_leftover_becomes_change_not_burnt(self, caplog):
+        """No-burn rule: a non-conforming participant who supplies >=2 addresses
+        but not enough for a separate change output gets the LAST equal slot
+        turned into an (oversized) change output to their OWN address — the
+        leftover is NEITHER donated NOR folded into the miner fee."""
+        import logging
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            # DONATION_ADDRESS configured precisely to prove it is NOT used.
+            coord.cfg._values["DONATION_ADDRESS"] = P2WPKH_ADDRS[7]
+            mix_id = await db.create_mix(
+                output_size=1_000_000,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # A: 2.5M NC with exactly TWO addresses. Naive plan = 2 equal + 0.5M
+            # with no address -> burn. No-burn plan = 1 equal + ~1.5M change.
+            a = await self._interested(db, mix_id, "nbA")
+            await self._commit(coord, chain, "nbA", [(TXID[0], 0, 2_500_000)])
+            await coord._cmd_provide_addresses(
+                FakeCtx("nbA"), "nbA", P2WPKH_ADDRS[0:2])
+            # No donation warning at intake — the leftover has a home.
+            warn = nostr.sent_dms[-1][1].lower()
+            assert "donated" not in warn
+            # Two outputs stored: one equal, one oversized change.
+            outs = sorted(o["amount"] for o in await db.get_outputs_by_participant(a))
+            assert outs == [1_000_000, 1_500_000]
+
+            # B: a second NC participant so the mix can proceed.
+            await self._interested(db, mix_id, "nbB")
+            await self._commit(coord, chain, "nbB", [(TXID[1], 0, 3_000_000)])
+            await coord._cmd_provide_addresses(
+                FakeCtx("nbB"), "nbB", P2WPKH_ADDRS[2:5])
+
+            with caplog.at_level(logging.INFO, logger="src.coordinator"):
+                await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+                await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+
+            assert (await db.get_mix(mix_id))["state"] == "signing"
+            # A kept an oversized change (above one output_size), after the fee.
+            a_final = await db.get_participant(a)
+            assert a_final["change_amount"] > 1_000_000
+
+            # The assembled tx pays a tiny miner fee at the target rate — proof
+            # the 0.5M was NOT folded into the fee.
+            rounds = await db.get_psbt_rounds_by_mix(mix_id)
+            psbt_hex = next(r["psbt_sent"] for r in rounds if r.get("psbt_sent"))
+            psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(psbt_hex))
+            sum_out = sum(o.nValue for o in psbt.unsigned_tx.vout)
+            miner_fee = (2_500_000 + 3_000_000) - sum_out
+            assert 0 < miner_fee < 50_000, f"leftover was burnt: fee={miner_fee}"
+
+            # Nothing was donated.
+            logs = " ".join(r.message.lower() for r in caplog.records)
+            assert "donated" not in logs
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_mixed_participant_assembly_preserves_conforming(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
