@@ -604,6 +604,16 @@ We should not update database state without preserving the dependent state, such
 
 Privacy.py is a non-authoritative sanity check, not a full anonymity analysis. The bar we enforce: **a mix must produce at least 2 equal-size outputs drawn from at least 2 inputs (non-conforming and conforming inputs counted together).** That is the minimum that achieves the bot's purpose — breaking the 1:1 link between a coin and its owner by giving each mixed output ≥1 indistinguishable sibling. Concretely the check requires `max(2, required_nonconforming)` identical `output_size` outputs to be present before signing. Higher anonymity is the user's choice: they can run the resulting coins through additional mixing rounds. We deliberately do NOT attempt subset-sum / N!/2 partition counting.
 
+### What is and isn't private (change & the fee split)
+
+The **equal `output_size` outputs are the anonymity set** — all identical, genuinely unlinkable. Everything else carries information:
+
+- **Change is the dominant, irreducible leak.** Every coinjoin-with-change (Wasabi, JoinMarket, this bot) has it. For each participant the amounts balance as `inputs = equal·output_size + change + fee`. Because change amounts are unique and high-entropy, an observer doing subset-sum can usually re-associate a change output with its input cluster regardless of the fee policy. The request-1 "oversized change instead of burning" rule makes change *more* distinctive — an accepted trade, because the answer to toxic change is to **re-mix it**, not to shrink it.
+- **The deterministic fee split is a minor, accepted signal.** We split the miner fee by each participant's input+output vsize (proportional). Any *deterministic* rule — proportional **or** a flat `total/N` — is computable by an attacker, so it lets them check a subset-sum candidate exactly; proportional additionally leaks a participant's input *count*. We considered **randomizing** fee shares to add ambiguity and rejected it: our fees are tiny (hundreds of sats) versus change amounts (10k–millions), so the ambiguity window is negligible — it would be security theater while introducing real fee unfairness (a 1-input user subsidizing a 10-input user). The honest position is that the fee split is **not** where privacy is won or lost.
+- **Where privacy is actually won:** (1) **conforming amounts** — exact-multiple inputs have *no change* and pass through 1→1, perfectly unlinkable (the protocol makes these free to encourage them); (2) **re-mixing** change in later rounds; (3) **user hygiene** — never co-spend change together with mixed outputs.
+
+So the design choice is deliberate: keep the proportional split (fair, and not the real exposure) and lean on conforming-amounts + re-mixing for anonymity.
+
 ---
 
 ## 6. `nostrmix-bot.env` Configuration

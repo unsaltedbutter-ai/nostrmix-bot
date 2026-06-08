@@ -21,6 +21,19 @@ A mix is sized by an **exact number of non-conforming participants** it waits fo
 conforming UTXOs present at assembly (the cap only bounds intake) and split evenly
 across the non-conforming participants, so the effective rate hits the target.
 
+### Getting the most privacy
+
+The equal `output_size` outputs are the anonymity set — identical and unlinkable.
+**Change is the weak point** of any coinjoin: change amounts are unique, so a chain
+observer can often re-link a change output to the inputs that funded it. The bot's
+fee split doesn't change that (it's a minor signal at most). To actually maximise
+privacy:
+
+- **Bring conforming amounts** (exact multiples of `output_size`) — they have **no
+  change**, pass through 1→1, and are free. This is the strongest lever.
+- **Re-mix your change** in a later round — toxic change becomes a fresh input.
+- **Never co-spend** change together with your mixed outputs in a later transaction.
+
 ## Quick Start
 
 ```bash
