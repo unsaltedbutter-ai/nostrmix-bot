@@ -3298,6 +3298,38 @@ class TestConformingModelGaps:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_address_constrained_participant_is_nudged_to_add_addresses(self):
+        """A non-conforming participant who funds more mixed outputs than their
+        address count allows (so the no-burn rule sacrifices a mixed output and
+        hands them an oversized change) is warned at /addresses to send more —
+        NOT a donation warning, since nothing is being donated."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000,
+                required_nonconforming=2, max_conforming_utxos=5,
+            )
+            await db.update_mix(mix_id, state="collecting",
+                                input_type="p2wpkh", output_type="p2wpkh")
+            # 3.5M with only TWO addresses: funds support 3 mixed outputs, but
+            # 2 addresses -> 1 mixed + 2.5M change. Should nudge to 4 addresses.
+            a = await self._interested(db, mix_id, "ucA")
+            await self._commit(coord, chain, "ucA", [(TXID[0], 0, 3_500_000)])
+            await coord._cmd_provide_addresses(
+                FakeCtx("ucA"), "ucA", P2WPKH_ADDRS[0:2])
+            msg = nostr.sent_dms[-1][1].lower()
+            assert "donated" not in msg          # nothing is donated
+            assert "re-send /addresses" in msg
+            assert "easy to trace" in msg
+            # Suggests 4 addresses (3 mixed + 1 change), i.e. 2 more.
+            assert "with 4" in msg and "2 more" in msg
+            # And it actually kept all the sats as change (no burn).
+            outs = sorted(o["amount"] for o in await db.get_outputs_by_participant(a))
+            assert outs == [1_000_000, 2_500_000]
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_mixed_participant_assembly_preserves_conforming(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:

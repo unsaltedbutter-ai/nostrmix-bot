@@ -707,22 +707,43 @@ class Coordinator:
                 f"a change address. Re-send /addresses with {len(addrs) + 1} addresses "
                 f"(one extra) to keep it."
             )
+        # Warn when the no-burn rule had to sacrifice a mixed output because the
+        # participant is address-constrained: they have a spare-address change
+        # that EXCEEDS output_size (a funds-bound change is always < output_size,
+        # so chg_amt >= output_size with a spare address uniquely identifies the
+        # sacrifice). Nudge them to add addresses so they mix more and shrink
+        # this distinctive (toxic) change. Mutually exclusive with donation_note.
+        undermix_note = ""
+        if (is_nc and spare_change_addr and num_change
+                and chg_amt >= output_size and addrs_for_nc >= 2):
+            funds_max_equal = nc_total // output_size
+            potential_mixed = conforming_count + funds_max_equal
+            ideal_addrs = potential_mixed + 1  # one per mixed output + one change
+            potential_change = nc_total - funds_max_equal * output_size
+            undermix_note = (
+                f"\n⚠️ You sent {len(addrs)} address(es), so you'll mix {total_equal} "
+                f"output(s) and receive {chg_amt} sats of change — larger than the "
+                f"{output_size}-sat mix size, and easy to trace. Re-send /addresses "
+                f"with {ideal_addrs} ({ideal_addrs - len(addrs)} more) to mix "
+                f"{potential_mixed} output(s) and shrink your change to ~{potential_change} sats."
+            )
+        notes = donation_note + undermix_note
         if already_paid:
             new_state = "paid"
             await self.nostr.send_dm(
                 npub_hex,
-                summary + donation_note + "\nYou're already paid up; waiting for the mix to refill.",
+                summary + notes + "\nYou're already paid up; waiting for the mix to refill.",
             )
         elif service_fee <= 0:
             new_state = "paid"
             await self.nostr.send_dm(
-                npub_hex, summary + donation_note + f"\nNo service fee — you're all set for {mix_id}.",
+                npub_hex, summary + notes + f"\nNo service fee — you're all set for {mix_id}.",
             )
         else:
             new_state = "committed"
             await self.nostr.send_dm(
                 npub_hex,
-                summary + donation_note + f"\nPay {service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}.",
+                summary + notes + f"\nPay {service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}.",
             )
         await self.db.update_participant(pid, state=new_state, change_amount=chg_amt)
 
