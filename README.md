@@ -238,6 +238,10 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 
 ## Protocol commands
 
+> **Using the bot as a participant?** See the [**User's Guide**](docs/USER_GUIDE.md)
+> for the full walkthrough — joining, committing, verifying the PSBT before you
+> sign, toxic change, and re-mixing.
+
 Commands are matched case-insensitively; the `/` prefix is optional for `list`.
 
 - `/list` (or `open`, `mixes`) — list open mixes
