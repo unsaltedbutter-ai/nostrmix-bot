@@ -275,10 +275,44 @@ async def run(spec: dict, env_path: str, db_path: str, reset: bool) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Offline PSBT return-path test.")
+    ap = argparse.ArgumentParser(
+        prog="psbt_accept.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Test the coinjoin RETURN path offline: participant signs -> bot\n"
+            "validates -> combine -> finalize. The complement to psbt_dryrun.py.\n\n"
+            "Like the real bot, it assembles the skeleton ONCE and PERSISTS it in a\n"
+            "--db file, then validates returned PSBTs against that STORED skeleton\n"
+            "(never re-deriving it). It drives the REAL Coordinator._cmd_accept_psbt\n"
+            "(validate_returned signature checks + multi-mix matching) and combines\n"
+            "+ finalizes via the REAL PSBTManager. It computes the would-be txid but\n"
+            "NEVER broadcasts and never sends a DM.\n\n"
+            "Two passes (state carried in --db, just like the bot):\n"
+            "  Pass 1 (no \"signed_psbt\" in the spec): assembles + persists the\n"
+            "    skeleton and prints it plus each participant's input indices to sign.\n"
+            "  Pass 2 (\"signed_psbt\" filled in, same --db): loads the stored\n"
+            "    skeleton, accepts each signed PSBT, then combines + finalizes and\n"
+            "    prints the raw tx + txid (NOT broadcast).\n\n"
+            "Exit code: 0 = finalized OK, 1 = pass 1 / a rejection, 2 = bad input."
+        ),
+        epilog=(
+            "examples:\n"
+            "  python scripts/psbt_accept.py scripts/accept-mix.json          # pass 1\n"
+            "  # ...import the skeleton, sign in a wallet, paste into signed_psbt...\n"
+            "  python scripts/psbt_accept.py scripts/accept-mix.json          # pass 2\n"
+            "  python scripts/psbt_accept.py my.json --db /tmp/mix.db --reset\n\n"
+            "spec JSON: the psbt_dryrun spec plus an optional per-participant\n"
+            "\"signed_psbt\". Because the skeleton is persisted, \"fee_rate\" need NOT\n"
+            "be re-supplied on pass 2; it's optional (omit for a live estimate, pin a\n"
+            "number to run offline). Use real \"txid:vout\" inputs so a wallet can sign."
+        ),
+    )
     ap.add_argument("spec", help="mix spec JSON (see scripts/accept-mix.json)")
-    ap.add_argument("env", nargs="?", help="env file (default: auto-detected)")
-    ap.add_argument("--db", help="persistent state db (default: per-spec temp file)")
+    ap.add_argument("env", nargs="?",
+                    help="env file (default: auto-detected via BotConfig)")
+    ap.add_argument("--db", metavar="PATH",
+                    help="persistent state db carried between passes "
+                         "(default: a per-spec temp file)")
     ap.add_argument("--reset", action="store_true",
                     help="delete the db first and re-assemble from scratch")
     args = ap.parse_args()
