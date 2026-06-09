@@ -34,6 +34,7 @@ behaviour fully offline (pair with a fixed "fee_rate").
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -300,12 +301,39 @@ async def run(spec: dict, env_path: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: python scripts/psbt_dryrun.py <mix-spec.json> [env-file]")
-        return 2
-    with open(sys.argv[1]) as f:
+    ap = argparse.ArgumentParser(
+        prog="psbt_dryrun.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Preview the exact coinjoin the bot would assemble from a mix spec.\n\n"
+            "Feeds the spec through the REAL Coordinator._assemble_psbt against a\n"
+            "throwaway DB with stub Nostr/Lightning handlers, so the fee math,\n"
+            "conforming/non-conforming classification, under-funded drops, donation\n"
+            "handling, the pre-broadcast sum invariant, and the PSBT build are all\n"
+            "production code. It NEVER broadcasts and never sends a DM.\n\n"
+            "Prints intake verdicts, readiness, the per-participant accounting, the\n"
+            "assembled transaction with its fee breakdown, a privacy check, and the\n"
+            "unsigned PSBT hex (import into a wallet to inspect; do NOT broadcast).\n"
+            "Exit code: 0 = would reach signing, 1 = would not proceed, 2 = bad input."
+        ),
+        epilog=(
+            "examples:\n"
+            "  python scripts/psbt_dryrun.py scripts/example-mix.json\n"
+            "  python scripts/psbt_dryrun.py my-mix.json /path/to/nostrmix-bot.env\n\n"
+            "spec JSON: see scripts/example-mix.json. Use real \"txid:vout\" inputs\n"
+            "(looked up on-chain) for an importable PSBT, or synthetic {\"amount\":N}\n"
+            "inputs to model fee/output behaviour offline. Omit \"fee_rate\" for a\n"
+            "live mempool.space estimate (needs network); pin a number to run offline."
+        ),
+    )
+    ap.add_argument("spec", help="mix spec JSON (see scripts/example-mix.json)")
+    ap.add_argument("env", nargs="?",
+                    help="env file (default: auto-detected via BotConfig)")
+    args = ap.parse_args()
+
+    with open(args.spec) as f:
         spec = json.load(f)
-    env_path = sys.argv[2] if len(sys.argv) > 2 else BotConfig.find_env_path()
+    env_path = args.env or BotConfig.find_env_path()
     return asyncio.run(run(spec, env_path))
 
 

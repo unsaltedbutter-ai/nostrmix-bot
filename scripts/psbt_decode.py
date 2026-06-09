@@ -17,9 +17,9 @@ them (SIGHASH_ALL commits to them), so verifying the PSBT before you sign is
 final.
 
 Usage:
-    python scripts/decode_psbt.py <hex>                 # PSBT or raw-tx hex
-    python scripts/decode_psbt.py --file skeleton.txt
-    echo <hex> | python scripts/decode_psbt.py -
+    python scripts/psbt_decode.py <hex>                 # PSBT or raw-tx hex
+    python scripts/psbt_decode.py --file skeleton.txt
+    echo <hex> | python scripts/psbt_decode.py -
     ... [--mine bc1qaaa,bc1qbbb]                         # your receive addresses
 """
 from __future__ import annotations
@@ -80,10 +80,34 @@ def _read_hex(args) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Decode a PSBT or raw tx locally.")
-    ap.add_argument("hex", nargs="?", help="PSBT or raw-tx hex ('-' or omit for stdin)")
-    ap.add_argument("--file", help="read the hex from a file instead")
-    ap.add_argument("--mine", help="comma-separated list of YOUR addresses to verify")
+    ap = argparse.ArgumentParser(
+        prog="psbt_decode.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Decode a PSBT (or raw tx) locally and show what it pays — the\n"
+            "\"are these coins spendable by me?\" check. No node required.\n\n"
+            "For each output it prints the ADDRESS + amount + script type, flags\n"
+            "OP_RETURN / nonstandard outputs as UNSPENDABLE (a burn -> exit 1), and\n"
+            "for a PSBT computes the miner fee from the input amounts it carries.\n"
+            "Pass --mine to total what goes to YOUR addresses. Exit code: 0 = all\n"
+            "outputs spendable, 1 = an unspendable output found, 2 = bad input."
+        ),
+        epilog=(
+            "examples:\n"
+            "  python scripts/psbt_decode.py <psbt-or-rawtx-hex>\n"
+            "  python scripts/psbt_decode.py --file skeleton.txt\n"
+            "  cat skeleton.txt | python scripts/psbt_decode.py -\n"
+            "  python scripts/psbt_decode.py <hex> --mine bc1qaaa...,bc1qbbb...\n\n"
+            "tip: a PSBT carries input amounts (so the fee is shown); a finalized\n"
+            "raw tx does not, so only its outputs can be checked."
+        ),
+    )
+    ap.add_argument("hex", nargs="?",
+                    help="PSBT or raw-tx hex; use '-' or omit to read from stdin")
+    ap.add_argument("--file", metavar="PATH",
+                    help="read the hex from a file instead of the argument")
+    ap.add_argument("--mine", metavar="ADDR,ADDR",
+                    help="comma-separated list of YOUR addresses; totals what they receive")
     args = ap.parse_args()
 
     hx = _read_hex(args)
