@@ -47,13 +47,13 @@ _ADJECTIVES = [
 # Everyday objects — fruit/veg, cutlery, household items, gadgets, clothes, treats.
 # Short and common; longer words are kept only when very familiar.
 _NOUNS = [
-    "adapter", "apple", "apron", "bagel", "ball", "balloon", "banana", "basket",
+    "atom", "apple", "bag", "bagel", "ball", "balloon", "banana", "bat",
     "battery", "bean", "bed", "beet", "bell", "belt", "bench", "berry", "bike",
-    "biscuit", "blanket", "blender", "book", "boot", "bottle", "bowl", "box",
-    "bread", "brick", "broom", "brush", "bucket", "butter", "button", "cabbage",
+    "bit", "blanket", "blender", "book", "boot", "bottle", "bowl", "box",
+    "bread", "brick", "broom", "brush", "bucket", "butter", "button", "cab",
     "cabinet", "cable", "cake", "camera", "candle", "candy", "cap", "carpet",
     "carrot", "cashew", "celery", "cereal", "chair", "charger", "cheese",
-    "cherry", "chip", "clip", "clock", "coat", "coconut", "coin", "collar",
+    "cherry", "chip", "clip", "clock", "coat", "cork", "coin", "collar",
     "comb", "console", "cookie", "cord", "cork", "corn", "couch", "cracker",
     "crayon", "cup", "cupcake", "curtain", "desk", "dice", "dish", "disk",
     "domino", "donut", "door", "drawer", "dress", "drill", "drive", "drum",
