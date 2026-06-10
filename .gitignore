@@ -1,4 +1,5 @@
 venv
+logs
 .DS_Store
 nostrmix-bot.env
 nostrmix-questions.md
