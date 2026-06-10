@@ -81,10 +81,15 @@ def main() -> int:
         return 2
 
     space = mn.SPACE
+    words = mn.ADJECTIVES + mn.NOUNS
+    avg_len = sum(len(w) for w in words) / len(words)
+    pct_short = 100 * sum(len(w) <= 5 for w in words) // len(words)
     print("== word space ==")
     print(f"  adjectives: {len(mn.ADJECTIVES)}   nouns: {len(mn.NOUNS)}")
     print(f"  distinct adjective-noun names: {space:,}")
     print(f"  (with one numeric suffix 2..10 that's ~{space*9:,} more)")
+    print(f"  word length: avg {avg_len:.1f}, {pct_short}% are <=5 letters "
+          f"(short = easier to retype on a phone)")
 
     names = []
     if args.mode == "random":

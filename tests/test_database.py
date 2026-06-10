@@ -265,3 +265,48 @@ class TestDatabase:
             assert survived is not None, "data didn't survive the reconnect"
         finally:
             await db2.close()
+
+
+class TestDestroyAndOwed:
+    @pytest.mark.asyncio
+    async def test_destroy_mix_data_wipes_all_bitcoin_data(self):
+        """destroy_mix_data must remove every UTXO, output, PSBT round, the
+        participants, and the mix row — no bitcoin info left behind."""
+        db = await make_db()
+        try:
+            mid = await db.create_mix(output_size=1_000_000)
+            pid = await db.add_participant(mid, "npubX", "x@x")
+            await db.add_utxo(pid, "aa" * 32, 0, 2_000_000, "p2wpkh", "0014" + "00" * 20)
+            await db.add_output(pid, "bc1qexampleaddr0000000000000000000000000", 1_000_000)
+            await db.add_psbt_round(mid, pid, round_num=1)
+
+            # Sanity: the rows exist first.
+            assert await db.get_utxos_by_participant(pid)
+            assert await db.get_outputs_by_participant(pid)
+            assert await db.get_psbt_rounds_by_mix(mid)
+
+            await db.destroy_mix_data(mid)
+
+            assert await db.get_mix(mid) is None
+            assert await db.get_participants_by_mix(mid) == []
+            assert await db.get_utxos_by_participant(pid) == []
+            assert await db.get_outputs_by_participant(pid) == []
+            assert await db.get_psbt_rounds_by_mix(mid) == []
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_add_refund_owed_is_idempotent(self):
+        """A debt is keyed on the opaque participant id, so re-recording the
+        same one (crash-resume) is a no-op rather than a duplicate."""
+        db = await make_db()
+        try:
+            await db.add_refund_owed("pid-1", "owed@x", 950, "cancelled: boom")
+            await db.add_refund_owed("pid-1", "owed@x", 950, "cancelled: boom")  # again
+            await db.add_refund_owed("pid-2", "two@x", 100, "completed")
+            owed = await db.get_refunds_owed()
+            assert len(owed) == 2
+            by_addr = {o["lightning_addr"]: o["sats"] for o in owed}
+            assert by_addr == {"owed@x": 950, "two@x": 100}
+        finally:
+            await db.close()

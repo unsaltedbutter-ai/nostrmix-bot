@@ -171,21 +171,6 @@ class Database:
         await self._execute("DELETE FROM participants WHERE mix_id=?", (mix_id,))
         await self._conn.commit()
 
-    async def scrub_participants_for_mix(self, mix_id: str):
-        """S-F: clear npub_hex / lightning_addr from every participant in a
-        mix so a cancelled mix leaves no on-disk privacy footprint.
-
-        Used by _cancel_and_refund. Keeps the participant rows (so 'refunded' /
-        'refund_failed' / 'cancelled' state remains queryable for the operator)
-        but blanks the identifying fields. Blacklist entries are stored
-        separately and untouched.
-        """
-        await self._execute(
-            "UPDATE participants SET npub_hex='', lightning_addr='' WHERE mix_id=?",
-            (mix_id,),
-        )
-        await self._conn.commit()
-
     async def delete_participant(self, pid: str):
         await self._execute("DELETE FROM participants WHERE id=?", (pid,))
         await self._conn.commit()

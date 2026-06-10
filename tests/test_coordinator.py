@@ -1940,6 +1940,8 @@ class TestBroadcastSweep:
             pid = await db.add_participant(mix_id, "npub_signed", "")
             await db.update_participant(pid, state="signed")
             await db.add_utxo(pid, TXID[0], 0, 100_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(pid, P2WPKH_ADDRS[0], 100_000)
+            await db.add_psbt_round(mix_id, pid, round_num=1)
 
             chain.confirmed["finaltxid_xyz"] = True
 
@@ -1947,11 +1949,13 @@ class TestBroadcastSweep:
             await db.set_setting("last_broadcast_check_unix", "0")
             await coord._broadcast_sweep(int(time.time()))
 
-            # All trace gone except blacklist (which we didn't add to).
+            # All bitcoin data gone (mix, participant, utxos, outputs, psbt).
             mix_after = await db.get_mix(mix_id)
             assert mix_after is None, "mix should be wiped after confirmation"
             assert await db.get_participant(pid) is None
             assert await db.get_utxos_by_participant(pid) == []
+            assert await db.get_outputs_by_participant(pid) == []
+            assert await db.get_psbt_rounds_by_mix(mix_id) == []
             # And the signer got a confirmation DM.
             dms = [m for r, m in nostr.sent_dms if r == "npub_signed"]
             assert any("finaltxid_xyz" in m for m in dms)
