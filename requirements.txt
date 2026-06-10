@@ -10,7 +10,7 @@
 # (conftest.py imports the same shim for tests). Delete that module if/when
 # bitcointx ships a release with the renamed names.
 
-nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0
+nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.1
 # Pinned: the conftest.py libsecp256k1 symbol-rename shim is written against
 # 1.1.5's loader internals. A 1.2+ release could change those and break tests.
 python-bitcointx==1.1.5
