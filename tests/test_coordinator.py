@@ -4805,7 +4805,7 @@ class TestListAutoCreate:
             assert available[0]["output_size"] == coord.cfg.DEFAULT_OUTPUT_SIZE
             msg = nostr.sent_dms[-1][1].lower()
             assert "no open mixes" not in msg   # not the come-back-later line
-            assert "btc outputs" in msg          # the new mix is listed
+            assert "btc" in msg                  # the new mix is listed
         finally:
             await db.close()
 

@@ -163,16 +163,16 @@ class CommandParser:
     # to the user's current stage — every command still works regardless of
     # whether it's listed (the list only shapes guidance, not behaviour).
     _HELP_CATALOG = [
-        ("list", "/list — show open mixes you can join"),
-        ("join", "/join <mix>  (or /join 0.01 to pick a size) — join a mix"),
-        ("commit", "/commit <txid:vout> … — register the UTXOs you're mixing"),
-        ("addresses", "/addresses <addr> … — addresses to receive your outputs"),
-        ("psbt_accept", "/psbt_accept <hex> — return your signed PSBT"),
-        ("cancel", "/cancel — leave a mix"),
+        ("list", "/list — open mixes"),
+        ("join", "/join <mix> — join (or /join 0.01)"),
+        ("commit", "/commit <txid:vout> … — add UTXOs"),
+        ("addresses", "/addresses <addr> … — payout addrs"),
+        ("psbt_accept", "/psbt_accept <hex> — return signed PSBT"),
+        ("cancel", "/cancel — leave"),
     ]
 
     def format_help(self, commands: List[str],
-                    header: str = "Commands available to you:") -> str:
+                    header: str = "Commands:") -> str:
         """Render the help text for just the given command keys, in catalog
         order. Unknown keys are ignored; `list` is always shown as a floor so a
         user is never left without a way to see open mixes."""
@@ -195,19 +195,13 @@ class CommandParser:
             state = mix.get("state", "collecting")
             req = mix.get("required_nonconforming")
             cap = mix.get("max_conforming_utxos")
-            extra = ""
+            parts = [f"{name}: {output_btc:.4f} BTC"]
             if req:
-                extra += f" Needs {req} mixer(s)."
+                parts.append(f"needs {req}")
             if cap:
-                extra += (
-                    f" Up to {cap} same-size ({output_btc:.4f} BTC) UTXOs welcome "
-                    f"free of charge."
-                )
-            lines.append(
-                f"mix {name}: {output_btc:.4f} BTC outputs ({state})."
-                + extra
-                + " p2wpkh addresses only."
-            )
+                parts.append(f"+{cap} same-size free")
+            parts.append("p2wpkh")
+            lines.append(" · ".join(parts))
         return "\n".join(lines)
 
     def format_paid_confirmation(self, mix_id: str, waiting: int) -> str:
