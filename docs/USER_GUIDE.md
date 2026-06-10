@@ -130,9 +130,7 @@ same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
 /join silver-cupcake
 ```
 
-The bot registers your interest and asks for your UTXOs and addresses. If you
-type the two words with a space instead of the hyphen — `/join silver cupcake` —
-the bot understands that too.
+The bot registers your interest and asks for your UTXOs and addresses.
 
 **Start a new mix:** there's no separate "create" command and you can't pick the
 size — mixes use the operator's defaults (typically **0.01 BTC** outputs,
@@ -140,8 +138,7 @@ size — mixes use the operator's defaults (typically **0.01 BTC** outputs,
 and the bot spins up a fresh default mix and puts you in it automatically.
 
 > One at a time: finish `/commit` **and** `/addresses` (and pay, if a fee is
-> charged) for your current mix before joining another. You can be in up to a few
-> *paid* mixes at once (default cap 5).
+> charged) for your current mix before joining another.
 
 ---
 
