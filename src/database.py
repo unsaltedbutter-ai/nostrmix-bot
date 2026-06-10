@@ -6,6 +6,8 @@ import uuid
 import time
 from typing import Optional, List, Dict, Any, Tuple
 
+from . import mix_names
+
 
 def _hex_id() -> str:
     """Short random hex ID for rows."""
@@ -71,20 +73,33 @@ class Database:
                          deadline_unix: Optional[int] = None,
                          required_nonconforming: int = 3,
                          max_conforming_utxos: int = 10) -> str:
-        mid = _hex_id()
         now = _now()
         deadline = deadline_unix if deadline_unix is not None else now + 3600 * 12  # 12 hour default
-        await self._execute(
-            """INSERT INTO mixes (id, output_size, max_participants,
-               required_nonconforming, max_conforming_utxos,
-               fee_per_element, state, deadline_unix, created_at_unix, updated_at_unix)
-               VALUES (?, ?, ?, ?, ?, ?, 'announced', ?, ?, ?)""",
-            (mid, output_size, max_participants,
-             required_nonconforming, max_conforming_utxos,
-             fee_per_element, deadline, now, now),
-        )
-        await self._conn.commit()
-        return mid
+        # Friendly adjective-noun name (BIP-39 words) as the id. It only needs to
+        # be unique among LIVE mixes — finished/failed mixes are destroyed — so a
+        # clash is rare. The PRIMARY KEY makes the INSERT the atomic uniqueness
+        # check: on the rare IntegrityError we just pick another name, and after a
+        # few tries fall back to a short suffix so creation can never livelock.
+        for attempt in range(64):
+            mid = mix_names.random_name()
+            if attempt >= 8:
+                mid = f"{mid}-{_hex_id()[:4]}"
+            try:
+                await self._execute(
+                    """INSERT INTO mixes (id, output_size, max_participants,
+                       required_nonconforming, max_conforming_utxos,
+                       fee_per_element, state, deadline_unix, created_at_unix, updated_at_unix)
+                       VALUES (?, ?, ?, ?, ?, ?, 'announced', ?, ?, ?)""",
+                    (mid, output_size, max_participants,
+                     required_nonconforming, max_conforming_utxos,
+                     fee_per_element, deadline, now, now),
+                )
+                await self._conn.commit()
+                return mid
+            except sqlite3.IntegrityError:
+                await self._conn.rollback()
+                continue
+        raise RuntimeError("could not allocate a unique mix name")
 
     async def get_mix(self, mix_id: str) -> Optional[Dict]:
         return await self._fetchone("SELECT * FROM mixes WHERE id = ?", (mix_id,))
