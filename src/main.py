@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import logging
+from urllib.parse import urlparse
 
 # Add src to path
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nostrmix-bot")
 
+# ANSI styling for the startup mast. Renders when the log is tailed in a
+# terminal; harmless escape bytes in the raw file.
+_R, _B, _DIM = "\033[0m", "\033[1m", "\033[2m"
+_GRN, _RED, _CYN, _YEL = "\033[32m", "\033[31m", "\033[36m", "\033[33m"
+
+
+def _git_revision(root: str) -> tuple[str, str | None]:
+    """Return (short_sha, branch) by reading .git directly — no `git` binary
+    needed (it may be absent under launchd). Returns ("unknown", None) on any
+    problem. Handles a .git *file* (worktree), a loose ref, and packed-refs."""
+    try:
+        git_dir = os.path.join(root, ".git")
+        if os.path.isfile(git_dir):  # worktree/submodule: .git points elsewhere
+            with open(git_dir) as f:
+                content = f.read().strip()
+            if content.startswith("gitdir:"):
+                git_dir = content[len("gitdir:"):].strip()
+                if not os.path.isabs(git_dir):
+                    git_dir = os.path.normpath(os.path.join(root, git_dir))
+        with open(os.path.join(git_dir, "HEAD")) as f:
+            head = f.read().strip()
+        if head.startswith("ref:"):
+            ref = head[4:].strip()
+            branch = ref.rsplit("/", 1)[-1]
+            ref_path = os.path.join(git_dir, ref)
+            if os.path.exists(ref_path):
+                with open(ref_path) as f:
+                    sha = f.read().strip()
+            else:  # ref is packed
+                sha = ""
+                packed = os.path.join(git_dir, "packed-refs")
+                if os.path.exists(packed):
+                    with open(packed) as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith(("#", "^")) \
+                                    and line.endswith(" " + ref):
+                                sha = line.split(" ", 1)[0]
+                                break
+        else:  # detached HEAD: the file holds the sha itself
+            sha, branch = head, "detached"
+        if sha:
+            return sha[:7], branch
+    except Exception:
+        pass
+    return "unknown", None
+
+
+def _startup_banner(cfg: BotConfig, env_path: str) -> None:
+    """Print a visual mast + the most operator-relevant config to stderr (the
+    log stream), marking the start of a fresh process run."""
+    sha, branch = _git_revision(ROOT_DIR)
+    rev = sha if branch is None else f"{sha} ({branch})"
+    relays = cfg.NOSTR_RELAYS
+    relay_hosts = ", ".join(urlparse(u).hostname or u for u in relays) or "(none)"
+    lud16 = cfg.BOT_LUD16 or f"{_DIM}(none){_R}"
+    zaps = f"{_GRN}OFF{_R}" if cfg.FEE_PER_ELEMENT == 0 else f"{_YEL}ON{_R}"
+    btc = cfg.DEFAULT_OUTPUT_SIZE / 1e8
+    bar = f"{_GRN}{'═' * 64}{_R}"
+    lines = [
+        "",
+        bar,
+        f"{_GRN}{_B}  ▶  N O S T R M I X   B O T   —   starting{_R}",
+        bar,
+        f"  {_CYN}commit  {_R}: {_B}{rev}{_R}",
+        f"  {_CYN}config  {_R}: {env_path}",
+        f"  {_CYN}bot     {_R}: {_B}{cfg.BOT_NAME}{_R}  {lud16}",
+        f"  {_CYN}relays  {_R}: {len(relays)} → {relay_hosts}",
+        f"  {_CYN}mix size{_R}: {cfg.DEFAULT_OUTPUT_SIZE:,} sats  ({btc:.8f} BTC)",
+        f"  {_CYN}min utxo{_R}: {cfg.MINIMUM_UTXO_SIZE:,} sats",
+        f"  {_CYN}required{_R}: {_B}{cfg.DEFAULT_REQUIRED_NONCONFORMING}{_R} "
+        f"non-conforming participant(s) per mix",
+        f"  {_CYN}fee/elem{_R}: {cfg.FEE_PER_ELEMENT} sats  (zaps {zaps})",
+        bar,
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
 
 async def main():
     """Main entry point."""
@@ -35,7 +114,7 @@ async def main():
     # 1. Load configuration
     env_path = BotConfig.find_env_path()
     cfg = BotConfig(env_path)
-    logger.info(f"Config loaded from {env_path}")
+    _startup_banner(cfg, env_path)
 
     # 2. Initialize database
     db = Database(cfg.DB_PATH)
