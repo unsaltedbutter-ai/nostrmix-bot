@@ -1723,9 +1723,9 @@ class TestBroadcast409TreatedAsSuccess:
             active = await db.get_participants_by_mix(mix_id)
             await coord._assemble_psbt(await db.get_mix(mix_id), active)
 
-            mix_after = await db.get_mix(mix_id)
-            assert mix_after["state"] == "cancelled", (
-                f"should cancel when NC survivors < required_nonconforming; got {mix_after['state']}"
+            # Cancel now DESTROYS the mix entirely (leave no trace on failure).
+            assert await db.get_mix(mix_id) is None, (
+                "should destroy the mix when NC survivors < required_nonconforming"
             )
         finally:
             await db.close()
@@ -1874,9 +1874,8 @@ class TestCombineAndBroadcast:
                       if p["state"] == "signed"]
             await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
 
-            mix_after = await db.get_mix(mix_id)
-            assert mix_after["state"] == "cancelled"
-            assert mix_after["broadcast_txid"] is None
+            # Failure destroys the mix (no lingering 'cancelled' row / txid).
+            assert await db.get_mix(mix_id) is None
             # Refunds attempted for both
             assert {r[0] for r in lightning.refunds} == {"a@x", "b@x"}
         finally:
@@ -1917,8 +1916,7 @@ class TestCombineAndBroadcast:
                       if p["state"] == "signed"]
             await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
 
-            mix_after = await db.get_mix(mix_id)
-            assert mix_after["state"] == "cancelled"
+            assert await db.get_mix(mix_id) is None  # destroyed on failure
             assert chain.broadcast_calls == [], "broadcast must not be attempted"
         finally:
             await db.close()
@@ -2389,17 +2387,20 @@ class TestRefundIdempotency:
             await db.update_participant(pid, state="paid", fee_paid=1000)
             await db.add_utxo(pid, TXID[0], 0, 500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
 
-            # First call: refund goes through, state moves to 'refunded'.
-            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
-            assert (await db.get_participant(pid))["state"] == "refunded"
+            # First call: refund goes through, then the mix is destroyed.
+            mix = await db.get_mix(mix_id)
+            await coord._cancel_and_refund(mix, "test")
             first_count = len(lightning.refunds)
             assert first_count == 1
+            assert await db.get_mix(mix_id) is None       # destroyed on failure
+            assert await db.get_participant(pid) is None   # participant wiped
+            # Fee was refunded successfully, so nothing is owed.
+            assert await db.get_refunds_owed() == []
 
-            # Simulate the bot crashing right after the state update — the
-            # next event-loop tick would re-enter _cancel_and_refund on the
-            # same participant. Must not pay twice.
-            await coord._cancel_and_refund(await db.get_mix(mix_id), "test (resume)")
-            assert (await db.get_participant(pid))["state"] == "refunded"
+            # Simulate the bot crashing right after the refund but before the
+            # destroy — the next tick re-enters _cancel_and_refund with the now
+            # stale mix dict. Participants are gone, so it must NOT pay again.
+            await coord._cancel_and_refund(mix, "test (resume)")
             assert len(lightning.refunds) == first_count, (
                 "C-B regression: second cancel_and_refund call paid again"
             )
@@ -2442,12 +2443,15 @@ class TestRefundIdempotency:
 
             await coord._cancel_and_refund(await db.get_mix(mix_id), "resume")
             # Should not have attempted a refund — state was already
-            # 'refunding' so we skipped.
+            # 'refunding' so we skipped (no double-pay).
             assert lightning.refunds == [], (
                 f"C-B regression: refunded a 'refunding' participant; got {lightning.refunds}"
             )
-            # State stays 'refunding' (operator must investigate).
-            assert (await db.get_participant(pid))["state"] == "refunding"
+            # The mix is destroyed (the in-flight 'refunding' case is logged for
+            # the operator, not recorded as a payable debt — outcome unknown).
+            assert await db.get_mix(mix_id) is None
+            assert await db.get_participant(pid) is None
+            assert await db.get_refunds_owed() == []
         finally:
             await db.close()
 
@@ -2465,8 +2469,15 @@ class TestRefundIdempotency:
             lightning.send_refund = fail_refund
 
             await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
-            assert (await db.get_participant(pid))["state"] == "refund_failed"
             assert len(lightning.refunds) == 1
+            # The mix is destroyed, but the failed refund leaves a MINIMAL debt
+            # record (who we owe + how much) so the operator can reconcile.
+            assert await db.get_mix(mix_id) is None
+            assert await db.get_participant(pid) is None
+            owed = await db.get_refunds_owed()
+            assert len(owed) == 1
+            assert owed[0]["lightning_addr"] == "br@x"
+            assert owed[0]["sats"] == coord._refund_keep_math(1000)
         finally:
             await db.close()
 
@@ -2591,8 +2602,7 @@ class TestPreRefundChainCheck:
                       if p["state"] == "signed"]
             await coord._combine_and_broadcast(await db.get_mix(mix_id), signed)
 
-            after = await db.get_mix(mix_id)
-            assert after["state"] == "cancelled"
+            assert await db.get_mix(mix_id) is None  # destroyed on failure
             assert {r[0] for r in lightning.refunds} == {"a@x", "b@x"}
         finally:
             await db.close()
@@ -2725,10 +2735,9 @@ class TestSumInvariantCancelsBadFeeMath:
 
             await coord._assemble_psbt(mix_row, active)
 
-            # The invariant trips → mix cancels.
-            after = await db.get_mix(mix_id)
-            assert after["state"] == "cancelled", (
-                f"S-E regression: assembled a 0-miner-fee tx; state={after['state']}"
+            # The invariant trips → mix cancels → destroyed.
+            assert await db.get_mix(mix_id) is None, (
+                "S-E regression: assembled a 0-miner-fee tx instead of destroying the mix"
             )
         finally:
             await db.close()
@@ -2821,10 +2830,35 @@ class TestBatchedCommitRejectionDMs:
             await db.close()
 
 
-# --- S-F: scrub_participants_for_mix on cancel ---
+# --- S-F: cancel destroys all participant data (was: scrub identifiers) ---
 
 
 class TestCancelScrubsIdentifiers:
+    @pytest.mark.asyncio
+    async def test_cancel_destroys_all_child_rows(self):
+        """Failure leaves no trace: the mix, its participants, and every child
+        row (utxos, outputs, psbt rounds) are gone — not just scrubbed."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            pid = await db.add_participant(mix_id, "npub_full", "full@x")
+            await db.update_participant(pid, state="paid", fee_paid=0)
+            await db.add_utxo(pid, TXID[0], 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(pid, P2WPKH_ADDRS[0], 1_000_000)
+            await db.add_psbt_round(mix_id, pid, round_num=1)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "boom")
+
+            assert await db.get_mix(mix_id) is None
+            assert await db.get_participants_by_mix(mix_id) == []
+            assert await db.get_utxos_by_participant(pid) == []
+            assert await db.get_outputs_by_participant(pid) == []
+            assert await db.get_psbt_rounds_by_mix(mix_id) == []
+            assert await db.get_refunds_owed() == []  # free mix owes nothing
+        finally:
+            await db.close()
+
+
     @pytest.mark.asyncio
     async def test_cancelled_mix_blanks_npub_and_lud16(self):
         coord, db, nostr, chain, lightning = await make_coord()
@@ -2836,11 +2870,12 @@ class TestCancelScrubsIdentifiers:
 
             await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
 
-            row = await db.get_participant(pid)
-            # State is preserved (refunded), but identifiers are gone.
-            assert row["state"] in ("refunded", "refund_failed", "cancelled")
-            assert row["npub_hex"] == "", f"S-F: npub_hex leaked: {row['npub_hex']!r}"
-            assert row["lightning_addr"] == "", f"S-F: lud16 leaked: {row['lightning_addr']!r}"
+            # S-F (strengthened): cancel now DESTROYS the mix outright, so there's
+            # no participant row left to leak npub/lud16, and the mix itself is
+            # gone. The fee here was refunded, so no debt record remains either.
+            assert await db.get_participant(pid) is None
+            assert await db.get_mix(mix_id) is None
+            assert await db.get_refunds_owed() == []
         finally:
             await db.close()
 
@@ -3469,7 +3504,7 @@ class TestConformingModelGaps:
 
             await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
 
-            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+            assert await db.get_mix(mix_id) is None  # destroyed on failure
         finally:
             await db.close()
 
@@ -3573,9 +3608,10 @@ class TestLowerPriorityGaps:
 
             await coord._cancel_and_refund(await db.get_mix(mix_id), "test cancel")
 
-            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+            assert await db.get_mix(mix_id) is None  # destroyed on failure
             assert lightning.refunds == [], "fee=0 mix has nothing to refund"
-            assert (await db.get_participant(pid))["state"] == "cancelled"
+            assert await db.get_participant(pid) is None  # participant wiped too
+            assert await db.get_refunds_owed() == []  # free mix owes nothing
         finally:
             await db.close()
 
@@ -3756,7 +3792,7 @@ class TestReviewGaps:
             active = await db.get_participants_by_mix(mix_id)
             await coord._assemble_psbt(await db.get_mix(mix_id), active)
 
-            assert (await db.get_mix(mix_id))["state"] == "cancelled"
+            assert await db.get_mix(mix_id) is None  # destroyed on failure
         finally:
             await db.close()
 

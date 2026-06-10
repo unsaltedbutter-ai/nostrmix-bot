@@ -112,6 +112,21 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- Outstanding refund debts. When a mix is destroyed (confirmed OR failed) every
+-- trace of it is wiped — EXCEPT, for a participant whose service-fee refund the
+-- Lightning backend rejected (state 'refund_failed'), a minimal record of who we
+-- owe and how much, so the operator can reconcile by hand. Deliberately holds no
+-- mix link, no npub, no UTXOs/outputs/PSBT — just the Lightning address + sats.
+-- The opaque participant_id is the PK only so re-recording on crash-resume is a
+-- no-op (INSERT OR IGNORE). Only ever populated when a service fee was charged.
+CREATE TABLE IF NOT EXISTS refunds_owed (
+    participant_id  TEXT PRIMARY KEY,
+    lightning_addr  TEXT NOT NULL,
+    sats            INTEGER NOT NULL,
+    reason          TEXT,
+    created_at_unix INTEGER NOT NULL
+);
+
 -- Indices for common query patterns
 CREATE INDEX IF NOT EXISTS idx_participants_mix ON participants(mix_id);
 CREATE INDEX IF NOT EXISTS idx_participants_npub ON participants(npub_hex);

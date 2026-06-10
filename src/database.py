@@ -492,3 +492,23 @@ class Database:
         await self._execute("DELETE FROM announcements WHERE mix_id=?", (mix_id,))
         await self._execute("DELETE FROM mixes WHERE id=?", (mix_id,))
         await self._conn.commit()
+
+    # --- Outstanding refund debts (survive mix destruction) ---
+
+    async def add_refund_owed(self, participant_id: str, lightning_addr: str,
+                              sats: int, reason: str = ""):
+        """Record a minimal debt for a failed refund. Idempotent: re-recording
+        the same participant_id (e.g. on crash-resume) is a no-op."""
+        await self._execute(
+            """INSERT OR IGNORE INTO refunds_owed
+               (participant_id, lightning_addr, sats, reason, created_at_unix)
+               VALUES (?, ?, ?, ?, ?)""",
+            (participant_id, lightning_addr, sats, reason, _now()),
+        )
+        await self._conn.commit()
+
+    async def get_refunds_owed(self) -> List[Dict]:
+        """All outstanding refund debts, for operator reconciliation."""
+        return await self._fetchall(
+            "SELECT * FROM refunds_owed ORDER BY created_at_unix"
+        )

@@ -2027,7 +2027,7 @@ class Coordinator:
                     except Exception:
                         pass
 
-            await self.db.destroy_mix_data(mix_id)
+            await self._destroy_mix(mix_id, "completed")
             # Privacy: mix token only — pairing it with the public txid
             # would let an observer map every participant in the local
             # logs onto the on-chain coinjoin.
@@ -2106,6 +2106,47 @@ class Coordinator:
 
     # --- Cancel and Refund ---
 
+    async def _destroy_mix(self, mix_id: str, reason: str):
+        """Wipe every trace of a terminal mix (confirmed OR failed), preserving
+        ONLY a minimal debt record for any participant whose service-fee refund
+        the Lightning backend rejected. Used by both terminal paths so no
+        failed-refund debt is lost when the mix is destroyed.
+
+        Idempotent: add_refund_owed is INSERT OR IGNORE (keyed on the opaque
+        participant id) and destroy_mix_data on an already-gone mix is a no-op,
+        so a crash-resume that re-enters here does no harm.
+        """
+        participants = await self.db.get_participants_by_mix(mix_id)
+        for p in participants:
+            state = p.get("state")
+            if state == "refund_failed":
+                lud16 = (p.get("lightning_addr") or "").strip()
+                fee_paid = int(p.get("fee_paid") or 0)
+                owed = self._refund_keep_math(fee_paid) if fee_paid > 0 else 0
+                if lud16 and owed > 0:
+                    await self.db.add_refund_owed(p["id"], lud16, owed, reason)
+                else:
+                    # No address (or nothing owed) — we can't record a payable
+                    # debt. Log it (tokenised) before the row is destroyed so the
+                    # operator at least knows a reconciliation is outstanding.
+                    logger.error(
+                        "Mix %s: participant %s was refund_failed but has no "
+                        "Lightning address to owe to (fee_paid=%d); cannot record debt",
+                        tokens.m(mix_id), tokens.p(p["npub_hex"]), fee_paid,
+                    )
+            elif state == "refunding":
+                # In-flight refund whose outcome we never confirmed (a crash
+                # mid-payout). It MIGHT have been paid, so we can't safely record
+                # it as owed (double-pay risk). Log loudly before destroying.
+                logger.error(
+                    "Mix %s: participant %s left in 'refunding' (in-flight refund, "
+                    "fee_paid=%d) when destroyed — operator must verify whether the "
+                    "Lightning payout settled",
+                    tokens.m(mix_id), tokens.p(p["npub_hex"]),
+                    int(p.get("fee_paid") or 0),
+                )
+        await self.db.destroy_mix_data(mix_id)
+
     async def _cancel_and_refund(self, mix: Dict, reason: str):
         """Cancel a mix and refund all non-blacklisted participants.
 
@@ -2160,17 +2201,13 @@ class Coordinator:
                 await self.db.update_participant(p["id"], state="cancelled")
                 await self.nostr.send_dm(p["npub_hex"], f"Mix {mix_id} cancelled: {reason}.")
 
-        await self.db.update_mix(mix_id, state="cancelled")
-        # Clean up associated records. utxos must go too: now that the
-        # schema enforces UNIQUE(txid, vout), leaving rows around would
-        # permanently block the same outpoints from being committed to
-        # any future mix.
-        await self.db.delete_outputs_for_mix(mix_id)
-        await self.db.delete_utxos_for_mix(mix_id)
-        # S-F: also wipe per-participant identifiers (npub_hex, lightning_addr)
-        # so a cancelled mix leaves no privacy footprint. Blacklist entries
-        # for ghosters are preserved separately.
-        await self.db.scrub_participants_for_mix(mix_id)
+        # Destroy ALL mix data (the requirement: leave no trace once a mix is
+        # confirmed OR failed). This subsumes the old scrub-and-keep — utxos,
+        # outputs, psbt rounds, participant identifiers, and the mix row all go.
+        # The only thing preserved is a minimal debt for any refund_failed
+        # participant (recorded inside _destroy_mix). Blacklist entries for
+        # ghosters live in a separate table and are untouched.
+        await self._destroy_mix(mix_id, f"cancelled: {reason}")
 
     # --- Lifecycle ---
 
