@@ -389,17 +389,15 @@ class TestRuntimeLogsHaveNoLeaks:
         class _NoOpCfg:
             BTCPAY_URL = BTCPAY_STORE = BTCPAY_API_KEY = ""
 
-        class FakeBtcPay:
-            async def send_to_lud16(self, *_):
+        class FakePayer:
+            async def pay(self, lud16, amount_sats, **_):
                 raise RuntimeError("BTCPay refused with secret_payload deadbeefdeadbeef")
-            async def get_balance(self): return 0
 
         h = LightningHandler(_NoOpCfg())
-        h._btcpay_wallet = FakeBtcPay()
-        h._lnurl_payer = None
+        h._payer = FakePayer()
 
         lud16 = "alice@secret.example.com"
-        with caplog.at_level(logging.WARNING, logger="src.lightning_handler"):
+        with caplog.at_level(logging.ERROR, logger="src.lightning_handler"):
             await h.send_refund(lud16, 1000, reason="test_reason")
 
         _assert_no_secrets_in(

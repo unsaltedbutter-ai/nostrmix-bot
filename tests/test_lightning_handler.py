@@ -1,12 +1,16 @@
-"""Tests for LightningHandler — refund paths and silent-failure logging.
+"""Tests for LightningHandler — the single LNURL-pay refund path.
 
-The handler depends on nostrbot_sdk's BtcPayWallet and LnurlPayer. We stub
-those out by swapping in fakes on the handler instance after construction,
-so we never touch the real SDK objects or hit a network.
+The handler delegates to nostrbot_sdk's LnurlPayer (which itself pays resolved
+invoices via a BtcPayWallet). We swap a fake payer onto the handler instance so
+we never hit a network, PLUS one interface-pinning test that imports the REAL
+SDK classes and asserts their signatures still match how the handler calls them
+— so a future SDK bump that renames/repositions an argument fails loudly here
+instead of silently breaking every refund in production.
 """
 
 import os
 import sys
+import inspect
 import logging
 import pytest
 
@@ -16,156 +20,131 @@ sys.path.insert(0, ROOT)
 from src.lightning_handler import LightningHandler
 
 
-class FakeBtcPay:
-    def __init__(self, send_raises: bool = False, balance: int = 10_000,
-                 balance_raises: bool = False):
-        self.send_raises = send_raises
-        self.balance = balance
-        self.balance_raises = balance_raises
-        self.send_calls: list = []
+class _Result:
+    """Stand-in for nostrbot_sdk.PayoutResult (status/fee_sats/actual_sats)."""
 
-    async def send_to_lud16(self, lud16, sats):
-        self.send_calls.append((lud16, sats))
-        if self.send_raises:
-            raise RuntimeError("btcpay 401")
-        return ("ok", sats)
-
-    async def get_balance(self):
-        if self.balance_raises:
-            raise RuntimeError("btcpay get_balance 500")
-        return self.balance
+    def __init__(self, status="paid", fee_sats=1, actual_sats=None):
+        self.status = status
+        self.fee_sats = fee_sats
+        self.actual_sats = actual_sats
 
 
-class FakeLnurlPayer:
-    def __init__(self, pay_raises: bool = False):
-        self.pay_raises = pay_raises
+class FakePayer:
+    """Matches LnurlPayer.pay(lud16, amount_sats, *, ...) → PayoutResult."""
+
+    def __init__(self, status="paid", raises=False):
+        self.status = status
+        self.raises = raises
         self.pay_calls: list = []
 
-    async def pay(self, lud16, amount_sats, fee_policy, zap_request):
+    async def pay(self, lud16, amount_sats, *, zap_target_pubkey=None,
+                  comment=None, source_url=""):
         self.pay_calls.append((lud16, amount_sats))
-        if self.pay_raises:
+        if self.raises:
             raise RuntimeError("lnurl 503")
-        return ("lnurl-paid", amount_sats)
+        return _Result(status=self.status, actual_sats=amount_sats)
 
 
 class _NoOpConfig:
-    """The handler only reads BTCPAY_URL/STORE/API_KEY off the config in
-    init(), and we never call init() in these tests — we wire fakes directly."""
+    """The handler reads BTCPAY_* off the config only in init(), which these
+    tests don't call — we wire the fake payer directly."""
     BTCPAY_URL = ""
     BTCPAY_STORE = ""
     BTCPAY_API_KEY = ""
 
 
-def _make_handler(btcpay=None, lnurl=None) -> LightningHandler:
+def _make_handler(payer=None) -> LightningHandler:
     h = LightningHandler(_NoOpConfig())
-    h._btcpay_wallet = btcpay
-    h._lnurl_payer = lnurl
+    h._payer = payer
     return h
 
 
 class TestSendRefund:
     @pytest.mark.asyncio
-    async def test_btcpay_success_does_not_fall_through_to_lnurl(self):
-        btc = FakeBtcPay(send_raises=False)
-        lnurl = FakeLnurlPayer(pay_raises=False)
-        h = _make_handler(btc, lnurl)
+    async def test_paid_returns_result(self):
+        payer = FakePayer(status="paid")
+        h = _make_handler(payer)
         result = await h.send_refund("user@example.com", 1000, reason="test")
         assert result is not None
-        assert btc.send_calls == [("user@example.com", 1000)]
-        assert lnurl.pay_calls == []
+        assert result.status == "paid"
+        assert payer.pay_calls == [("user@example.com", 1000)]
 
     @pytest.mark.asyncio
-    async def test_btcpay_failure_falls_back_to_lnurl(self, caplog):
-        btc = FakeBtcPay(send_raises=True)
-        lnurl = FakeLnurlPayer(pay_raises=False)
-        h = _make_handler(btc, lnurl)
-        with caplog.at_level(logging.WARNING):
-            result = await h.send_refund("user@example.com", 2000, reason="fallback")
-        assert result is not None
-        assert btc.send_calls == [("user@example.com", 2000)]
-        assert lnurl.pay_calls == [("user@example.com", 2000)]
-        # And we logged the BTCPay failure rather than swallowing.
-        assert any("btcpay refund" in r.message.lower() for r in caplog.records)
-
-    @pytest.mark.asyncio
-    async def test_both_backends_fail_returns_none_and_logs_error(self, caplog):
-        btc = FakeBtcPay(send_raises=True)
-        lnurl = FakeLnurlPayer(pay_raises=True)
-        h = _make_handler(btc, lnurl)
+    async def test_skipped_returns_none(self, caplog):
+        """A provider that can't honour the amount yields status='skipped';
+        the coordinator must NOT treat that as a completed refund."""
+        payer = FakePayer(status="skipped")
+        h = _make_handler(payer)
         with caplog.at_level(logging.ERROR):
-            result = await h.send_refund("user@example.com", 3000, reason="catastrophe")
+            result = await h.send_refund("user@example.com", 1000, reason="test")
         assert result is None
-        # Two failure logs: the LNURL exception, plus the final "no working
-        # backend" line.
-        error_msgs = [r.message.lower() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any("no working backend" in m for m in error_msgs)
+        assert any("not settled" in r.message.lower() for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_no_btcpay_uses_lnurl_directly(self):
-        lnurl = FakeLnurlPayer(pay_raises=False)
-        h = _make_handler(btcpay=None, lnurl=lnurl)
-        result = await h.send_refund("user@example.com", 500)
-        assert result is not None
-        assert lnurl.pay_calls == [("user@example.com", 500)]
+    async def test_payer_exception_returns_none_and_logs(self, caplog):
+        payer = FakePayer(raises=True)
+        h = _make_handler(payer)
+        with caplog.at_level(logging.ERROR):
+            result = await h.send_refund("user@example.com", 3000, reason="boom")
+        assert result is None
+        assert any("refund" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_backend_returns_none(self, caplog):
+        h = _make_handler(payer=None)
+        with caplog.at_level(logging.ERROR):
+            result = await h.send_refund("user@example.com", 500)
+        assert result is None
+        assert any("no refund backend" in r.message.lower() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_zero_amount_is_a_noop(self):
-        btc = FakeBtcPay()
-        lnurl = FakeLnurlPayer()
-        h = _make_handler(btc, lnurl)
+        payer = FakePayer()
+        h = _make_handler(payer)
         result = await h.send_refund("user@example.com", 0)
-        # No backend was attempted for amount=0
-        assert btc.send_calls == []
-        assert lnurl.pay_calls == []
-        # And the handler still emits the final "no working backend" log,
-        # which is acceptable — the caller shouldn't be asking us to send 0.
         assert result is None
-
-
-class TestGetBalance:
-    @pytest.mark.asyncio
-    async def test_returns_balance_when_available(self):
-        h = _make_handler(btcpay=FakeBtcPay(balance=42_000))
-        assert await h.get_balance() == 42_000
+        assert payer.pay_calls == []
 
     @pytest.mark.asyncio
-    async def test_logs_and_returns_none_when_btcpay_raises(self, caplog):
-        h = _make_handler(btcpay=FakeBtcPay(balance_raises=True))
-        with caplog.at_level(logging.WARNING):
-            result = await h.get_balance()
+    async def test_missing_lud16_returns_none(self, caplog):
+        payer = FakePayer()
+        h = _make_handler(payer)
+        with caplog.at_level(logging.ERROR):
+            result = await h.send_refund("", 500)
         assert result is None
-        assert any("btcpay get_balance" in r.message.lower() for r in caplog.records)
-
-    @pytest.mark.asyncio
-    async def test_returns_none_when_no_btcpay_configured(self):
-        h = _make_handler(btcpay=None)
-        assert await h.get_balance() is None
+        assert payer.pay_calls == []
 
 
-class TestSendRefundToLnurl:
-    """send_refund_to_lnurl computes the keep deduction and delegates to send_refund."""
+class TestSdkInterfacePinning:
+    """Guard against SDK drift: these assert the REAL nostrbot_sdk signatures
+    are still shaped the way LightningHandler calls them. If the SDK renames or
+    repositions an argument, these fail instead of every refund silently dying."""
 
-    @pytest.mark.asyncio
-    async def test_subtracts_keep_percent(self):
-        btc = FakeBtcPay()
-        h = _make_handler(btc, lnurl=None)
-        # 10000 sats × (1 - 5%) = 9500, but keep_min_sats=50 wins only if
-        # 5% < 50. At zap=10000, 5% = 500 > 50, so 500 is kept.
-        sent = await h.send_refund_to_lnurl("u@x", 10_000, keep_percent=5, keep_min_sats=50)
-        assert sent == 9_500
-        assert btc.send_calls == [("u@x", 9_500)]
+    def test_lnurl_payer_constructor_shape(self):
+        from nostrbot_sdk import LnurlPayer
+        params = inspect.signature(LnurlPayer.__init__).parameters
+        # Handler constructs LnurlPayer(keys=, wallet=, fee_policy=, default_comment=)
+        assert "keys" in params
+        assert "wallet" in params
+        assert "fee_policy" in params
+        assert "default_comment" in params
 
-    @pytest.mark.asyncio
-    async def test_keep_min_sats_kicks_in_for_tiny_zaps(self):
-        btc = FakeBtcPay()
-        h = _make_handler(btc, lnurl=None)
-        # 100 sats × 5% = 5, but keep_min_sats=50 wins. Refund = 100 - 50 = 50.
-        sent = await h.send_refund_to_lnurl("u@x", 100, keep_percent=5, keep_min_sats=50)
-        assert sent == 50
+    def test_lnurl_payer_pay_shape(self):
+        from nostrbot_sdk import LnurlPayer
+        params = inspect.signature(LnurlPayer.pay).parameters
+        # Handler calls payer.pay(lud16=, amount_sats=)
+        assert "lud16" in params
+        assert "amount_sats" in params
 
-    @pytest.mark.asyncio
-    async def test_returns_zero_when_refund_would_be_nonpositive(self):
-        h = _make_handler(btcpay=FakeBtcPay(), lnurl=None)
-        # 30 sats - max(5%, 50) = 30 - 50 = -20, refund = 0
-        sent = await h.send_refund_to_lnurl("u@x", 30, keep_percent=5, keep_min_sats=50)
-        assert sent == 0
+    def test_btcpay_wallet_constructor_shape(self):
+        from nostrbot_sdk import BtcPayWallet
+        params = inspect.signature(BtcPayWallet.__init__).parameters
+        # Handler constructs BtcPayWallet(url=, store_id=, api_key=)
+        assert "url" in params
+        assert "store_id" in params
+        assert "api_key" in params
+
+    def test_payout_result_has_status(self):
+        from nostrbot_sdk import PayoutResult
+        fields = inspect.signature(PayoutResult).parameters
+        assert "status" in fields

@@ -294,14 +294,12 @@ class FeeEngine:
         fee_shares: Dict[int, int] = {id(rec): 0 for rec in nc}
         nc_portion_vsize = overhead
         nc_portion_fee = 0
-        layouts: Dict[int, Tuple[int, int, int]] = {}
         for _pass in range(3):
             weights: Dict[int, int] = {}
             nc_in_v_total = 0
             nc_out_v_total = 0
             for rec in nc:
                 ne, nch, chg = _nc_layout(rec, fee_shares[id(rec)])
-                layouts[id(rec)] = (ne, nch, chg)
                 in_v = self.total_inputs_vsize(
                     rec.get("nonconforming_inputs_by_type") or {})
                 out_v = (ne + nch) * self.output_vsize(
@@ -342,8 +340,19 @@ class FeeEngine:
         for p in participants_data:
             conforming_count = p.get("conforming_count", 0)
             if p.get("is_nonconforming"):
-                ne, nch, chg = layouts.get(id(p), _nc_layout(p, fee_shares.get(id(p), 0)))
+                # Recompute the layout from the FINAL fee share so num_equal /
+                # change_sats are consistent with the fee_share we report. The
+                # iteration loop's intermediate `layouts` lagged the shares by
+                # one pass (it stored the layout BEFORE updating the share), and
+                # for a participant whose surplus is near one output_size the
+                # output count oscillates and never converges within 3 passes —
+                # emitting a stale layout would (a) tell the user a fee they
+                # don't actually pay and (b) hide a participant who can no longer
+                # fund an equal output from the coordinator's underfunded-drop
+                # check. Deriving the layout from the final share here makes
+                # per-participant accounting exact and surfaces ne==0 correctly.
                 fee_share = fee_shares.get(id(p), 0)
+                ne, nch, chg = _nc_layout(p, fee_share)
                 num_inputs_total = sum(
                     (p.get("nonconforming_inputs_by_type") or {}).values())
                 service_fee = self.calculate_service_fee(num_inputs_total, ne + nch)

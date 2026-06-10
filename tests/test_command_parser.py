@@ -94,6 +94,17 @@ class TestCommandParser:
             assert parsed.command == "commit_utxos"
             assert parsed.args[0] == expected, f"failed for: {sep!r}"
 
+    def test_commit_accepts_mixed_case_txid_normalizes_to_lower(self):
+        """Some wallets/explorers show txids capitalized. Accept upper/mixed
+        case and normalize to lowercase (what the chain API + DB expect)."""
+        upper = "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890"
+        parsed = self.parser.parse(f"/commit {upper}:2")
+        assert parsed.command == "commit_utxos"
+        utxos = parsed.args[0]
+        assert len(utxos) == 1
+        assert utxos[0]["txid"] == upper.lower()
+        assert utxos[0]["vout"] == 2
+
     def test_addresses(self):
         """Test /addresses command."""
         parsed = self.parser.parse("/addresses bc1qabc... bc1qdef...")

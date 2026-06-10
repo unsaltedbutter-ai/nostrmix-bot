@@ -21,8 +21,10 @@ class ParsedCommand:
         self.raw = raw
 
 
-# Extract txid:vout pairs
-UTXO_PATTERN = re.compile(r'([a-f0-9]{64}):(\d+)')
+# Extract txid:vout pairs. Accept upper- or mixed-case hex (some wallets/block
+# explorers display txids capitalized); callers normalize the txid to lowercase,
+# which is what the chain API and the DB's UNIQUE(txid, vout) constraint expect.
+UTXO_PATTERN = re.compile(r'([a-fA-F0-9]{64}):(\d+)')
 
 # A bare number (BTC amount) for `/join <amount>`. Mix names are always
 # alphabetic "<adjective>-<noun>" pairs, so a pure number never collides with
@@ -92,7 +94,7 @@ class CommandParser:
             # or ", " (a wallet "copy all"). finditer ignores whatever sits
             # between matches, so all forms parse the same. (The "/commit" word
             # itself can't match a 64-hex:vout pattern.)
-            utxos = [{"txid": m.group(1), "vout": int(m.group(2))}
+            utxos = [{"txid": m.group(1).lower(), "vout": int(m.group(2))}
                      for m in UTXO_PATTERN.finditer(raw)]
             return ParsedCommand("commit_utxos", [utxos], raw)
 
@@ -142,7 +144,7 @@ class CommandParser:
         """Parse 'txid:vout txid:vout ...' from raw text."""
         utxos = []
         for m in UTXO_PATTERN.finditer(text):
-            utxos.append({"txid": m.group(1), "vout": int(m.group(2))})
+            utxos.append({"txid": m.group(1).lower(), "vout": int(m.group(2))})
         return utxos
 
     def parse_addresses(self, text: str) -> List[str]:

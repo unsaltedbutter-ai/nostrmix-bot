@@ -257,6 +257,52 @@ class TestPSBTManager:
         )
         assert not ok, "strict mode should reject when only some assigned inputs are signed"
 
+    def test_validate_returned_rejects_high_s_signature(self):
+        """BIP146: a high-S signature is cryptographically valid (libsecp
+        normalizes S before verifying) but non-standard, so relays drop the
+        witness. validate_returned must reject it at submission rather than let
+        it waste the whole signing round at broadcast."""
+        from bitcointx.core import b2x
+        from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
+        from src.psbt_manager import _SECP256K1_N
+
+        def _flip_to_high_s(sig_with_hashtype: bytes) -> bytes:
+            der, hashtype = sig_with_hashtype[:-1], sig_with_hashtype[-1:]
+            r_len = der[3]
+            r = der[4:4 + r_len]
+            s_marker = 4 + r_len
+            s_len = der[s_marker + 1]
+            s = int.from_bytes(der[s_marker + 2:s_marker + 2 + s_len], "big")
+            s_high = _SECP256K1_N - s            # the malleated sibling sig
+            sh = s_high.to_bytes((s_high.bit_length() + 7) // 8 or 1, "big")
+            if sh[0] & 0x80:                     # DER positive-integer padding
+                sh = b"\x00" + sh
+            body = b"\x02" + bytes([len(r)]) + r + b"\x02" + bytes([len(sh)]) + sh
+            return b"\x30" + bytes([len(body)]) + body + hashtype
+
+        skel, keys = self._multi_input_skeleton(n=3)
+        signed = self._sign_with(skel, [0], keys)
+
+        # bitcointx auto-finalizes a signed p2wpkh input into a
+        # final_script_witness of [signature, pubkey]; rewrite that signature to
+        # its high-S sibling.
+        psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(signed))
+        psin = psbt.inputs[0]
+        fsw = psin.final_script_witness
+        stack = list(fsw.stack) if hasattr(fsw, "stack") else list(fsw)
+        psin.final_script_witness = type(fsw)(
+            [_flip_to_high_s(bytes(stack[0])), bytes(stack[1])])
+        tampered = b2x(psbt.serialize())
+
+        ok, reason = self.mgr.validate_returned(
+            skel, tampered,
+            participant_input_count=1,
+            expected_output_addresses=[],
+            participant_input_indices=[0],
+        )
+        assert not ok, "high-S signature must be rejected"
+        assert "high-s" in reason.lower(), reason
+
     def test_combine_then_finalize_yields_broadcastable_tx(self):
         """End-to-end: build a 3-input skeleton, each participant signs
         their own input separately, combine the three returns, finalize

@@ -375,6 +375,75 @@ class TestProvideAddressesPaidState:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_committed_resubmit_replaces_not_appends(self):
+        """C3: a fee-charged participant stays 'committed' with outputs stored,
+        then re-sends /addresses (e.g. after we asked for a change address).
+        The new set must REPLACE the old — appending doubled the outputs and
+        inflated the expected zap past what we quoted, making it unpayable."""
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, fee_per_element=100)
+            npub = "npub_resub"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+            first = await db.get_outputs_by_participant(pid)
+            # Re-send a different set of the same size.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[3:6])
+            second = await db.get_outputs_by_participant(pid)
+
+            assert len(second) == len(first), "outputs were appended, not replaced"
+            # The stored addresses are the NEW set, not a mix of both.
+            stored = {o["address"] for o in second}
+            assert stored <= set(P2WPKH_ADDRS[3:6])
+            assert stored.isdisjoint(set(P2WPKH_ADDRS[0:3]))
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_addresses_in_batch_rejected(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            npub = "npub_dupe"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            dupes = [P2WPKH_ADDRS[0], P2WPKH_ADDRS[1], P2WPKH_ADDRS[0]]
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, dupes)
+
+            assert await db.get_outputs_by_participant(pid) == []
+            assert (await db.get_participant(pid))["state"] == "committed"
+            assert "unique" in nostr.sent_dms[-1][1].lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_address_clash_with_other_participant_rejected(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            # Participant A already holds an output address in this mix.
+            a = await db.add_participant(mix_id, "npub_A", "")
+            await db.add_output(a, P2WPKH_ADDRS[0], 1_000_000)
+
+            # Participant B tries to reuse A's address.
+            b = await db.add_participant(mix_id, "npub_B", "")
+            await db.add_utxo(b, TXID[1], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(b, state="committed")
+
+            await coord._cmd_provide_addresses(
+                FakeCtx("npub_B"), "npub_B", [P2WPKH_ADDRS[0], P2WPKH_ADDRS[1], P2WPKH_ADDRS[2]])
+
+            assert await db.get_outputs_by_participant(b) == []
+            assert "already in use" in nostr.sent_dms[-1][1].lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_zero_fee_skips_zap_and_marks_paid(self):
         # Default config: FEE_PER_ELEMENT == 0 → no zap, straight to 'paid'.
         coord, db, nostr, chain, lightning = await make_coord()
@@ -614,6 +683,146 @@ class TestGhostRecovery:
             dms_to_survivors = [m for r, m in nostr.sent_dms if r in ("s1", "s2")]
             assert dms_to_survivors  # at least one
             assert any("thrown out your addresses" in m for m in dms_to_survivors)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_ghost_when_everyone_else_signed_restarts_round_not_cancel(self):
+        """H2: the common ghost pattern — all cooperative participants sign
+        early, one lets the deadline lapse. On the tick that ghosts the
+        laggard the others are all 'signed', so the OLD code took the
+        all_signed branch first, tried to finalize a tx still missing the
+        ghost's signature, and cancelled the whole mix. The fix checks
+        ghosted_any first → ghost recovery restarts the round instead."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="signing", ghost_retries=0,
+                                deadline_unix=int(time.time()) - 100)
+            deadline_seconds = coord.cfg.SIGNING_DEADLINE_HOURS * 3600
+            past = int(time.time()) - (deadline_seconds + 120)
+            recent = int(time.time()) - 60
+
+            # Two survivors who already SIGNED.
+            for i, npub in enumerate(("s1", "s2")):
+                pid = await db.add_participant(mix_id, npub, "")
+                await db.add_utxo(pid, TXID[i], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                await db.add_output(pid, P2WPKH_ADDRS[i], 1_000_000)
+                await db.update_participant(pid, state="signed",
+                                            fee_paid=500, psbt_sent_at_unix=recent)
+
+            # The ghoster — still 'signing', past the deadline.
+            gpid = await db.add_participant(mix_id, "ghost", "")
+            await db.add_utxo(gpid, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(gpid, state="signing", psbt_sent_at_unix=past)
+
+            mix_row = await db.get_mix(mix_id)
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._handle_signing(mix_row, active, int(time.time()))
+
+            # Recovery, NOT cancellation: mix survives and is back to collecting.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after is not None, "mix was wrongly cancelled"
+            assert mix_after["state"] == "collecting"
+            assert mix_after["ghost_retries"] == 1
+            # The ghoster is blacklisted.
+            assert await db.is_blacklisted("ghost")
+            # No broadcast was attempted.
+            assert chain.broadcast_calls == []
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_committed_straggler_does_not_wedge_signing(self):
+        """H3: a participant who /commit-ed but never finished /addresses
+        before the mix advanced stays 'committed'. The OLD code included
+        such stragglers in 'remaining', so all_signed was forever false and
+        the fully-signed mix never broadcast. The fix scopes the
+        completion check to the assembled round (signing/signed/ghosted)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id, pids, keys = await _make_2p_signing_mix(coord, db)
+            await _seed_signed_mix(coord, db, mix_id=mix_id, signing_keys=keys)
+            chain.broadcast_return = "txid_round_scoped_ok"
+
+            # A straggler joins/commits but never gets into the round.
+            spid = await db.add_participant(mix_id, "npub_straggler", "")
+            await db.add_utxo(spid, "cc" * 32, 0, 250_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(spid, state="committed")
+
+            mix_row = await db.get_mix(mix_id)   # already 'signing' after assembly
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._handle_signing(mix_row, active, int(time.time()))
+
+            # The signed round broadcast despite the committed straggler.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after["state"] == "broadcast"
+            assert mix_after["broadcast_txid"] == "txid_round_scoped_ok"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_classify_ready_requires_addresses(self):
+        """C2/H1 part A: a 'paid' participant with no output addresses (e.g. a
+        ghost-recovery survivor who hasn't resubmitted) must NOT count toward
+        the non-conforming target, so the mix can't re-advance to assembling
+        and assemble with empty address lists."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, required_nonconforming=1)
+            mix_row = await db.get_mix(mix_id)
+
+            # One NC participant, paid, but addresses were cleared.
+            pid = await db.add_participant(mix_id, "npub_no_addr", "")
+            await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="paid", fee_paid=500)
+
+            ready = [p for p in await db.get_participants_by_mix(mix_id)
+                     if p["state"] == "paid"]
+            proceed, nc_count, _ = await coord._classify_ready(mix_row, ready)
+            assert proceed is False
+            assert nc_count == 0  # the address-less participant did not count
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_assembly_drops_address_starved_conforming_participant(self):
+        """C2/H1 part B: defence-in-depth. A conforming-only participant who
+        reaches assembly with no addresses would have their pass-through output
+        SILENTLY skipped (their whole UTXO burned to the miner fee). The fix
+        drops them rather than burning funds; with the NC target then unmet the
+        mix cancels and refunds instead of shipping a fund-burning tx."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(
+                output_size=1_000_000, required_nonconforming=1, fee_per_element=100)
+            await db.update_mix(mix_id, state="assembling", fee_rate=30,
+                                input_type="p2wpkh", output_type="p2wpkh")
+
+            # NC participant with addresses (the legitimate mixer).
+            nc = await db.add_participant(mix_id, "npub_nc", "nc@x")
+            await db.add_utxo(nc, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(nc, state="paid", fee_paid=500)
+            for addr in P2WPKH_ADDRS[0:3]:
+                await db.add_output(nc, addr, 1_000_000)
+
+            # Conforming-only participant, paid, but NO addresses on file.
+            conf = await db.add_participant(mix_id, "npub_conf", "conf@x")
+            await db.add_utxo(conf, TXID[1], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(conf, state="paid", fee_paid=0)
+
+            active = await db.get_participants_by_mix(mix_id)
+            await coord._assemble_psbt(await db.get_mix(mix_id), active)
+
+            # The conforming UTXO was never silently burned: no PSBT was built
+            # that omits its output. With only the NC participant left (target
+            # unmet after the drop), the mix cancels + refunds rather than
+            # broadcasting. The conforming participant's UTXO row is released.
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after is None or mix_after["state"] != "broadcast"
+            # No broadcast of a fund-burning tx.
+            assert chain.broadcast_calls == []
         finally:
             await db.close()
 
@@ -1231,6 +1440,34 @@ class TestJoinByAmount:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_amount_of_one_btc_or_more_rejected(self):
+        """The mix size must be < 1 BTC. A bare integer like '/join 100000'
+        (a sats-vs-BTC typo) reads as 100000 BTC and must be refused, not
+        create a mix; '/join 1' (1 BTC) likewise."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            for npub, amt in (("npub_big1", "1"), ("npub_big2", "100000")):
+                await coord._cmd_join_mix(FakeCtx(npub), None, None, amt)
+                assert await db.get_participants_by_npub(npub) == []
+            assert await db.get_mixes_by_state("announced", "collecting") == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "less than 1 btc" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_amount_just_under_one_btc_is_allowed(self):
+        """0.99 BTC is a valid (if large) mix size — the bound is < 1, not <=."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "npub_under1"
+            await coord._cmd_join_mix(FakeCtx(npub), None, None, "0.99")
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_refused_at_max_open_mixes(self):
         """At MAX_OPEN_MIXES open mixes, an amount-join of a new size is refused
         rather than creating another mix."""
@@ -1559,6 +1796,51 @@ class TestSilentZapNoLongerSilent:
             messages = " ".join(r.message.lower() for r in caplog.records)
             assert "unmatched zap" in messages or "no pending fee" in messages
             assert "1234" in messages
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_late_zap_after_timeout_recorded_as_refund_owed(self):
+        """H3: a zap that lands after the participant's slot timed out (state
+        'cancelled') must not be silently kept. Record a refund debt + DM."""
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, fee_per_element=100)
+            pid = await db.add_participant(mix_id, "npub_late", "late@wallet.com")
+            # Their slot timed out before the zap arrived.
+            await db.update_participant(pid, state="cancelled")
+
+            class Zap:
+                sender_hex = "npub_late"
+                amount_sats = 700
+            await coord._on_zap(Zap(), FakeCtx("npub_late"))
+
+            owed = await db.get_refunds_owed()
+            assert len(owed) == 1
+            assert owed[0]["participant_id"] == pid
+            assert owed[0]["lightning_addr"] == "late@wallet.com"
+            assert owed[0]["sats"] == 700
+            dms = " ".join(m for r, m in nostr.sent_dms if r == "npub_late").lower()
+            assert "refund" in dms and "expired" in dms
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_extra_zap_from_paid_participant_is_kept_not_refunded(self):
+        """A second zap from an already-paid participant in an active mix is a
+        duplicate/overpayment — kept, never recorded as a refund."""
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000, fee_per_element=100)
+            pid = await db.add_participant(mix_id, "npub_dup", "dup@wallet.com")
+            await db.update_participant(pid, state="paid", fee_paid=500)
+
+            class Zap:
+                sender_hex = "npub_dup"
+                amount_sats = 500
+            await coord._on_zap(Zap(), FakeCtx("npub_dup"))
+
+            assert await db.get_refunds_owed() == []
         finally:
             await db.close()
 
@@ -2214,6 +2496,80 @@ class TestExitMixSingleAndNone:
             # C-B: paid exit lands in 'refunded' (not 'cancelled').
             assert (await db.get_participant(pid_a))["state"] == "refunded"
             assert (await db.get_participant(pid_b))["state"] == "paid"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_multi_mix_refunds_the_matched_participants_fee(self):
+        """The matched participant's OWN fee/lud16 is used for the refund, not
+        the first mix's. (Previously the refund read active[0] regardless of
+        which mix matched.)"""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_a = await db.create_mix(output_size=100_000)
+            mix_b = await db.create_mix(output_size=100_000)
+            pid_a = await db.add_participant(mix_a, "npub_mm2", "a_addr@x")
+            pid_b = await db.add_participant(mix_b, "npub_mm2", "b_addr@x")
+            await db.update_participant(pid_a, state="paid", fee_paid=500)
+            await db.update_participant(pid_b, state="paid", fee_paid=4000)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_mm2"), "npub_mm2", mix_b)
+
+            assert (await db.get_participant(pid_b))["state"] == "refunded"
+            assert (await db.get_participant(pid_a))["state"] == "paid"
+            # The refund went to mix_b's lud16 for an amount derived from
+            # mix_b's 4000-sat fee (not mix_a's 500).
+            mm_refunds = [r for r in lightning.refunds if r[0] == "b_addr@x"]
+            assert mm_refunds, f"no refund to b_addr@x: {lightning.refunds}"
+            assert mm_refunds[0][1] > 500  # derived from 4000, not 500
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_signing_is_refused(self):
+        """H1: a participant in 'signing' cannot /cancel — that would delete
+        their inputs from under the shared skeleton and force the whole mix to
+        restart. Their row/UTXOs/fee are left untouched."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000)
+            await db.update_mix(mix_id, state="signing")
+            pid = await db.add_participant(mix_id, "npub_sign", "s@x")
+            await db.add_utxo(pid, TXID[0], 0, 250_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="signing", fee_paid=500)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_sign"), "npub_sign", None)
+
+            # Nothing was torn down, no refund issued.
+            p = await db.get_participant(pid)
+            assert p["state"] == "signing"
+            assert await db.get_utxos_by_participant(pid) != []
+            assert lightning.refunds == []
+            dms = " ".join(m for r, m in nostr.sent_dms if r == "npub_sign").lower()
+            assert "signing phase" in dms
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_ghosted_participant_not_refunded_on_cancel(self):
+        """M1: a ghosted (paid-but-never-signed) participant forfeits their fee.
+        _cancel_and_refund must skip them."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000)
+            await db.update_mix(mix_id, state="signing")
+            # A cooperative paid participant + a ghost, both with a fee paid.
+            good = await db.add_participant(mix_id, "npub_good", "good@x")
+            await db.update_participant(good, state="paid", fee_paid=500)
+            ghost = await db.add_participant(mix_id, "npub_ghost", "ghost@x")
+            await db.update_participant(ghost, state="ghosted", fee_paid=500)
+
+            await coord._cancel_and_refund(await db.get_mix(mix_id), "test")
+
+            # The ghost was NOT refunded; the cooperative participant was.
+            refunded_addrs = {r[0] for r in lightning.refunds}
+            assert "ghost@x" not in refunded_addrs
+            assert "good@x" in refunded_addrs
         finally:
             await db.close()
 
@@ -3756,10 +4112,13 @@ class TestLowerPriorityGaps:
             )
             await db.update_mix(mix_id, state="collecting")
 
-            for npub, (txid, vout) in (("zpA", (TXID[0], 0)), ("zpB", (TXID[1], 0))):
+            for npub, (txid, vout), addr_slice in (
+                ("zpA", (TXID[0], 0), P2WPKH_ADDRS[0:3]),
+                ("zpB", (TXID[1], 0), P2WPKH_ADDRS[3:6]),
+            ):
                 await self._interested(db, mix_id, npub)
                 await self._commit(coord, chain, npub, [(txid, vout, 250_000)])
-                await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+                await coord._cmd_provide_addresses(FakeCtx(npub), npub, addr_slice)
                 # Fee > 0 -> stays committed, zap requested.
                 assert (await db.get_participants_by_npub(npub))[0]["state"] == "committed"
 
@@ -3849,10 +4208,13 @@ class TestReviewGaps:
                 fee_per_element=0,
             )
             await db.update_mix(mix_id, state="collecting")
-            for npub, txid in (("tA", TXID[0]), ("tB", TXID[1])):
+            for npub, txid, addr_slice in (
+                ("tA", TXID[0], P2WPKH_ADDRS[0:3]),
+                ("tB", TXID[1], P2WPKH_ADDRS[3:6]),
+            ):
                 await self._interested(db, mix_id, npub)
                 await self._commit(coord, chain, npub, [(txid, 0, 250_000)])
-                await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+                await coord._cmd_provide_addresses(FakeCtx(npub), npub, addr_slice)
 
             # First tick: collecting -> assembling (proceed gate dispatched).
             await coord._tick()

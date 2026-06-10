@@ -261,10 +261,16 @@ class Coordinator:
                     f"Minimum mix size is {self.cfg.MINIMUM_UTXO_SIZE / 1e8:.8f} BTC.",
                 )
                 return
-            # Typo guard: nothing above the total bitcoin supply can be funded.
-            if sats > 21_000_000 * 100_000_000:
+            # The amount is the per-output mix size, in BTC, and must be a
+            # fraction of a bitcoin (0 < amount < 1). This both guards against a
+            # sats-vs-BTC typo (e.g. "/join 100000" meaning 0.001 BTC would
+            # otherwise read as 100000 BTC) and keeps output sizes sane.
+            if sats >= 1 * 100_000_000:
                 await self.nostr.send_dm(
-                    npub_hex, "That mix size is impossibly large — check the amount.")
+                    npub_hex,
+                    "The mix size must be less than 1 BTC — amounts are in BTC, "
+                    "so use a decimal like /join 0.01 (not sats).",
+                )
                 return
             mix_id, created = await self._find_or_create_mix_by_size(sats)
             if mix_id is None:
@@ -728,6 +734,44 @@ class Coordinator:
                 )
                 return
 
+        # Reject duplicate output addresses. Reusing an address (within this
+        # batch, or one already pledged by another participant in the same mix)
+        # collides two outputs into one on-chain — wrecking both the per-output
+        # accounting and the privacy of an equal-output set. Say so plainly
+        # rather than silently de-duping.
+        seen_in_batch = set()
+        dupes_in_batch = set()
+        for a in addrs:
+            if a in seen_in_batch:
+                dupes_in_batch.add(a)
+            seen_in_batch.add(a)
+        if dupes_in_batch:
+            sample = ", ".join(sorted(dupes_in_batch)[:3])
+            await self.nostr.send_dm(
+                npub_hex,
+                f"Each output address must be unique. You repeated: {sample}. "
+                f"Re-send /addresses with distinct, fresh addresses.",
+            )
+            return
+
+        # Addresses already claimed by OTHER participants in this mix. (We're
+        # about to replace THIS participant's own outputs, so theirs don't count.)
+        others_addrs = set()
+        for other in await self.db.get_participants_by_mix(mix_id):
+            if other["id"] == pid:
+                continue
+            for o in await self.db.get_outputs_by_participant(other["id"]):
+                others_addrs.add(o["address"])
+        clash = [a for a in addrs if a in others_addrs]
+        if clash:
+            sample = ", ".join(sorted(set(clash))[:3])
+            await self.nostr.send_dm(
+                npub_hex,
+                f"These addresses are already in use by someone else in {mix_id}: "
+                f"{sample}. Send fresh addresses that you control.",
+            )
+            return
+
         # Get participant's UTXOs and classify against the mix's output size.
         output_size = mix["output_size"]
         utxos = await self.db.get_utxos_by_participant(pid)
@@ -789,10 +833,15 @@ class Coordinator:
             fee_per_element=mix.get("fee_per_element"),
         )
 
-        # Store outputs. If this is a ghost-recovery resubmission, clear the
-        # stale outputs first so we don't double-count.
-        if already_paid:
-            await self.db.delete_outputs_by_participant(pid)
+        # /addresses is replace-not-append: clear any outputs already on file
+        # for this participant before storing the new set. This covers BOTH a
+        # ghost-recovery resubmission (state 'paid') AND a fee-charged
+        # participant who is still 'committed' (they have stored outputs from a
+        # prior /addresses while awaiting their zap) re-sending a new list — e.g.
+        # after we prompted them to add a change address. Without this the
+        # outputs doubled, inflating the expected zap fee past what we quoted so
+        # the user could never pay it. (C3)
+        await self.db.delete_outputs_by_participant(pid)
 
         # Lay out in order: conforming pass-throughs, then NC equal outputs, then
         # a change output ONLY if the participant supplied a spare address. The
@@ -1002,14 +1051,16 @@ class Coordinator:
             return
 
         if len(active) == 1:
-            pid = active[0]["id"]
-            actual_mix_id = active[0]["mix_id"]
+            target_p = active[0]
+            pid = target_p["id"]
+            actual_mix_id = target_p["mix_id"]
             mix = await self.db.get_mix(actual_mix_id)
         elif mix_id:
             # Find matching mix
             for p in active:
                 m = await self.db.get_mix(p["mix_id"])
                 if m and m["id"].lower() == mix_id.lower():
+                    target_p = p
                     pid = p["id"]
                     actual_mix_id = p["mix_id"]
                     mix = m
@@ -1035,6 +1086,24 @@ class Coordinator:
             )
             return
 
+        # Once a participant is in the signing phase they've been sent a PSBT
+        # that already commits their inputs. Letting them /cancel now would
+        # delete their inputs from under a skeleton everyone else is signing —
+        # finalize would then fail and the WHOLE mix would be cancelled, letting
+        # one party grief every honest participant for the price of their own
+        # keep amount. Refuse; if they genuinely can't sign, the signing-deadline
+        # ghost-recovery path handles their departure cleanly (and blacklists
+        # them). (H1)
+        if target_p["state"] in ("signing", "signed"):
+            await self.nostr.send_dm(
+                npub_hex,
+                f"{actual_mix_id} is already in the signing phase, so it's too "
+                f"late to cancel — backing out now would force everyone else to "
+                f"start over. If you can't sign, just don't: after the signing "
+                f"deadline the mix automatically re-forms without you.",
+            )
+            return
+
         # Release UTXOs back to the outpoint pool BEFORE the wallet call so
         # they're freed even if we crash mid-refund. UNIQUE(txid, vout)
         # would otherwise block the same outpoint forever.
@@ -1042,12 +1111,12 @@ class Coordinator:
         await self.db.delete_outputs_by_participant(pid)
 
         # Refund fee — goes through _safe_refund for idempotency (C-B).
-        fee_paid = int(active[0].get("fee_paid") or 0)
-        lud16 = active[0].get("lightning_addr") or ""
+        fee_paid = int(target_p.get("fee_paid") or 0)
+        lud16 = target_p.get("lightning_addr") or ""
         if fee_paid > 0 and lud16:
             refund_sats = self._refund_keep_math(fee_paid)
             new_state = await self._safe_refund(
-                active[0], actual_mix_id, refund_sats, reason="voluntary_exit",
+                target_p, actual_mix_id, refund_sats, reason="voluntary_exit",
             )
             if new_state == "refunded":
                 msg = self.parser.format_refund(refund_sats, "voluntary exit")
@@ -1084,11 +1153,52 @@ class Coordinator:
         awaiting = [p for p in participants if p["state"] == "committed"]
 
         if not awaiting:
-            # No pending fee — could be a donation, a late zap after we already
-            # marked the participant paid, or a zap from an npub we've never
-            # met. Log so the operator can audit the bot's Lightning inflows
-            # against expected service fees. Sender becomes an opaque token
-            # so the log doesn't link an npub to a payment trail.
+            # No 'committed' participant is waiting on this zap. Three cases:
+            #
+            #  1. The sender already paid and their mix is in flight ('paid' /
+            #     'signing' / 'signed' / 'broadcast'). This is a duplicate or an
+            #     overpayment, NOT a refundable orphan — log for revenue audit
+            #     and keep it (a successful mix's fee is non-refundable).
+            #  2. The sender's slot TIMED OUT ('cancelled') before this zap
+            #     landed (LN/relay latency, or they paid right at the deadline).
+            #     Their money arrived too late to join — record a refund debt so
+            #     the operator returns it, and tell the user, rather than
+            #     silently pocketing a payment they tried to make.
+            #  3. Genuinely unknown sender / donation — log and keep.
+            #
+            # Sender is always an opaque token in logs so we never link an npub
+            # to a payment trail.
+            in_flight = [p for p in participants
+                         if p["state"] in ("paid", "signing", "signed", "broadcast")]
+            if in_flight:
+                logger.info(
+                    "Extra zap from already-paid sender=%s amount=%d sats — "
+                    "duplicate/overpayment, kept",
+                    tokens.p(npub_hex), amount_sats,
+                )
+                return
+
+            # Most recent timed-out slot with a Lightning address on file.
+            timed_out = [p for p in participants
+                         if p["state"] == "cancelled" and (p.get("lightning_addr") or "").strip()]
+            if timed_out:
+                target = max(timed_out, key=lambda p: int(p.get("updated_at_unix") or 0))
+                await self.db.add_refund_owed(
+                    target["id"], target["lightning_addr"].strip(), amount_sats,
+                    reason="late_zap_after_timeout",
+                )
+                logger.info(
+                    "Late zap recorded as refund owed: sender=%s mix=%s amount=%d sats",
+                    tokens.p(npub_hex), tokens.m(target["mix_id"]), amount_sats,
+                )
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Your {amount_sats}-sat payment arrived after your slot in "
+                    f"{target['mix_id']} expired, so it couldn't join the mix. "
+                    f"The operator will refund it to your Lightning address.",
+                )
+                return
+
             logger.info(
                 "Unmatched zap: sender=%s amount=%d sats — no committed participant; ignored",
                 tokens.p(npub_hex), amount_sats,
@@ -1299,6 +1409,15 @@ class Coordinator:
         nc_count = 0
         conforming_present = False
         for p in ready:
+            # A participant only counts toward the target once they have output
+            # addresses on file. After ghost recovery every survivor is reset to
+            # 'paid' with their addresses deleted; without this guard the mix
+            # would re-advance to assembling on the very next tick — before
+            # anyone resubmits /addresses — and assemble with empty address
+            # lists (burning conforming UTXOs to the miner fee). (C2/H1)
+            outputs = await self.db.get_outputs_by_participant(p["id"])
+            if not outputs:
+                continue
             utxos = await self.db.get_utxos_by_participant(p["id"])
             if any(u["amount"] != output_size for u in utxos):
                 nc_count += 1
@@ -1430,8 +1549,14 @@ class Coordinator:
     # Terminal-for-refund-purposes states. Any participant in one of these
     # has already had their refund decision made; calling _safe_refund again
     # on them is a no-op. Critical for crash-recovery idempotency (C-B).
+    # States that _safe_refund must NOT pay out. 'ghosted' is included
+    # deliberately: a participant who paid the service fee but let the signing
+    # deadline lapse FORFEITS that fee (the FINAL WARNING DM says as much) and
+    # is blacklisted — refunding them would both contradict that promise and pay
+    # out money on every "max ghost retries exceeded" cancellation.
     _REFUND_TERMINAL_STATES = frozenset({
         "refunding", "refunded", "refund_failed", "cancelled", "completed",
+        "ghosted",
     })
 
     async def _safe_refund(self, p: Dict, mix_id: str, refund_sats: int,
@@ -1552,6 +1677,54 @@ class Coordinator:
                 f"output plus miner fees.",
             )
 
+    async def _drop_address_starved(self, p: Dict, mix_id: str):
+        """Drop a participant who reached assembly without enough output
+        addresses to receive the outputs they committed (most often a survivor
+        whose addresses were cleared by ghost recovery and not resubmitted).
+        Releases their UTXOs and refunds any service fee, with an accurate
+        message telling them to resubmit /addresses.
+
+        Idempotent via _safe_refund (C-B): safe to call twice across a crash."""
+        fresh = await self.db.get_participant(p["id"])
+        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+            return
+
+        await self.db.delete_utxos_by_participant(p["id"])
+        await self.db.delete_outputs_by_participant(p["id"])
+
+        fee_paid = int(p.get("fee_paid") or 0)
+        lud16 = p.get("lightning_addr", "")
+        npub = p["npub_hex"]
+        msg = (
+            f"Dropped from mix {mix_id}: we didn't have enough output addresses "
+            f"on file to pay you when the mix assembled. Re-join and send "
+            f"/addresses to try again."
+        )
+
+        if fee_paid > 0 and lud16:
+            refund_sats = self._refund_keep_math(fee_paid)
+            new_state = await self._safe_refund(
+                p, mix_id, refund_sats, reason="address_starved_dropped",
+            )
+            if new_state == "refunded":
+                await self.nostr.send_dm(
+                    npub, msg + f" Refunded {refund_sats} sats.")
+            else:
+                await self.nostr.send_dm(
+                    npub, msg + f" We tried to refund {refund_sats} sats but our "
+                    f"Lightning backend rejected it — please contact the operator.")
+        elif fee_paid > 0:
+            logger.error(
+                "Cannot refund address-starved participant %s in mix %s: "
+                "fee_paid=%d but no lightning_addr. Operator must reconcile.",
+                tokens.p(npub), tokens.m(mix_id), fee_paid,
+            )
+            await self.db.update_participant(p["id"], state="cancelled")
+            await self.nostr.send_dm(npub, msg)
+        else:
+            await self.db.update_participant(p["id"], state="cancelled")
+            await self.nostr.send_dm(npub, msg)
+
     async def _assemble_psbt(self, mix: Dict, active: List[Dict]):
         """Build the PSBT skeleton and send to all paid participants.
 
@@ -1619,6 +1792,44 @@ class Coordinator:
         # the real fee share rather than the declared address count.)
         all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
             await self._gather_assembly_data(active, output_size)
+
+        required_nc = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+
+        # Defence-in-depth (C2/H1): a participant must have at least enough
+        # addresses to receive the conforming pass-throughs they committed plus,
+        # if they brought non-conforming inputs, one equal output. /addresses
+        # enforces this at intake, but ghost recovery deletes everyone's
+        # addresses and resets them to 'paid'. If such a participant reached
+        # assembly before resubmitting, the output-building loop would SILENTLY
+        # skip their funded outputs and burn those sats to the miner fee. Drop
+        # them from this round (releasing UTXOs + refunding any fee) so funds are
+        # never burned. _classify_ready already withholds the mix from advancing
+        # for this reason, so in practice this is a backstop.
+        def _min_addrs(rec: Dict) -> int:
+            return rec.get("conforming_count", 0) + (1 if rec.get("is_nonconforming") else 0)
+
+        starved_pids = {
+            rec["pid"] for rec in participants_data
+            if rec.get("num_addresses", 0) < _min_addrs(rec)
+        }
+        if starved_pids:
+            survivors = []
+            for p in active:
+                if p["id"] in starved_pids:
+                    await self._drop_address_starved(p, mix_id)
+                else:
+                    survivors.append(p)
+            active = survivors
+            all_inputs, participants_data, addrs_by_pid, input_indices_by_pid = \
+                await self._gather_assembly_data(active, output_size)
+
+            nc_survivors = sum(1 for rec in participants_data if rec.get("is_nonconforming"))
+            if len(active) < 2 or nc_survivors < required_nc:
+                await self._cancel_and_refund(
+                    mix, "not enough participants after dropping address-starved",
+                )
+                return
+
         total_vsize, total_miner_fee, fee_results = _calc(participants_data)
 
         if total_miner_fee <= 0:
@@ -1632,7 +1843,7 @@ class Coordinator:
         # pass-throughs). After dropping, the mix must still have at least the
         # required number of non-conforming participants (the exact target it
         # advanced on) AND >=2 participants overall; otherwise cancel.
-        required_nc = mix.get("required_nonconforming") or self.cfg.DEFAULT_REQUIRED_NONCONFORMING
+        # (required_nc computed above, before the address-starvation guard.)
         underfunded_pids = {
             rec["pid"] for rec, fr in zip(participants_data, fee_results)
             if fr.is_nonconforming and fr.num_equal_outputs == 0
@@ -1671,6 +1882,10 @@ class Coordinator:
         # additional miner fee, per the plan).
         donation_address = (self.cfg.DONATION_ADDRESS or "").strip()
         all_outputs: List[Dict] = []
+        # Track sats deliberately folded into the miner fee (above-dust leftovers
+        # with no change address and no DONATION_ADDRESS). Used to bound the
+        # pre-broadcast fee invariant without false-positives on legitimate folds.
+        folded_above_dust = 0
         for rec, fr in zip(participants_data, fee_results):
             addrs = addrs_by_pid[rec["pid"]]
             idx = 0
@@ -1703,6 +1918,7 @@ class Coordinator:
                 else:
                     # No donation address configured → the leftover stays in the
                     # tx as additional miner fee (output omitted).
+                    folded_above_dust += fr.change_sats
                     logger.info(
                         "Mix %s: participant %s left %d above-dust sats to the "
                         "miner fee (no change address, no DONATION_ADDRESS)",
@@ -1740,6 +1956,31 @@ class Coordinator:
             )
             await self._cancel_and_refund(
                 mix, "fee math produced an undercollecting tx",
+            )
+            return
+
+        # Upper-bound guard (symmetric to the lower bound above). The actual
+        # miner fee should be the engine's target plus only the sats we
+        # KNOWINGLY folded: above-dust leftovers with nowhere to go
+        # (folded_above_dust), and sub-dust leftovers (< MINIMUM_UTXO_SIZE each,
+        # at most one per participant). A regression that silently dropped a
+        # funded output would push actual_miner_fee far past this ceiling — far
+        # better to cancel loudly than to burn a participant's output to miners.
+        max_expected_fee = (
+            total_miner_fee
+            + folded_above_dust
+            + len(participants_data) * self.cfg.MINIMUM_UTXO_SIZE
+        )
+        if actual_miner_fee > max_expected_fee:
+            logger.error(
+                "Mix %s: pre-broadcast fee ceiling exceeded. miner_fee=%d "
+                "target=%d folded_above_dust=%d ceiling=%d — a funded output may "
+                "have been dropped. Cancelling rather than burning coins.",
+                tokens.m(mix_id), actual_miner_fee, total_miner_fee,
+                folded_above_dust, max_expected_fee,
+            )
+            await self._cancel_and_refund(
+                mix, "fee math produced an overcollecting tx",
             )
             return
 
@@ -1912,13 +2153,28 @@ class Coordinator:
                     await self.nostr.send_dm(p["npub_hex"], text)
                     await self.db.update_participant(p["id"], reminder_count=expected_level)
 
-        # Check if all remaining signed
-        remaining = [p for p in active if p["state"] not in ("ghosted", "cancelled")]
-        all_signed = all(p["state"] == "signed" for p in remaining)
+        # Only the participants actually in THIS assembled round count toward
+        # "everyone signed". A round participant is one _assemble_psbt moved to
+        # signing — i.e. state in (signing, signed, ghosted). A straggler still
+        # in 'committed'/'interested' (joined but never finished /addresses or
+        # never paid before assembly) or a late 'paid' (zap landed after the
+        # round was frozen) is NOT in the round; including them here would make
+        # all_signed forever false and wedge the mix in signing with everyone's
+        # UTXOs locked. (H3)
+        round_participants = [
+            p for p in active if p["state"] in ("signing", "signed", "ghosted")
+        ]
+        remaining = [p for p in round_participants if p["state"] not in ("ghosted", "cancelled")]
+        all_signed = bool(remaining) and all(p["state"] == "signed" for p in remaining)
 
-        if all_signed and remaining:
-            await self._combine_and_broadcast(mix, remaining)
-        elif ghosted_any:
+        # Ghost recovery takes precedence over broadcast. The common ghost
+        # pattern is "everyone cooperative signs early, one lets the deadline
+        # lapse": on the tick that ghosts the laggard, the others are all
+        # 'signed', so all_signed would be true — but the skeleton still has the
+        # ghost's input unsigned, so finalize would fail and _combine_and_broadcast
+        # would cancel the whole mix instead of restarting the round. Checking
+        # ghosted_any FIRST routes that case to ghost recovery. (H2)
+        if ghosted_any:
             # Check ghost retries
             ghost_retries = mix.get("ghost_retries", 0)
             max_ghost = mix.get("max_ghost_retries", self.cfg.MAX_GHOST_RETRIES)
@@ -1929,7 +2185,7 @@ class Coordinator:
                 # Increment ghost retries
                 await self.db.update_mix(mix_id, ghost_retries=ghost_retries + 1)
                 # Remove ghost from mix
-                ghost_participants = [p for p in active if p["state"] == "ghosted"]
+                ghost_participants = [p for p in round_participants if p["state"] == "ghosted"]
                 for gp in ghost_participants:
                     await self.db.delete_utxos_by_participant(gp["id"])
                     await self.db.delete_outputs_by_participant(gp["id"])
@@ -1954,6 +2210,9 @@ class Coordinator:
                 await self.db.update_mix(
                     mix_id, state="collecting", deadline_unix=new_deadline,
                 )
+
+        elif all_signed:
+            await self._combine_and_broadcast(mix, remaining)
 
     async def _combine_and_broadcast(self, mix: Dict, signed: List[Dict]):
         """Combine all signed PSBTs and broadcast."""

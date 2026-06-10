@@ -26,6 +26,15 @@ from . import secp256k1_compat  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# secp256k1 curve order. BIP146 requires the signature's S value to be in the
+# lower half (S <= n/2, "low-S") for the witness to be standard. A high-S
+# signature still verifies (libsecp256k1 normalizes S before checking), so we
+# must reject it explicitly here — otherwise we accept the participant, combine,
+# finalize, and only discover at broadcast that relays drop the non-standard tx,
+# wasting the whole signing round.
+_SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP256K1_HALF_N = _SECP256K1_N // 2
+
 from bitcointx.core import (
     b2x, CTxIn, CTxOut, COutPoint, CTransaction,
     CMutableTxIn, CMutableTxOut, CMutableTransaction,
@@ -364,6 +373,10 @@ class PSBTManager:
             return False, "pubkey does not own the input"
         if sig[-1] != SIGHASH_ALL:
             return False, f"hashtype 0x{sig[-1]:02x} != SIGHASH_ALL"
+        # BIP146 low-S: reject a non-standard high-S signature now (it verifies
+        # but relays won't propagate the witness).
+        if not PSBTManager._sig_is_low_s(sig[:-1]):
+            return False, "non-standard high-S signature (BIP146)"
         try:
             pub = CPubKey(pub_bytes)
             script_code = CScript(
@@ -376,6 +389,29 @@ class PSBTManager:
         except Exception as e:
             return False, f"verify error: {type(e).__name__}"
         return True, "ok"
+
+    @staticmethod
+    def _sig_is_low_s(der_sig: bytes) -> bool:
+        """True iff the DER ECDSA signature's S value is low (S <= n/2, BIP146).
+
+        DER layout: 0x30 <len> 0x02 <rlen> <R...> 0x02 <slen> <S...>. We parse S
+        out and compare against half the curve order. A malformed signature
+        returns False (it would fail verification anyway)."""
+        try:
+            if len(der_sig) < 8 or der_sig[0] != 0x30 or der_sig[2] != 0x02:
+                return False
+            r_len = der_sig[3]
+            s_marker = 4 + r_len
+            if s_marker + 1 >= len(der_sig) or der_sig[s_marker] != 0x02:
+                return False
+            s_len = der_sig[s_marker + 1]
+            s_bytes = der_sig[s_marker + 2: s_marker + 2 + s_len]
+            if len(s_bytes) != s_len or s_len == 0:
+                return False
+            s = int.from_bytes(s_bytes, "big")
+            return 0 < s <= _SECP256K1_HALF_N
+        except (IndexError, ValueError):
+            return False
 
     # --- Combine PSBTs ---
 

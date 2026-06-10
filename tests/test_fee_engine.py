@@ -325,3 +325,78 @@ class TestNcOutputPlan:
         ne, nch, chg = self.engine.nc_output_plan(2_000_000, 1_000_000, 2, 5_000)
         assert ne == 1 and nch == 1
         assert ne * 1_000_000 + chg == 1_995_000  # all available sats placed
+
+
+class TestFeeShareConsistency:
+    """Regression for the non-converging fee-share iteration: the emitted
+    (num_equal, change_sats) MUST be consistent with the emitted fee_share_sats,
+    and a participant who can no longer fund one equal output after their fee
+    MUST report num_equal_outputs == 0 so the coordinator drops them."""
+
+    def setup_method(self):
+        self.engine = FeeEngine(
+            fee_per_element=0, min_fee_rate_sats=1.5, max_fee_rate_sats=510,
+            overhead_vsize=10, minimum_utxo_size=10_000,
+        )
+
+    @staticmethod
+    def _p(nc_total, addrs, tag=""):
+        return {
+            "pid": f"p{nc_total}_{addrs}_{tag}", "npub_hex": "n",
+            "total_sats": nc_total, "num_addresses": addrs,
+            "conforming_count": 0, "nonconforming_total_sats": nc_total,
+            "nonconforming_inputs_by_type": {"p2wpkh": 1},
+            "output_type": "p2wpkh", "is_nonconforming": True,
+        }
+
+    def _assert_consistent(self, pdata, rate, output_size=1_000_000):
+        _v, _total, results = self.engine.calculate_all_fees(pdata, output_size, rate)
+        for rec, fr in zip(pdata, results):
+            if not fr.is_nonconforming:
+                continue
+            nc = rec["nonconforming_total_sats"]
+            accounted = fr.num_equal_outputs * output_size + fr.change_sats + fr.fee_share_sats
+            folded = nc - accounted
+            # Per-participant conservation: nothing is created, only ever folded
+            # into the fee, and a fold is bounded (sub-dust, or a single-address
+            # donation leftover < output_size).
+            assert folded >= 0, (
+                f"created sats: {rec['pid']} nc={nc} ne={fr.num_equal_outputs} "
+                f"chg={fr.change_sats} fee={fr.fee_share_sats}")
+            # A reported equal output must actually be affordable.
+            if fr.num_equal_outputs >= 1:
+                assert (nc - fr.fee_share_sats) >= output_size, (
+                    f"reports ne>=1 but can't afford it: {rec['pid']} "
+                    f"nc={nc} fee={fr.fee_share_sats}")
+
+    def test_oscillation_case_reports_ne_zero(self):
+        """The reviewer's exact trigger: a UTXO a few thousand sats over
+        output_size, paired with a large participant. The small one can't cover
+        an equal output after its fee share, so it MUST report ne==0 (not a
+        stale ne==1 that the coordinator's drop check would miss)."""
+        small = self._p(1_009_999, 2, "small")
+        big = self._p(5_000_000, 5, "big")
+        _v, _total, results = self.engine.calculate_all_fees(
+            [small, big], 1_000_000, 117.3)
+        assert results[0].num_equal_outputs == 0, "underfunded participant hidden"
+        # The big participant's accounting is exactly consistent.
+        big_r = results[1]
+        assert (big_r.num_equal_outputs * 1_000_000
+                + big_r.change_sats + big_r.fee_share_sats) == 5_000_000
+
+    def test_consistency_property_sweep(self):
+        """Sweep many participant mixes (deterministic seed) and assert
+        per-participant conservation + affordability on every one. This is the
+        check that catches a regression of the lagged-layout bug."""
+        import random
+        rng = random.Random(1234)
+        for _ in range(4000):
+            n = rng.randint(2, 5)
+            pdata = []
+            for i in range(n):
+                if rng.random() < 0.5:
+                    nct = 1_000_000 + rng.randint(1, 60_000)   # near-boundary
+                else:
+                    nct = rng.randint(1_000_000, 8_000_000)
+                pdata.append(self._p(nct, rng.randint(1, 6), tag=str(i)))
+            self._assert_consistent(pdata, rng.choice([2, 30, 117.3, 250, 510]))
