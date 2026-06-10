@@ -62,7 +62,7 @@ _NOUNS = [
     "flag", "fork", "fox", "frog", "gal", "gate", "gear", "gem", "gift", "glue",
     "goat", "gold", "gum", "guy", "ham", "hand", "hat", "hen", "hill", "hook",
     "horn", "hose", "hut", "ice", "ink", "iron", "jam", "jar", "jet", "jug",
-    "kale", "key", "kid", "kite", "knee", "knob", "lab", "lake", "lamb", "lamp",
+    "kale", "key", "kid", "kite", "knee", "lab", "lake", "lamb", "lamp",
     "leaf", "leek", "leg", "lens", "lid", "lime", "line", "lion", "lip", "lock",
     "log", "mail", "map", "mask", "mat", "meat", "milk", "mint", "mom", "moon",
     "mop", "moth", "mug", "mule", "nail", "neck", "nest", "net", "note", "nut",

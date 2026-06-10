@@ -47,6 +47,12 @@ _DEFAULTS = {
     "DEFAULT_OUTPUT_SIZE": 1000000,
     "MAX_PARTICIPANTS_DEFAULT": 20,
     "MAX_PENDING_MIXES": 5,
+    # Cap on simultaneously-open mixes (state announced or collecting). Gates
+    # every new-mix creation path — the /join <amount> create flow and the
+    # /commit auto-create. At the cap, creation is refused and the user is
+    # pointed at /list. The daily auto-create only fires when zero mixes are
+    # open, so it never hits this.
+    "MAX_OPEN_MIXES": 10,
     "SIGNING_DEADLINE_HOURS": 48,
     "PAY_DEADLINE_HOURS": 12,
     "MAX_GHOST_RETRIES": 3,
@@ -164,6 +170,11 @@ class BotConfig:
         if self.FEE_PER_ELEMENT < 0:
             self._values["FEE_PER_ELEMENT"] = 0
 
+        # At least one mix must be allowed open, otherwise the bot could never
+        # create the always-available default mix. Clamp up to 1 rather than reject.
+        if self.MAX_OPEN_MIXES < 1:
+            self._values["MAX_OPEN_MIXES"] = 1
+
         # DEFAULT_OUTPUT_SIZE must be >= MINIMUM_UTXO_SIZE — otherwise every
         # equal output we produce is below Bitcoin's standardness dust limit
         # and no wallet would later be able to spend them.
@@ -275,6 +286,10 @@ class BotConfig:
     @property
     def MAX_PENDING_MIXES(self) -> int:
         return self._values["MAX_PENDING_MIXES"]
+
+    @property
+    def MAX_OPEN_MIXES(self) -> int:
+        return self._values["MAX_OPEN_MIXES"]
 
     @property
     def SIGNING_DEADLINE_HOURS(self) -> int:

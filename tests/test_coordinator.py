@@ -1169,6 +1169,111 @@ class TestAutoMixOnCommit:
             await db.close()
 
 
+# --- join-by-amount (/join <btc>) ---
+
+
+class TestJoinByAmount:
+    @pytest.mark.asyncio
+    async def test_creates_mix_with_exact_size(self):
+        """/join 0.00125 creates a 125000-sat mix (exact, no rounding) and
+        registers the user as interested."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "npub_sizer"
+            await coord._cmd_join_mix(FakeCtx(npub), None, None, "0.00125")
+
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+            mix = await db.get_mix(ps[0]["mix_id"])
+            assert mix["output_size"] == 125_000
+            assert mix["state"] == "collecting"
+            assert mix["required_nonconforming"] == coord.cfg.DEFAULT_REQUIRED_NONCONFORMING
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "created mix" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_joins_existing_same_size_prefers_fullest(self):
+        """/join <amount> joins an open mix of that exact size, picking the
+        closest-to-full one rather than creating a new mix."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            empty = await db.create_mix(output_size=1_000_000, max_participants=10)
+            await db.update_mix(empty, state="collecting")
+            fuller = await db.create_mix(output_size=1_000_000, max_participants=10)
+            await db.update_mix(fuller, state="collecting")
+            await db.add_participant(fuller, "someone_else", "")
+
+            npub = "npub_joiner_amt"
+            await coord._cmd_join_mix(FakeCtx(npub), None, None, "0.01")
+
+            ps = await db.get_participants_by_npub(npub)
+            assert len(ps) == 1
+            assert ps[0]["mix_id"] == fuller  # the fuller one, not a new mix
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_below_minimum_rejected(self):
+        """An amount below MINIMUM_UTXO_SIZE is rejected and creates no mix."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "npub_tiny"
+            # 1000 sats, default MINIMUM_UTXO_SIZE is 10000.
+            await coord._cmd_join_mix(FakeCtx(npub), None, None, "0.00001")
+
+            assert await db.get_participants_by_npub(npub) == []
+            assert await db.get_mixes_by_state("announced", "collecting") == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "minimum mix size" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_refused_at_max_open_mixes(self):
+        """At MAX_OPEN_MIXES open mixes, an amount-join of a new size is refused
+        rather than creating another mix."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_OPEN_MIXES"] = 2
+            for _ in range(2):
+                mid = await db.create_mix(output_size=2_000_000)
+                await db.update_mix(mid, state="collecting")
+
+            npub = "npub_capped"
+            await coord._cmd_join_mix(FakeCtx(npub), None, None, "0.01")
+
+            assert await db.get_participants_by_npub(npub) == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "too many open mixes" in joined
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_commit_auto_create_refused_at_cap(self):
+        """The /commit auto-create path also respects MAX_OPEN_MIXES."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_OPEN_MIXES"] = 1
+            # One open mix already, locked to a type our UTXO won't match so the
+            # auto-create path is forced (and then blocked by the cap).
+            existing = await db.create_mix(output_size=999_999)
+            await db.update_mix(existing, state="collecting", input_type="p2tr")
+
+            npub = "npub_commit_capped"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(value=500_000)
+            await coord._cmd_commit_utxos(
+                FakeCtx(npub), npub, [{"txid": TXID[0], "vout": 0}],
+            )
+
+            assert await db.get_participants_by_npub(npub) == []
+            joined = " ".join(m for _, m in nostr.sent_dms).lower()
+            assert "no compatible mix available" in joined
+        finally:
+            await db.close()
+
+
 # --- #11 /psbt_accept disambiguation across multiple signing mixes ---
 
 

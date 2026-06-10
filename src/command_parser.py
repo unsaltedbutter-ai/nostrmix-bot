@@ -24,6 +24,11 @@ class ParsedCommand:
 # Extract txid:vout pairs
 UTXO_PATTERN = re.compile(r'([a-f0-9]{64}):(\d+)')
 
+# A bare number (BTC amount) for `/join <amount>`. Mix names are always
+# alphabetic "<adjective>-<noun>" pairs, so a pure number never collides with
+# a name — the match unambiguously means "join/create a mix of this size".
+AMOUNT_PATTERN = re.compile(r'^\d+(\.\d+)?$|^\.\d+$')
+
 
 class CommandParser:
     """Parse incoming DM text into structured commands.
@@ -60,9 +65,17 @@ class CommandParser:
             return ParsedCommand("list_mixes", [], raw)
 
         # -- JOIN --
+        # Args are [mix_id, alt, amount_btc]. A name-join fills the first two
+        # (amount None); an amount-join fills only the third (name slots None).
         if cmd == "join":
             if len(args) >= 1:
-                mix_id = args[0].strip().lower()
+                first = args[0].strip()
+                if AMOUNT_PATTERN.match(first):
+                    # "/join 0.01" — join-or-create a mix of this BTC size. The
+                    # coordinator converts to sats, floors at MINIMUM_UTXO_SIZE,
+                    # and finds-or-creates the mix.
+                    return ParsedCommand("join_mix", [None, None, first], raw)
+                mix_id = first.lower()
                 # Names are "<word>-<word>". Tolerate a user who typed a space
                 # instead of the hyphen ("/join silver cupcake"): also offer the
                 # joined "<word1>-<word2>" as a fallback the coordinator tries if
@@ -70,7 +83,7 @@ class CommandParser:
                 alt = None
                 if len(args) >= 2:
                     alt = f"{args[0].strip()}-{args[1].strip()}".lower()
-                return ParsedCommand("join_mix", [mix_id, alt], raw)
+                return ParsedCommand("join_mix", [mix_id, alt, None], raw)
             return ParsedCommand("join_mix", [], raw)
 
         # -- COMMIT UTXOS --

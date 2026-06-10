@@ -136,6 +136,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | `DEFAULT_OUTPUT_SIZE` | `1000000` | int ≥ `MINIMUM_UTXO_SIZE` (else load fails) | Equal-output size (sats) of auto-created mixes. Also the conforming/non-conforming dividing line. |
 | `MAX_PARTICIPANTS_DEFAULT` | `20` | int > 0 | Upper bound used by the auto-mix-on-`/commit` capacity check. |
 | `MAX_PENDING_MIXES` | `5` | int ≥ 1 | Max simultaneous **paid** mixes a single npub may be in. A 4th/Nth `/join` is refused. |
+| `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `/join <amount>` and the `/commit` auto-create. At the cap, creation is refused and the user is pointed at `/list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
 | `SIGNING_DEADLINE_HOURS` | `48` | int > 0 | Time participants have to return a signed PSBT. Reminder DMs fire at ⅛, ¼, ½ of this; past it, the participant is ghosted + blacklisted. |
 | `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set); also the collecting deadline and the ghost-recovery deadline extension. |
 | `MAX_GHOST_RETRIES` | `3` | int ≥ 0 | How many times a mix restarts collecting after a ghost before it cancels and refunds everyone. |
@@ -245,7 +246,8 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 Commands are matched case-insensitively; the `/` prefix is optional for `list`.
 
 - `/list` (or `open`, `mixes`) — list open mixes
-- `/join <mix_name>` — join a mix
+- `/join <mix_name>` — join a mix by name; or `/join <amount>` (e.g. `/join 0.01`)
+  to join an open mix of that BTC output size, or create one if none exists
 - `/commit <txid:vout> ...` — register UTXOs (may be sent more than once)
 - `/addresses <addr1> <addr2> ...` — provide output addresses (one per conforming
   UTXO; non-conforming participants need ≥1 more for an equal output, plus one more

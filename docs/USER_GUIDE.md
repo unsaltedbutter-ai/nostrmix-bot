@@ -76,6 +76,7 @@ Everything is a DM to the bot. Commands start with `/` (case-insensitive).
 |---|---|
 | `/list` (or `open`, `mixes`) | Show open mixes you can join |
 | `/join <mix_name>` | Register interest in a specific open mix |
+| `/join <amount>` | Join — or start — a mix of that BTC size (e.g. `/join 0.01`) |
 | `/commit <txid:vout> ...` | Declare the UTXO(s) you'll contribute (may be sent more than once) |
 | `/addresses <addr1> <addr2> ...` | Give your fresh output addresses |
 | `/psbt_accept <hex>` | Return your **signed** PSBT |
@@ -132,10 +133,24 @@ same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
 
 The bot registers your interest and asks for your UTXOs and addresses.
 
-**Start a new mix:** there's no separate "create" command and you can't pick the
-size — mixes use the operator's defaults (typically **0.01 BTC** outputs,
-`p2wpkh`). If no compatible mix is open, simply **`/commit` a UTXO** (next step)
-and the bot spins up a fresh default mix and puts you in it automatically.
+**Start — or join — a mix by size** with a BTC amount instead of a name:
+
+```
+/join 0.01
+```
+
+If an open mix with **that exact output size** has room, the bot adds you to it
+(picking the one closest to filling). If none exists, it **creates** a fresh mix of
+that size — using the operator's default participant and conforming-UTXO counts — and
+puts you in it. Custom sizes work too (`/join 0.00125` → 125,000-sat outputs); the
+only floor is the operator's minimum UTXO size, and the bot caps how many mixes can be
+open at once (if it's full, it asks you to `/list` and join an existing one). The bot
+echoes the size it created or joined, so a mistyped amount is visible before you commit
+any coins.
+
+**Start a new mix the lazy way:** you can also skip `/join` entirely and just
+**`/commit` a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
+you in it automatically.
 
 > One at a time: finish `/commit` **and** `/addresses` (and pay, if a fee is
 > charged) for your current mix before joining another.
@@ -335,7 +350,8 @@ left of the traceable change is negligible.
 ```
 /list                                  → see open mixes
 /join silver-cupcake                   → join the mix you picked
-                                         (or skip /join and just /commit to auto-start a new mix)
+   (or /join 0.01 to join-or-start a mix of that size,
+    or skip /join and just /commit to auto-start a new mix)
 /commit <txid:vout> …                  → register the coins you'll contribute
 /addresses bc1q… bc1q… bc1q…           → one per mixed output + one extra for change
    (pay the zap only if a fee is charged — off by default)

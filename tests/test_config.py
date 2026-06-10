@@ -38,6 +38,7 @@ class TestBotConfig:
         assert cfg.DEFAULT_REQUIRED_NONCONFORMING == 3
         assert cfg.MAX_CONFORMING_UTXOS == 10
         assert cfg.MAX_NONCONFORMING_UTXOS_PER_PARTICIPANT == 10
+        assert cfg.MAX_OPEN_MIXES == 10
         # Donation address disabled by default (privacy-preserving fold-to-fee).
         assert cfg.DONATION_ADDRESS == ""
         assert cfg.DB_PATH == "./bot.db"
@@ -48,6 +49,23 @@ class TestBotConfig:
 
         # Clean up
         os.unlink(env_path)
+
+    def test_max_open_mixes_clamped_to_one(self):
+        """MAX_OPEN_MIXES < 1 is clamped up to 1 (a 0 cap would block the
+        always-available default mix)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("MAX_OPEN_MIXES=0\n")
+            env_path = f.name
+
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.MAX_OPEN_MIXES == 1
+        finally:
+            # load_dotenv(override=True) leaks this into os.environ; pop it so
+            # it doesn't bleed into other tests' BotConfig instances.
+            os.environ.pop("MAX_OPEN_MIXES", None)
+            os.unlink(env_path)
 
     def test_relay_parsing(self):
         """Test relay list parsing."""

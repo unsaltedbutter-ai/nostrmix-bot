@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import time
 import logging
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Dict, List, Any, Callable, Tuple
 
 from nostrbot_sdk import SenderContext, ValidatedZap, NostrBot
@@ -109,7 +110,10 @@ class Coordinator:
                     # parsed.args[1] is the "<word1>-<word2>" fallback for a
                     # name typed with a space instead of a hyphen.
                     alt = parsed.args[1] if len(parsed.args) > 1 else None
-                    await self._cmd_join_mix(ctx, mix_id, alt)
+                    # parsed.args[2] is the BTC amount for "/join <amount>"
+                    # (None for a name-join).
+                    amount = parsed.args[2] if len(parsed.args) > 2 else None
+                    await self._cmd_join_mix(ctx, mix_id, alt, amount)
 
                 case "commit_utxos":
                     utxos = parsed.args[0] if parsed.args else []
@@ -195,14 +199,24 @@ class Coordinator:
         await self.nostr.send_dm(ctx.sender_hex, msg)
 
     async def _cmd_join_mix(self, ctx: SenderContext, mix_id: Optional[str],
-                            alt_mix_id: Optional[str] = None):
-        """Handle /join <mix_name>. ``alt_mix_id`` is the "<word1>-<word2>"
-        fallback used when the name was typed with a space instead of a hyphen
-        ("/join silver cupcake")."""
+                            alt_mix_id: Optional[str] = None,
+                            amount_btc: Optional[str] = None):
+        """Handle /join. Two forms:
+
+        - ``/join <mix_name>`` — join an existing mix by name. ``alt_mix_id`` is
+          the "<word1>-<word2>" fallback used when the name was typed with a
+          space instead of a hyphen ("/join silver cupcake").
+        - ``/join <amount>`` — join-or-create a mix of that BTC output size
+          (``amount_btc`` is the raw BTC string). Joins the closest-to-full open
+          mix of that exact size, else creates a fresh one.
+        """
         npub_hex = ctx.sender_hex
 
-        if not mix_id:
-            await self.nostr.send_dm(npub_hex, "Usage: /join <mix_name>")
+        if not mix_id and not amount_btc:
+            await self.nostr.send_dm(
+                npub_hex,
+                "Usage: /join <mix_name>  or  /join <amount_btc>  (e.g. /join 0.01)",
+            )
             return
 
         # Check blacklist
@@ -233,22 +247,50 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, self.parser.format_max_mixes(self.cfg.MAX_PENDING_MIXES))
             return
 
-        # Verify the mix exists and is in collecting state. If the first token
-        # didn't match, fall back to the hyphen-joined two-word form (handles
-        # "/join silver cupcake").
-        mix = await self.db.get_mix(mix_id)
-        if not mix and alt_mix_id:
-            alt = await self.db.get_mix(alt_mix_id)
-            if alt:
-                mix, mix_id = alt, alt_mix_id
-        if not mix:
-            await self.nostr.send_dm(
-                npub_hex, f"No mix named '{alt_mix_id or mix_id}' found.")
-            return
-
-        if mix["state"] not in ("announced", "collecting"):
-            await self.nostr.send_dm(npub_hex, f"Mix '{mix_id}' is already in progress or completed.")
-            return
+        created = False
+        if amount_btc is not None:
+            # --- Amount form: join-or-create a mix of this BTC size. ---
+            sats = self._parse_btc_to_sats(amount_btc)
+            if sats is None:
+                await self.nostr.send_dm(
+                    npub_hex, "Couldn't read that amount — try e.g. /join 0.01")
+                return
+            if sats < self.cfg.MINIMUM_UTXO_SIZE:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Minimum mix size is {self.cfg.MINIMUM_UTXO_SIZE / 1e8:.8f} BTC.",
+                )
+                return
+            # Typo guard: nothing above the total bitcoin supply can be funded.
+            if sats > 21_000_000 * 100_000_000:
+                await self.nostr.send_dm(
+                    npub_hex, "That mix size is impossibly large — check the amount.")
+                return
+            mix_id, created = await self._find_or_create_mix_by_size(sats)
+            if mix_id is None:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Too many open mixes right now (max {self.cfg.MAX_OPEN_MIXES}). "
+                    f"Try /list and /join an existing one.",
+                )
+                return
+            mix = await self.db.get_mix(mix_id)
+        else:
+            # --- Name form: verify the mix exists and is open. If the first
+            # token didn't match, fall back to the hyphen-joined two-word form
+            # (handles "/join silver cupcake").
+            mix = await self.db.get_mix(mix_id)
+            if not mix and alt_mix_id:
+                alt = await self.db.get_mix(alt_mix_id)
+                if alt:
+                    mix, mix_id = alt, alt_mix_id
+            if not mix:
+                await self.nostr.send_dm(
+                    npub_hex, f"No mix named '{alt_mix_id or mix_id}' found.")
+                return
+            if mix["state"] not in ("announced", "collecting"):
+                await self.nostr.send_dm(npub_hex, f"Mix '{mix_id}' is already in progress or completed.")
+                return
 
         # Look up kind 0 for lud16
         # We handle that later through the SDK
@@ -258,14 +300,76 @@ class Coordinator:
         # Add participant as 'interested'
         pid = await self.db.add_participant(mix_id, npub_hex, lud16)
 
-        # Reply asking for UTXOs and addresses
+        # Reply asking for UTXOs and addresses. For an amount-join, lead with
+        # the created/joined size so a mistyped amount is visible before funds.
+        lead = f"Registered interest in {mix_id}."
+        if amount_btc is not None:
+            output_btc = mix["output_size"] / 1e8
+            verb = "Created mix" if created else "Joined mix"
+            lead = f"{verb} {mix_id}: {output_btc:.8f} BTC outputs."
         await self.nostr.send_dm(
             npub_hex,
-            f"Registered interest in {mix_id}.\n"
+            f"{lead}\n"
             f"Send me txid(s) and vout(s) and your output addresses:\n"
             f"/commit <txid:vout> ...\n"
             f"/addresses <addr1> <addr2> ..."
         )
+
+    @staticmethod
+    def _parse_btc_to_sats(s: str) -> Optional[int]:
+        """Convert a BTC amount string to integer sats, or None if it isn't a
+        valid whole number of sats. Decimal avoids the float rounding error
+        ``float("0.00125") * 1e8`` would introduce."""
+        try:
+            sats = Decimal(s) * 100_000_000
+        except (InvalidOperation, ValueError):
+            return None
+        if sats <= 0 or sats != sats.to_integral_value():
+            return None
+        return int(sats)
+
+    async def _find_or_create_mix_by_size(
+        self, output_size: int
+    ) -> Tuple[Optional[str], bool]:
+        """Find an open (announced/collecting) mix with this exact output_size
+        that still has room, preferring the closest-to-full so participants
+        coalesce. Otherwise create a fresh mix with DEFAULT_* settings — unless
+        MAX_OPEN_MIXES is reached, in which case return (None, False).
+
+        Returns (mix_id, created)."""
+        open_mixes = await self.db.get_mixes_by_state("announced", "collecting")
+        best_id: Optional[str] = None
+        best_count = -1
+        for m in open_mixes:
+            if m["output_size"] != output_size:
+                continue
+            cap = m.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
+            cnt = await self.db.count_participants_by_mix(
+                m["id"], exclude_states=["cancelled", "ghosted", "refunding", "refunded", "refund_failed"],
+            )
+            if cnt >= cap:
+                continue
+            if cnt > best_count:
+                best_count, best_id = cnt, m["id"]
+        if best_id is not None:
+            return best_id, False
+        # None compatible — spin up a fresh mix unless we're at the open cap.
+        if len(open_mixes) >= self.cfg.MAX_OPEN_MIXES:
+            return None, False
+        deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        mid = await self.db.create_mix(
+            output_size=output_size,
+            max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
+            fee_per_element=self.cfg.FEE_PER_ELEMENT,
+            deadline_unix=deadline,
+            required_nonconforming=self.cfg.DEFAULT_REQUIRED_NONCONFORMING,
+            max_conforming_utxos=self.cfg.MAX_CONFORMING_UTXOS,
+        )
+        # Leave input_type NULL — it locks at the first /commit, same as the
+        # name-join flow.
+        await self.db.update_mix(mid, state="collecting")
+        logger.info("Created mix %s by amount (output_size=%d)", tokens.m(mid), output_size)
+        return mid, True
 
     async def _find_or_create_mix_for(self, input_type: str) -> Optional[str]:
         """Find an open mix matching input_type (or unlocked) with capacity,
@@ -283,7 +387,10 @@ class Coordinator:
             if cnt >= cap:
                 continue
             return m["id"]
-        # None compatible — spin up a fresh default mix.
+        # None compatible — spin up a fresh default mix unless we're at the
+        # open-mix cap (then the caller tells the user to /list and /join).
+        if len(open_mixes) >= self.cfg.MAX_OPEN_MIXES:
+            return None
         deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
         mid = await self.db.create_mix(
             output_size=self.cfg.DEFAULT_OUTPUT_SIZE,

@@ -40,6 +40,33 @@ class TestCommandParser:
         assert parsed.command == "join_mix"
         assert parsed.args[0] == "silver-cupcake"
         assert parsed.args[1] is None
+        assert parsed.args[2] is None
+
+    def test_join_amount_decimal(self):
+        """/join <amount> → amount in slot 2, name slots None."""
+        parsed = self.parser.parse("/join 0.01")
+        assert parsed.command == "join_mix"
+        assert parsed.args[0] is None
+        assert parsed.args[1] is None
+        assert parsed.args[2] == "0.01"
+
+    def test_join_amount_leading_dot(self):
+        parsed = self.parser.parse("/join .5")
+        assert parsed.command == "join_mix"
+        assert parsed.args[2] == ".5"
+
+    def test_join_amount_integer(self):
+        """A bare integer is still a BTC amount, not a name."""
+        parsed = self.parser.parse("/join 1000000")
+        assert parsed.command == "join_mix"
+        assert parsed.args[0] is None
+        assert parsed.args[2] == "1000000"
+
+    def test_join_name_has_amount_slot_none(self):
+        """A name-join leaves the amount slot None."""
+        parsed = self.parser.parse("/join east-gate")
+        assert parsed.args[0] == "east-gate"
+        assert parsed.args[2] is None
 
     def test_commit_utxos(self):
         """Test /commit with UTXOs."""
