@@ -1,15 +1,16 @@
-"""Friendly mix names — simple `color-object` phrases like `silver-cupcake`.
+"""Friendly mix names — simple `adjective-object` phrases like `big-apple`.
 
 Optimised for a human who reads a name in a Nostr note, goes off to gather their
 inputs for a few minutes, then has to retype it from memory in a DM — often on a
 phone keyboard. So the words are chosen to be **short and very common**:
 
-- adjectives are everyday **colors** (visual + easy to spell: red, blue, gold…),
+- adjectives are simple everyday descriptors: the basic colors (red, blue,
+  green…) plus plain words like big, little, soft, hard, wet, dry, open, smooth,
 - nouns are everyday **objects** — fruit, cutlery, household things, gadgets
   (apple, spoon, lamp, phone…), favouring 3-5 letters or longer-but-common words.
 
-Not constrained to the BIP-39 list (that pulled in rare words like "gosling"); the
-only rules are common, short, and inoffensive.
+The only rules are common, short, and inoffensive (not constrained to BIP-39 —
+that pulled in rare words like "gosling").
 
 Two ways to get a name:
 
@@ -28,15 +29,17 @@ import math as _math
 import random as _random
 from typing import Optional
 
-# Everyday colors — short, common, visual, easy to spell (no turquoise/chartreuse).
+# Simple, common adjectives: the basic colors plus everyday descriptors
+# (size, texture, state, temperature, speed). Child-simple and quick to type.
 _ADJECTIVES = [
-    "amber", "aqua", "beige", "black", "blue", "blush", "bronze", "brown",
-    "charcoal", "clay", "cocoa", "copper", "coral", "cream", "crimson", "cyan",
-    "denim", "emerald", "gold", "gray", "green", "indigo", "ivory", "jade",
-    "jet", "khaki", "lavender", "lilac", "lime", "maroon", "mint", "mustard",
-    "navy", "olive", "orange", "pearl", "pink", "purple", "red", "rose", "ruby",
-    "rust", "sage", "salmon", "sand", "sapphire", "scarlet", "silver", "sky",
-    "slate", "snow", "steel", "tan", "teal", "violet", "white", "wine", "yellow",
+    "bent", "big", "black", "blue", "bright", "broken", "brown", "bumpy",
+    "clean", "cold", "cool", "dark", "dry", "easy", "empty", "extra", "fast",
+    "flat", "fluffy", "free", "full", "fuzzy", "gray", "green", "handy", "hard",
+    "hot", "huge", "icy", "large", "light", "little", "long", "loose", "new",
+    "odd", "old", "open", "orange", "plain", "purple", "quick", "red", "rough",
+    "round", "safe", "sharp", "shiny", "short", "simple", "slow", "small",
+    "smooth", "soft", "spare", "tall", "tight", "tiny", "warm", "wet", "white",
+    "wide", "yellow",
 ]
 
 # Everyday objects — fruit/veg, cutlery, household items, gadgets, clothes, treats.
