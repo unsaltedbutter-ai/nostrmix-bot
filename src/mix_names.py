@@ -32,14 +32,16 @@ from typing import Optional
 # Simple, common adjectives: the basic colors plus everyday descriptors
 # (size, texture, state, temperature, speed). Child-simple and quick to type.
 _ADJECTIVES = [
-    "bent", "big", "black", "blue", "bright", "broken", "brown", "bumpy",
-    "clean", "cold", "cool", "dark", "dry", "easy", "empty", "extra", "fast",
-    "flat", "fluffy", "free", "full", "fuzzy", "gray", "green", "handy", "hard",
-    "hot", "huge", "icy", "large", "light", "little", "long", "loose", "new",
-    "odd", "old", "open", "orange", "plain", "purple", "quick", "red", "rough",
-    "round", "safe", "sharp", "shiny", "short", "simple", "slow", "small",
-    "smooth", "soft", "spare", "tall", "tight", "tiny", "warm", "wet", "white",
-    "wide", "yellow",
+    "bent", "big", "black", "blue", "bold", "bright", "broken", "brown",
+    "bumpy", "clean", "cold", "cool", "dark", "dry", "easy", "empty", "extra",
+    "fancy", "fast", "flat", "fluffy", "free", "fresh", "full", "fuzzy", "good",
+    "gray", "green", "handy", "hard", "hot", "huge", "icy", "jumbo", "juicy",
+    "large", "light", "little", "long", "loose", "mega", "mini", "neat", "new",
+    "nice", "odd", "old", "open", "orange", "plain", "purple", "quick", "red",
+    "rough", "round", "safe", "salty", "sharp", "shiny", "short", "simple",
+    "slow", "small", "smooth", "soft", "sour", "spare", "spicy", "super",
+    "sweet", "tall", "tasty", "tight", "tiny", "warm", "wet", "white", "wide",
+    "yellow",
 ]
 
 # Everyday objects — fruit/veg, cutlery, household items, gadgets, clothes, treats.
