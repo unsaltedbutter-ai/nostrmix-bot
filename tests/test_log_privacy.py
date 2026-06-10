@@ -56,10 +56,17 @@ class TestStaticLogPatternGuards:
 
     # The token helpers (tokens.p, tokens.l, etc) are how to log these
     # values safely; anything else is suspect.
+    # The token helpers (tokens.p, tokens.l, tokens.tx, ...) are how to log
+    # these safely; a bare variable of one of these names is a leak. mix_id is
+    # intentionally NOT here — the operator may log it plainly — but txid and
+    # psbt must never hit a log raw (txid is a public on-chain handle, psbt hex
+    # carries every address). Matches a bare `, name` / `{name`, not substrings
+    # like local_txid / psbt_hex.
     BAD_VAR_NAMES = (
         "npub", "npub_hex", "sender_hex", "pubkey_hex",
         "lud16", "lightning_addr",
         "scriptpubkey", "address",
+        "txid", "psbt",
     )
 
     def test_no_raw_identifier_in_logger_call(self):

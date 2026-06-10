@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS mixes (
     --     non-conforming participants.
     required_nonconforming INTEGER NOT NULL DEFAULT 3,
     max_conforming_utxos INTEGER NOT NULL DEFAULT 10,
-    fee_rate        INTEGER DEFAULT 30,        -- sats/vbyte, set at assembly
+    fee_rate        REAL DEFAULT 30,           -- sats/vbyte (fractional), set at assembly
     fee_per_element INTEGER DEFAULT 0,         -- sats, service-fee zap per non-conforming element; 0 = no zap
     state           TEXT NOT NULL DEFAULT 'announced',
     -- announced | collecting | assembling | signing | broadcast | completed | cancelled

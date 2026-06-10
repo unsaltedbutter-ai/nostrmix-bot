@@ -33,6 +33,12 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        # secure_delete=ON: when a mix confirms or fails we DELETE every trace
+        # of it; without this, the freed pages still hold the plaintext (PSBT
+        # hex with addresses, npubs, lud16s) until SQLite happens to reuse
+        # them. The bot's whole job is to leave no linkage behind, so the on-
+        # disk residue matters. Costs extra writes on delete — acceptable here.
+        await self._conn.execute("PRAGMA secure_delete=ON")
         # Run schema
         with open(SCHEMA_PATH) as f:
             schema = f.read()

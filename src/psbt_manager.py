@@ -413,6 +413,23 @@ class PSBTManager:
         except (IndexError, ValueError):
             return False
 
+    def unsigned_txid(self, psbt_hex: str) -> Optional[str]:
+        """Return the txid of a PSBT's unsigned transaction (big-endian hex),
+        or None if it can't be parsed. Used to confirm a returned/signed PSBT
+        was signed against the CURRENT round's skeleton before combining — a
+        stale signature left over from a prior round/skeleton has a different
+        unsigned txid and must not be merged in."""
+        try:
+            psbt = PartiallySignedBitcoinTransaction.from_binary(
+                bytes.fromhex(psbt_hex)
+            )
+            tx = psbt.unsigned_tx
+            if tx is None:
+                return None
+            return b2x(tx.GetTxid()[::-1])
+        except Exception:
+            return None
+
     # --- Combine PSBTs ---
 
     def combine_psbts(self, psbt_hexes: List[str]) -> str:

@@ -535,6 +535,16 @@ class Coordinator:
                 rejections.append((outpoint, "not found on chain"))
                 continue
 
+            # Require the funding (parent) tx to be confirmed. An unconfirmed
+            # parent can be replaced (RBF) out from under us AFTER everyone has
+            # signed, failing the whole coinjoin late — and the griefer isn't
+            # even ghosted (this isn't a signing-deadline miss). lookup_txout's
+            # "status" is the parent-confirmed flag.
+            if not txout.get("status", False):
+                rejections.append(
+                    (outpoint, "unconfirmed — wait for at least 1 confirmation"))
+                continue
+
             # S-B: None = couldn't verify; True = spent; False = unspent.
             spent = await self.chain.is_utxo_spent(txid, vout)
             if spent is None:
@@ -1086,18 +1096,22 @@ class Coordinator:
             )
             return
 
-        # Once a participant is in the signing phase they've been sent a PSBT
-        # that already commits their inputs. Letting them /cancel now would
-        # delete their inputs from under a skeleton everyone else is signing —
-        # finalize would then fail and the WHOLE mix would be cancelled, letting
-        # one party grief every honest participant for the price of their own
-        # keep amount. Refuse; if they genuinely can't sign, the signing-deadline
-        # ghost-recovery path handles their departure cleanly (and blacklists
-        # them). (H1)
-        if target_p["state"] in ("signing", "signed"):
+        # Once a mix has left collecting it is being (or about to be) turned
+        # into a signed transaction that already commits this participant's
+        # inputs. Letting them /cancel now would delete their inputs from under
+        # the skeleton everyone else is signing — finalize would then fail and
+        # the WHOLE mix would be cancelled, letting one party grief every honest
+        # participant for the price of their own keep amount. We gate on BOTH
+        # the participant state (signing/signed) AND the mix state (assembling/
+        # signing): during the assembling window the participant is still 'paid'
+        # but the skeleton is being built, so a state-only check missed it. If
+        # they genuinely can't sign, the signing-deadline ghost-recovery path
+        # handles their departure cleanly (and blacklists them). (H1)
+        mix_state = mix.get("state") if mix else None
+        if target_p["state"] in ("signing", "signed") or mix_state in ("assembling", "signing"):
             await self.nostr.send_dm(
                 npub_hex,
-                f"{actual_mix_id} is already in the signing phase, so it's too "
+                f"{actual_mix_id} is already assembling/signing, so it's too "
                 f"late to cancel — backing out now would force everyone else to "
                 f"start over. If you can't sign, just don't: after the signing "
                 f"deadline the mix automatically re-forms without you.",
@@ -1765,11 +1779,16 @@ class Coordinator:
         else:
             fee_rate = mix.get("fee_rate") or 30
 
-        # Defensive: only assemble paid (or already-signing, for crash-resume)
-        # participants. The caller's `active` filter is loose ("not cancelled,
-        # not ghosted") — without this guard, a participant whose pay-timeout
-        # hasn't fired yet would be included with no zap on file.
-        active = [p for p in active if p["state"] in ("paid", "signing")]
+        # Defensive: only assemble paid (or already-signing/signed, for
+        # crash-resume) participants. The caller's `active` filter is loose
+        # ("not cancelled, not ghosted") — without this guard, a participant
+        # whose pay-timeout hasn't fired yet would be included with no zap on
+        # file. 'signed' is included so a fast signer who returned a PSBT
+        # against the OLD skeleton before a crash is re-added to the new round
+        # (add_psbt_round resets their stale psbt_returned to NULL and they are
+        # re-sent the fresh skeleton) rather than being silently excluded and
+        # leaving a stale signature behind to poison the combine. (stale-sig)
+        active = [p for p in active if p["state"] in ("paid", "signing", "signed")]
 
         # Conforming-model fee inputs. The miner fee is computed from the ACTUAL
         # conforming UTXOs in this frozen participant set (the cap,
@@ -1931,7 +1950,12 @@ class Coordinator:
                 change_amount=fr.change_sats,
             )
 
-        await self.db.update_mix(mix_id, fee_rate=int(fee_rate))
+        # Store the fee rate as a float (not int()). A calm-mempool rate like
+        # 1.5 sat/vB truncated to 1 would, on a crash-resume with the chain API
+        # down, fall back below MIN_FEE_RATE_SATS and trip the pre-broadcast
+        # invariant — cancelling the mix and costing users their refund keep for
+        # a pure rounding bug. The column is REAL; SQLite stores the fraction.
+        await self.db.update_mix(mix_id, fee_rate=round(float(fee_rate), 3))
 
         # S-E: defensive invariant. The PSBT we're about to send must pay
         # the miner more than the minimum relay fee. A future bug in the
@@ -2076,7 +2100,6 @@ class Coordinator:
         deadline_hours = self.cfg.SIGNING_DEADLINE_HOURS
         deadline_seconds = deadline_hours * 3600
 
-        ghosted_any = False
         for p in active:
             if p["state"] not in ("signing", "signed", "ghosted"):
                 continue
@@ -2107,7 +2130,6 @@ class Coordinator:
                         utxo_txid_vout=f"{gu['txid']}:{gu['vout']}",
                         reason="ghosting",
                     )
-                ghosted_any = True
                 logger.info(
                     "Participant %s ghosted mix %s",
                     tokens.p(p["npub_hex"]), tokens.m(mix_id),
@@ -2153,62 +2175,85 @@ class Coordinator:
                     await self.nostr.send_dm(p["npub_hex"], text)
                     await self.db.update_participant(p["id"], reminder_count=expected_level)
 
-        # Only the participants actually in THIS assembled round count toward
-        # "everyone signed". A round participant is one _assemble_psbt moved to
-        # signing — i.e. state in (signing, signed, ghosted). A straggler still
-        # in 'committed'/'interested' (joined but never finished /addresses or
-        # never paid before assembly) or a late 'paid' (zap landed after the
-        # round was frozen) is NOT in the round; including them here would make
-        # all_signed forever false and wedge the mix in signing with everyone's
-        # UTXOs locked. (H3)
-        round_participants = [
-            p for p in active if p["state"] in ("signing", "signed", "ghosted")
-        ]
-        remaining = [p for p in round_participants if p["state"] not in ("ghosted", "cancelled")]
+        # Decide ghost-recovery vs broadcast from the DATABASE, scoped to the
+        # current assembled round — NOT from a tick-local flag. The active list
+        # passed in by _process_mix has already filtered out 'ghosted' rows, so
+        # a ghost persisted by an EARLIER tick that crashed (or whose recovery
+        # DM raised) mid-recovery would be invisible to a tick-local check:
+        # ghosted_any would read False, the cooperative signers would look
+        # "all signed", and the mix would wrongly broadcast/cancel with the
+        # ghost's input still unsigned. Re-reading from the DB makes recovery
+        # resumable. Round membership is the psbt_rounds row for this round_num,
+        # so a ghost from a PRIOR round (still 'ghosted' but reset out of this
+        # round) doesn't re-trigger recovery. (HIGH ghost-recovery)
+        round_num = mix.get("ghost_retries", 0) + 1
+        all_parts = await self.db.get_participants_by_mix(mix_id)
+        remaining = []        # current-round participants who can still sign
+        round_ghosts = []     # current-round participants who ghosted
+        for p in all_parts:
+            if p["state"] in ("signing", "signed"):
+                remaining.append(p)
+            elif p["state"] == "ghosted":
+                rnd = await self.db.get_psbt_round(mix_id, p["id"], round_num)
+                if rnd is not None:
+                    round_ghosts.append(p)
+        ghosted_any = bool(round_ghosts)
         all_signed = bool(remaining) and all(p["state"] == "signed" for p in remaining)
 
         # Ghost recovery takes precedence over broadcast. The common ghost
         # pattern is "everyone cooperative signs early, one lets the deadline
-        # lapse": on the tick that ghosts the laggard, the others are all
-        # 'signed', so all_signed would be true — but the skeleton still has the
-        # ghost's input unsigned, so finalize would fail and _combine_and_broadcast
-        # would cancel the whole mix instead of restarting the round. Checking
-        # ghosted_any FIRST routes that case to ghost recovery. (H2)
+        # lapse": the others are all 'signed', so all_signed would be true — but
+        # the skeleton still has the ghost's input unsigned, so finalize would
+        # fail and _combine_and_broadcast would cancel the whole mix instead of
+        # restarting the round. Checking ghosted_any FIRST routes that case to
+        # ghost recovery. (H2)
         if ghosted_any:
-            # Check ghost retries
             ghost_retries = mix.get("ghost_retries", 0)
             max_ghost = mix.get("max_ghost_retries", self.cfg.MAX_GHOST_RETRIES)
 
             if ghost_retries >= max_ghost:
                 await self._cancel_and_refund(mix, "max ghost retries exceeded")
             else:
-                # Increment ghost retries
-                await self.db.update_mix(mix_id, ghost_retries=ghost_retries + 1)
-                # Remove ghost from mix
-                ghost_participants = [p for p in round_participants if p["state"] == "ghosted"]
-                for gp in ghost_participants:
+                # Crash-safe ordering: do the idempotent cleanup (drop the
+                # ghost's inputs/outputs, reset survivors to 'paid' with
+                # addresses cleared) FIRST, then bump ghost_retries and flip to
+                # 'collecting' in a SINGLE update as the very last step. If we
+                # crash before that final update, the mix stays 'signing' with
+                # the SAME round_num, so the ghost is still found next tick and
+                # recovery re-runs harmlessly. Incrementing ghost_retries early
+                # would change round_num and HIDE the ghost on resume — exactly
+                # the bug we're fixing.
+                for gp in round_ghosts:
                     await self.db.delete_utxos_by_participant(gp["id"])
                     await self.db.delete_outputs_by_participant(gp["id"])
 
                 # Notify remaining and actually clear their addresses so the
-                # ghost-warning DM ("we've thrown out your addresses") tells
-                # the truth. Their UTXOs and service-fee payment are kept; the
-                # 'paid' state combined with empty outputs is what _cmd_provide_addresses
-                # needs to accept a re-submission without re-charging.
+                # ghost-warning DM ("we've thrown out your addresses") tells the
+                # truth. Their UTXOs and service-fee payment are kept; 'paid'
+                # with empty outputs is what _cmd_provide_addresses needs to
+                # accept a re-submission without re-charging. The DM is guarded:
+                # a relay hiccup must NOT abort recovery (that would strand the
+                # mix mid-recovery and let the next tick wrongly cancel it).
                 for p in remaining:
                     await self.db.delete_outputs_by_participant(p["id"])
                     await self.db.update_participant(p["id"], state="paid", reminder_count=0)
-                    await self.nostr.send_dm(
-                        p["npub_hex"],
-                        self.parser.format_ghost_warning(mix_id),
-                    )
+                    try:
+                        await self.nostr.send_dm(
+                            p["npub_hex"], self.parser.format_ghost_warning(mix_id),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Mix %s: ghost-warning DM to participant %s failed "
+                            "(continuing recovery)",
+                            tokens.m(mix_id), tokens.p(p["npub_hex"]),
+                        )
 
-                # Move mix back to collecting and extend the deadline so the
-                # survivors actually have time to re-submit addresses before
-                # the next assembly attempt.
+                # Final, single atomic step: bump retries, return to collecting,
+                # extend the deadline so survivors have time to re-submit.
                 new_deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
                 await self.db.update_mix(
-                    mix_id, state="collecting", deadline_unix=new_deadline,
+                    mix_id, ghost_retries=ghost_retries + 1,
+                    state="collecting", deadline_unix=new_deadline,
                 )
 
         elif all_signed:
@@ -2219,14 +2264,37 @@ class Coordinator:
         mix_id = mix["id"]
         round_num = mix.get("ghost_retries", 0) + 1
 
-        # Collect signed PSBTs from the active round
+        # Collect signed PSBTs from the active round. Guard against a STALE
+        # return poisoning the combine: a returned PSBT must have the same
+        # unsigned-tx txid as this round's skeleton. A crash between a fast
+        # signer's per-participant update and the round-level flip could leave a
+        # signature made against an OLD skeleton; merging it would corrupt every
+        # combine attempt. We compare each return's unsigned txid against the
+        # skeleton we actually sent for this round. (stale-sig)
         psbt_hexes = []
+        skeleton_txid: Optional[str] = None
+        stale = 0
         for p in signed:
             rounds = await self.db.get_psbt_round(mix_id, p["id"], round_num)
-            if rounds and rounds.get("psbt_returned"):
-                psbt_hexes.append(rounds["psbt_returned"])
+            if not rounds or not rounds.get("psbt_returned"):
+                continue
+            if skeleton_txid is None and rounds.get("psbt_sent"):
+                skeleton_txid = self.psbt_mgr.unsigned_txid(rounds["psbt_sent"])
+            ret_txid = self.psbt_mgr.unsigned_txid(rounds["psbt_returned"])
+            if skeleton_txid is not None and ret_txid != skeleton_txid:
+                stale += 1
+                logger.warning(
+                    "Mix %s: discarding a returned PSBT whose unsigned tx "
+                    "doesn't match this round's skeleton (stale signature).",
+                    tokens.m(mix_id),
+                )
+                continue
+            psbt_hexes.append(rounds["psbt_returned"])
 
         if len(psbt_hexes) < 2:
+            # If we dropped stale returns, this isn't a real "everyone signed"
+            # state — let recovery/the deadline handle it rather than broadcast
+            # a half-signed tx.
             await self._cancel_and_refund(mix, "not enough signed PSBTs")
             return
 
@@ -2287,7 +2355,7 @@ class Coordinator:
             logger.warning(
                 "Mix %s: broadcast_tx returned None but tx is known on chain "
                 "(%s) — parking in broadcast state instead of refunding.",
-                tokens.m(mix_id), local_txid,
+                tokens.m(mix_id), tokens.tx(local_txid),
             )
             await self.db.update_mix(
                 mix_id, state="broadcast",
@@ -2308,7 +2376,7 @@ class Coordinator:
                 "Mix %s: broadcast_tx returned None AND chain endpoints "
                 "unreachable — cannot tell whether tx (%s) is in mempool. "
                 "Parking in broadcast state; the sweep will recheck.",
-                tokens.m(mix_id), local_txid or "<unparseable>",
+                tokens.m(mix_id), tokens.tx(local_txid) if local_txid else "<unparseable>",
             )
             if local_txid:
                 await self.db.update_mix(
@@ -2331,6 +2399,41 @@ class Coordinator:
         # known is False — every endpoint that answered said the tx is
         # nowhere to be found. Genuine broadcast failure; safe to refund.
         await self._cancel_and_refund(mix, "broadcast failed")
+
+    async def _tx_double_spent(self, raw_tx_hex: str, txid: str) -> Optional[bool]:
+        """Has this broadcast tx been replaced out by a conflicting spend?
+
+        Returns True only when (a) the tx is NOT known to any chain endpoint
+        (not in mempool, not confirmed) AND (b) at least one of its inputs is
+        now spent — which, since our tx isn't the spender, means a DIFFERENT tx
+        took that outpoint. That coinjoin can never confirm, so the sweep must
+        stop re-broadcasting it forever. Returns False when the tx is still
+        around or its inputs are free (a normal "fell out of mempool, re-push"
+        case), and None when we can't tell (chain unreachable / unparseable) —
+        the caller treats None as "keep trying", never as a conflict.
+        """
+        try:
+            known = await self.chain.tx_known(txid)
+        except Exception:
+            known = None
+        if known is None:
+            return None          # can't reach the chain — inconclusive
+        if known:
+            return False         # still in mempool or confirmed — not conflicted
+        # Our tx is nowhere on-chain. Probe its inputs for a conflicting spend.
+        try:
+            from bitcointx.core import CTransaction, b2x as _b2x
+            tx = CTransaction.deserialize(bytes.fromhex(raw_tx_hex))
+            outpoints = [
+                (_b2x(vin.prevout.hash[::-1]), vin.prevout.n) for vin in tx.vin
+            ]
+        except Exception:
+            return None
+        for in_txid, vout in outpoints:
+            spent = await self.chain.is_utxo_spent(in_txid, vout)
+            if spent is True:
+                return True      # a different tx spent our input → conflict
+        return False             # inputs free (or unreachable) — keep retrying
 
     async def _broadcast_sweep(self, now: float):
         """Sweep all broadcast-pending mixes and check confirmation.
@@ -2384,6 +2487,24 @@ class Coordinator:
                 # token only; surface the txid in a separate line.
                 mtoken = tokens.m(mix_id)
                 if raw_tx_hex:
+                    # Before re-pushing, check whether the tx was double-spent
+                    # out from under us. If a conflicting tx took one of our
+                    # inputs, ours can NEVER confirm — stop the infinite
+                    # re-broadcast loop (which also retains all participant data
+                    # forever) and tear the mix down, refunding service fees.
+                    conflicted = await self._tx_double_spent(raw_tx_hex, txid)
+                    if conflicted:
+                        logger.warning(
+                            "Mix %s: broadcast tx conflicted — an input was "
+                            "double-spent by another tx that won. Cancelling "
+                            "(cannot confirm).", mtoken,
+                        )
+                        await self._cancel_and_refund(
+                            mix,
+                            "broadcast transaction was double-spent (a conflicting "
+                            "transaction confirmed first)",
+                        )
+                        continue
                     rebroadcast = await self.chain.re_broadcast(raw_tx_hex)
                     if rebroadcast:
                         logger.info("Mix %s: re-broadcast attempted; next check in %dh", mtoken, interval_hours)

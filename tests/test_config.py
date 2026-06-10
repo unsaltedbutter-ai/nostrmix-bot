@@ -166,3 +166,63 @@ class TestAcceptedTypes:
             assert cfg.ACCEPTED_OUTPUT_TYPES == {"p2wpkh"}
         finally:
             os.unlink(env_path)
+
+
+class TestConfigWarnings:
+    """The loader should warn (not crash) on the common foot-guns: a missing
+    config file, an unknown/typo'd key, and a missing signing key. Warnings
+    never include the VALUE of any key."""
+
+    def test_warns_on_missing_file(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="src.config"):
+            BotConfig("/definitely/not/here/bot-config")
+        assert any("not found" in r.message for r in caplog.records)
+
+    def test_warns_on_unknown_key_without_leaking_value(self, caplog):
+        import logging
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=placeholder\n")
+            f.write("FEE_PER_ELEMNT=500\n")          # typo: missing 'E'
+            env_path = f.name
+        try:
+            with caplog.at_level(logging.WARNING, logger="src.config"):
+                BotConfig(env_path)
+            msgs = " ".join(r.message for r in caplog.records)
+            assert "unknown config key" in msgs.lower()
+            assert "FEE_PER_ELEMNT" in msgs       # the name is named
+            assert "500" not in msgs              # the value is NOT logged
+        finally:
+            os.unlink(env_path)
+
+    def test_warns_on_missing_signing_key(self, caplog, monkeypatch):
+        import logging
+        # load_dotenv(override=True) leaks values into os.environ across
+        # BotConfig instances, so a prior test's key can linger — clear it so
+        # this test sees a genuinely-absent signing key.
+        monkeypatch.delenv("NOSTR_PRIVATE_KEY_NPUB", raising=False)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("BOT_NAME=butterbot\n")        # no signing key set
+            env_path = f.name
+        try:
+            with caplog.at_level(logging.WARNING, logger="src.config"):
+                BotConfig(env_path)
+            assert any("NOSTR_PRIVATE_KEY_NPUB is not set" in r.message
+                       for r in caplog.records)
+        finally:
+            os.unlink(env_path)
+
+    def test_no_unknown_warning_for_clean_file(self, caplog):
+        import logging
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=placeholder\n")
+            f.write("FEE_PER_ELEMENT=0\n")
+            f.write("# a comment\n")
+            env_path = f.name
+        try:
+            with caplog.at_level(logging.WARNING, logger="src.config"):
+                BotConfig(env_path)
+            msgs = " ".join(r.message for r in caplog.records).lower()
+            assert "unknown config key" not in msgs
+        finally:
+            os.unlink(env_path)

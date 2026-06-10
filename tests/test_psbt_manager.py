@@ -344,6 +344,23 @@ class TestPSBTManager:
         txid = b2x(tx.GetTxid()[::-1])
         assert len(txid) == 64
 
+    def test_unsigned_txid_matches_for_signed_return_differs_across_skeletons(self):
+        """unsigned_txid powers the stale-signature guard in _combine_and_broadcast.
+        A participant's signed return has the SAME unsigned txid as the skeleton
+        (signing doesn't change the unsigned tx); a PSBT built from a different
+        input set has a DIFFERENT one — which is how a stale return is caught."""
+        skel, keys = self._multi_input_skeleton(n=3)
+        signed = self._sign_with(skel, [0], keys)
+        skel_txid = self.mgr.unsigned_txid(skel)
+        assert skel_txid is not None and len(skel_txid) == 64
+        # Signing leaves the unsigned tx (and thus its txid) unchanged.
+        assert self.mgr.unsigned_txid(signed) == skel_txid
+        # A skeleton over a different input set has a different unsigned txid.
+        other_skel, _ = self._multi_input_skeleton(n=2)
+        assert self.mgr.unsigned_txid(other_skel) != skel_txid
+        # Garbage in → None (the guard treats that as a mismatch).
+        assert self.mgr.unsigned_txid("not hex") is None
+
     def test_combine_skips_when_one_participant_unsigned(self):
         """If one participant's PSBT has no signature on their input, the
         combine still works structurally but finalize must fail (or return

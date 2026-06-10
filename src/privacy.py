@@ -1,11 +1,22 @@
 """Privacy Module — non-authoritative PSBT sanity check.
 
-The bar we enforce is intentionally simple: a mix must produce at least 2
-equal-size (output_size) outputs drawn from at least 2 inputs (non-conforming
-and conforming counted together). That breaks the 1:1 coin↔owner link, which is
-the bot's purpose. We deliberately do NOT attempt subset-sum / N!/2 partition
-counting; users who want stronger anonymity re-mix the outputs in later rounds.
-The coordinator calls check_psbt with floor = max(2, required_nonconforming).
+The bar this module enforces is intentionally simple and counts OUTPUTS ONLY,
+by value: the transaction must have at least N outputs, and its largest
+equal-value group must be at least N (the coordinator passes
+N = max(2, required_nonconforming)). That's a cheap guard against an assembly
+bug that produced a degenerate, obviously-unmixed transaction.
+
+What it deliberately does NOT do:
+  * It does NOT attribute outputs to owners. Two equal outputs that both belong
+    to one participant still count toward the group — and that's fine: one
+    participant legitimately receives several equal outputs, and the distinct-
+    party guarantee (≥2 separate parties contributing equal outputs) is enforced
+    upstream by the coordinator's _classify_ready solo_ok check, not here.
+  * It does NOT count or verify inputs, and makes no subset-sum / N!/2 partition
+    claim. Stronger anonymity is the user's choice via re-mixing in later rounds.
+
+So this is a sanity smoke test, not an anonymity proof; the coordinator logs a
+failure and continues (the real proceed/abort decision lives in _classify_ready).
 """
 
 from __future__ import annotations
@@ -24,14 +35,15 @@ class PrivacyCheck:
         return max(output_groups.values())
 
     def check_psbt(self, psbt_hex: str, num_participants: int) -> Tuple[bool, str]:
-        """Check if a PSBT meets minimum privacy requirements.
+        """Check if a PSBT meets the minimum-structure sanity bar.
 
-        ``num_participants`` is the anonymity-set floor. Under the
-        conforming/non-conforming model the coordinator passes the mix's
-        required non-conforming participant count (N distinct equal-output
-        contributors); conforming UTXOs only add more equal outputs. The check
-        is a non-authoritative sanity guard: there must be at least N outputs,
-        and the largest equal-value group must be at least N.
+        ``num_participants`` is the floor N the coordinator passes
+        (max(2, required_nonconforming)). The check, by output VALUE only:
+        there must be at least N outputs, and the largest equal-value group
+        must be at least N. It does not attribute outputs to owners (one
+        participant may hold several equal outputs) and does not inspect inputs
+        — distinct-party contribution is guaranteed upstream by _classify_ready,
+        not here. Non-authoritative: the coordinator logs failures and proceeds.
         """
         from bitcointx.core.psbt import PartiallySignedBitcoinTransaction
 

@@ -2,7 +2,10 @@
 
 import os
 import json
+import logging
 from typing import Optional, List, Dict, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # Defaults matching the plan's env template
@@ -143,6 +146,11 @@ class BotConfig:
         from dotenv import load_dotenv
         load_dotenv(env_path, override=True)
 
+        # Surface common foot-guns at load time. With real money on the line a
+        # silent misconfiguration (a typo'd key running on the default, a
+        # missing env file, no signing key) is worse than a noisy warning.
+        self._warn_on_config_issues(env_path)
+
         for key, default in _DEFAULTS.items():
             raw = os.environ.get(key, default)
             # Type-coerce based on default type
@@ -196,6 +204,55 @@ class BotConfig:
             raw = self._values.get(key, "")
             parsed = {t.strip().lower() for t in raw.split(",") if t.strip()}
             self._values[f"_{key.lower()}"] = parsed or {"p2wpkh"}
+
+    @staticmethod
+    def _warn_on_config_issues(env_path: str) -> None:
+        """Log warnings for missing env file, unknown (typo'd) keys, and a
+        missing signing key. Reads only KEY NAMES from the file — never the
+        values — so this can't leak a secret into the logs.
+        """
+        if not os.path.exists(env_path):
+            logger.warning(
+                "Config file not found at %s — running entirely on defaults. "
+                "FEE_PER_ELEMENT=0, no BOT_LUD16, no signing key. This is almost "
+                "certainly not what you want for a live bot.",
+                env_path,
+            )
+            return
+
+        # Collect the key names declared in the file (left of the first '=',
+        # skipping comments/blank lines). Values are deliberately not read.
+        file_keys = set()
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    key = s.split("=", 1)[0].strip()
+                    if key.lower().startswith("export "):
+                        key = key[len("export "):].strip()
+                    if key:
+                        file_keys.add(key)
+        except OSError as e:
+            logger.warning("Could not read config file %s: %s", env_path, type(e).__name__)
+            return
+
+        unknown = sorted(k for k in file_keys if k not in _DEFAULTS)
+        if unknown:
+            logger.warning(
+                "Ignoring %d unknown config key(s) (typo? renamed?): %s. "
+                "These have NO effect — the matching setting runs on its default.",
+                len(unknown), ", ".join(unknown),
+            )
+
+        # Presence-only check for the signing key (never read/echo the value).
+        if not (os.environ.get("NOSTR_PRIVATE_KEY_NPUB") or "").strip():
+            logger.warning(
+                "NOSTR_PRIVATE_KEY_NPUB is not set — the bot has no Nostr signing "
+                "key and the SDK will fail to start. Set it in %s.",
+                env_path,
+            )
 
     # --- Property helpers ---
 

@@ -81,6 +81,13 @@ class SessionTokens:
         """Lud16 token from a Lightning address."""
         return self.for_kind("l", lud16)
 
+    def tx(self, txid: str) -> str:
+        """Txid token. A bare on-chain txid in a log is a privacy leak —
+        paired with anything mix-internal it reconstructs coinjoin membership,
+        and on its own it still says "this bot broadcast this public tx". Log
+        ``tokens.tx(txid)`` instead of the raw value."""
+        return self.for_kind("tx", txid)
+
 
 # Module-level singleton: every production log call should use this.
 tokens = SessionTokens()

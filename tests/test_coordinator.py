@@ -660,6 +660,12 @@ class TestGhostRecovery:
             await db.update_participant(surv2_pid, state="signing",
                                         fee_paid=500, psbt_sent_at_unix=recent)
 
+            # Every signing participant has a psbt_rounds row for the current
+            # round (round_num = ghost_retries + 1 = 1) — that's how _assemble_psbt
+            # leaves them, and how ghost recovery scopes a ghost to this round.
+            for pid in (ghoster_pid, surv1_pid, surv2_pid):
+                await db.add_psbt_round(mix_id, pid, round_num=1)
+
             mix_row = await db.get_mix(mix_id)
             active = await db.get_participants_by_mix(mix_id)
             await coord._handle_signing(mix_row, active, int(time.time()))
@@ -710,11 +716,13 @@ class TestGhostRecovery:
                 await db.add_output(pid, P2WPKH_ADDRS[i], 1_000_000)
                 await db.update_participant(pid, state="signed",
                                             fee_paid=500, psbt_sent_at_unix=recent)
+                await db.add_psbt_round(mix_id, pid, round_num=1)
 
             # The ghoster — still 'signing', past the deadline.
             gpid = await db.add_participant(mix_id, "ghost", "")
             await db.add_utxo(gpid, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.update_participant(gpid, state="signing", psbt_sent_at_unix=past)
+            await db.add_psbt_round(mix_id, gpid, round_num=1)
 
             mix_row = await db.get_mix(mix_id)
             active = await db.get_participants_by_mix(mix_id)
@@ -2546,7 +2554,7 @@ class TestExitMixSingleAndNone:
             assert await db.get_utxos_by_participant(pid) != []
             assert lightning.refunds == []
             dms = " ".join(m for r, m in nostr.sent_dms if r == "npub_sign").lower()
-            assert "signing phase" in dms
+            assert "too late to cancel" in dms
         finally:
             await db.close()
 
@@ -4516,5 +4524,282 @@ class TestInputOutputOrdering:
             psbt = PartiallySignedBitcoinTransaction.from_binary(bytes.fromhex(ra["psbt_sent"]))
             txids = [bytes(vin.prevout.hash)[::-1].hex() for vin in psbt.unsigned_tx.vin]
             assert txids == sorted(txids), txids
+        finally:
+            await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the post-launch fix batch:
+#  - ghost recovery survives a crash/exception mid-recovery (DB-derived, not
+#    tick-local)
+#  - /cancel refused during 'assembling'
+#  - unconfirmed-parent UTXOs rejected at /commit
+#  - broadcast sweep cancels a double-spent (conflicted) tx instead of looping
+#  - fee_rate stored as a float (no int() truncation)
+# ---------------------------------------------------------------------------
+
+
+class TestGhostRecoveryCrashResume:
+    @pytest.mark.asyncio
+    async def test_persisted_ghost_recovers_not_cancels(self):
+        """The HIGH fix: a ghost whose state was already 'ghosted' on disk
+        (a prior tick crashed / its recovery DM raised before completing) must
+        still drive recovery. _process_mix filters 'ghosted' out of `active`,
+        so a tick-local flag would miss it, see two signed survivors as
+        'all signed', and wrongly cancel the mix. Recovery is now decided from
+        the DB, round-scoped via psbt_rounds."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="signing", ghost_retries=0,
+                                deadline_unix=int(time.time()) - 100)
+            recent = int(time.time()) - 60
+
+            # Two cooperative survivors, already SIGNED, in the round.
+            for i, npub in enumerate(("s1", "s2")):
+                pid = await db.add_participant(mix_id, npub, "")
+                await db.add_utxo(pid, TXID[i], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                await db.add_output(pid, P2WPKH_ADDRS[i], 1_000_000)
+                await db.update_participant(pid, state="signed",
+                                            fee_paid=500, psbt_sent_at_unix=recent)
+                await db.add_psbt_round(mix_id, pid, round_num=1)
+
+            # The ghost is ALREADY persisted as 'ghosted' (simulating a prior
+            # tick that marked it and then died before finishing recovery).
+            gpid = await db.add_participant(mix_id, "ghost", "")
+            await db.add_utxo(gpid, TXID[2], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(gpid, state="ghosted", psbt_sent_at_unix=recent)
+            await db.add_psbt_round(mix_id, gpid, round_num=1)
+
+            mix_row = await db.get_mix(mix_id)
+            # Mirror _process_mix: 'ghosted' rows are filtered OUT of active.
+            active = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] != "ghosted"]
+            await coord._handle_signing(mix_row, active, int(time.time()))
+
+            mix_after = await db.get_mix(mix_id)
+            assert mix_after is not None, "mix was wrongly cancelled/destroyed"
+            assert mix_after["state"] == "collecting", "did not recover"
+            assert mix_after["ghost_retries"] == 1
+            assert chain.broadcast_calls == [], "must not broadcast a half-signed tx"
+            # Survivors reset to 'paid' with outputs cleared.
+            for npub in ("s1", "s2"):
+                ps = await db.get_participants_by_npub(npub)
+                assert ps[0]["state"] == "paid"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_recovery_ghost_retries_and_state_flip_are_one_update(self):
+        """Crash-safety: if recovery is interrupted before its final step the
+        mix must stay 'signing' with the SAME round_num so the ghost is still
+        found next tick. We assert that the post-recovery state has BOTH the
+        bumped retries AND collecting — i.e. they move together, never leaving
+        a bumped-retries-but-still-signing window that would hide the ghost."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="signing", ghost_retries=0,
+                                deadline_unix=int(time.time()) - 100)
+            recent = int(time.time()) - 60
+            for i, npub in enumerate(("s1", "s2")):
+                pid = await db.add_participant(mix_id, npub, "")
+                await db.add_utxo(pid, TXID[i], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+                await db.add_output(pid, P2WPKH_ADDRS[i], 1_000_000)
+                await db.update_participant(pid, state="signed",
+                                            fee_paid=500, psbt_sent_at_unix=recent)
+                await db.add_psbt_round(mix_id, pid, round_num=1)
+            gpid = await db.add_participant(mix_id, "ghost", "")
+            await db.update_participant(gpid, state="ghosted", psbt_sent_at_unix=recent)
+            await db.add_psbt_round(mix_id, gpid, round_num=1)
+
+            mix_row = await db.get_mix(mix_id)
+            active = [p for p in await db.get_participants_by_mix(mix_id)
+                      if p["state"] != "ghosted"]
+            await coord._handle_signing(mix_row, active, int(time.time()))
+
+            m = await db.get_mix(mix_id)
+            # Never the dangerous intermediate (retries bumped but still signing).
+            assert not (m["ghost_retries"] == 1 and m["state"] == "signing")
+            assert m["state"] == "collecting" and m["ghost_retries"] == 1
+        finally:
+            await db.close()
+
+
+class TestCancelDuringAssembling:
+    @pytest.mark.asyncio
+    async def test_cancel_refused_while_mix_assembling(self):
+        """A participant is still 'paid' during the assembling window, but the
+        skeleton is being built from their inputs. /cancel must be refused —
+        deleting their UTXOs now would force the whole mix to restart."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="assembling")
+            pid = await db.add_participant(mix_id, "npub_a", "a@x")
+            await db.add_utxo(pid, TXID[0], 0, 1_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="paid", fee_paid=500)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_a"), "npub_a", None)
+
+            p = await db.get_participant(pid)
+            assert p["state"] == "paid", "cancel should be refused during assembling"
+            assert await db.get_utxos_by_participant(pid) != []
+            assert lightning.refunds == []
+            dms = " ".join(m for r, m in nostr.sent_dms if r == "npub_a").lower()
+            assert "too late to cancel" in dms
+        finally:
+            await db.close()
+
+
+class TestUnconfirmedUtxoRejected:
+    @pytest.mark.asyncio
+    async def test_commit_rejects_unconfirmed_parent(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="collecting")
+            pid = await db.add_participant(mix_id, "npub_u", "")  # 'interested'
+
+            outpoint = f"{TXID[0]}:0"
+            chain.txouts[outpoint] = {
+                "txid": TXID[0], "vout": 0,
+                "status": False,                       # parent NOT confirmed
+                "value": 1_500_000,
+                "scriptpubkey": FAKE_SCRIPTPUBKEY,
+                "scriptpubkey_type": "p2wpkh",
+                "address": "",
+            }
+            chain.spent[outpoint] = False
+
+            await coord._cmd_commit_utxos(
+                FakeCtx("npub_u"), "npub_u", [{"txid": TXID[0], "vout": 0}])
+
+            # No UTXO stored; rejection mentions confirmation.
+            assert await db.get_utxos_by_participant(pid) == []
+            dms = " ".join(m for r, m in nostr.sent_dms if r == "npub_u").lower()
+            assert "unconfirmed" in dms or "confirmation" in dms
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_commit_accepts_confirmed_parent(self):
+        """Control: the same UTXO with status=True (confirmed) is accepted, so
+        the rejection is specifically the confirmation gate, not something else."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="collecting")
+            pid = await db.add_participant(mix_id, "npub_c", "")
+            outpoint = f"{TXID[0]}:0"
+            chain.txouts[outpoint] = {
+                "txid": TXID[0], "vout": 0, "status": True, "value": 1_500_000,
+                "scriptpubkey": FAKE_SCRIPTPUBKEY, "scriptpubkey_type": "p2wpkh",
+                "address": "",
+            }
+            chain.spent[outpoint] = False
+            await coord._cmd_commit_utxos(
+                FakeCtx("npub_c"), "npub_c", [{"txid": TXID[0], "vout": 0}])
+            assert len(await db.get_utxos_by_participant(pid)) == 1
+        finally:
+            await db.close()
+
+
+def _one_input_raw_tx(prev_txid_hex: str, vout: int = 0):
+    """Build a minimal real 1-input tx; return (raw_hex, our_txid)."""
+    from bitcointx.core import (
+        CMutableTransaction, CMutableTxIn, CMutableTxOut, COutPoint, b2x,
+    )
+    from bitcointx.core.script import CScript
+    vin = [CMutableTxIn(COutPoint(bytes.fromhex(prev_txid_hex)[::-1], vout))]
+    vout_outs = [CMutableTxOut(90_000, CScript(bytes.fromhex(FAKE_SCRIPTPUBKEY)))]
+    tx = CMutableTransaction(vin, vout_outs)
+    return b2x(tx.serialize()), b2x(tx.GetTxid()[::-1])
+
+
+class TestBroadcastConflict:
+    @pytest.mark.asyncio
+    async def test_tx_double_spent_detects_conflict(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            raw, our_txid = _one_input_raw_tx(TXID[0], 0)
+            # Our tx isn't on-chain, and its input was spent by something else.
+            chain.known_txids[our_txid] = False
+            chain.spent[f"{TXID[0]}:0"] = True
+            assert await coord._tx_double_spent(raw, our_txid) is True
+
+            # Control 1: our tx is still known (in mempool) → not a conflict.
+            chain.known_txids[our_txid] = True
+            assert await coord._tx_double_spent(raw, our_txid) is False
+
+            # Control 2: tx not known but input still unspent → just re-push.
+            chain.known_txids[our_txid] = False
+            chain.spent[f"{TXID[0]}:0"] = False
+            assert await coord._tx_double_spent(raw, our_txid) is False
+
+            # Control 3: chain unreachable → inconclusive (None), never a conflict.
+            chain.known_txids[our_txid] = None
+            assert await coord._tx_double_spent(raw, our_txid) is None
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sweep_cancels_conflicted_tx(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            raw, our_txid = _one_input_raw_tx(TXID[1], 0)
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="broadcast",
+                                broadcast_txid=our_txid, broadcast_tx_hex=raw)
+            pid = await db.add_participant(mix_id, "npub_b", "b@x")
+            await db.update_participant(pid, state="signed", fee_paid=500)
+
+            chain.confirmed[our_txid] = False     # not confirmed
+            chain.known_txids[our_txid] = False    # not in mempool
+            chain.spent[f"{TXID[1]}:0"] = True     # input double-spent
+
+            await coord._broadcast_sweep(int(time.time()))
+
+            # Mix torn down (destroyed) — not re-broadcast forever.
+            assert await db.get_mix(mix_id) is None
+            # The paid participant's service fee was refunded.
+            assert any(r[0] == "b@x" for r in lightning.refunds)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sweep_rebroadcasts_when_not_conflicted(self):
+        """Control: a tx that simply fell out of mempool (inputs still free) is
+        re-broadcast, not cancelled."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            raw, our_txid = _one_input_raw_tx(TXID[2], 0)
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, state="broadcast",
+                                broadcast_txid=our_txid, broadcast_tx_hex=raw)
+            chain.confirmed[our_txid] = False
+            chain.known_txids[our_txid] = False
+            chain.spent[f"{TXID[2]}:0"] = False    # input still unspent
+            chain.broadcast_calls = []
+
+            await coord._broadcast_sweep(int(time.time()))
+
+            assert await db.get_mix(mix_id) is not None     # still alive
+            assert chain.broadcast_calls == [raw]           # re-pushed
+        finally:
+            await db.close()
+
+
+class TestFeeRateStoredAsFloat:
+    @pytest.mark.asyncio
+    async def test_fractional_fee_rate_round_trips(self):
+        """fee_rate must survive as a fraction (column is REAL). A truncated
+        1.5→1 would trip the MIN_FEE_RATE invariant on a crash-resume."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            await db.update_mix(mix_id, fee_rate=1.5)
+            m = await db.get_mix(mix_id)
+            assert m["fee_rate"] == 1.5
         finally:
             await db.close()
