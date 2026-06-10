@@ -106,8 +106,10 @@ class Coordinator:
 
                 case "join_mix":
                     mix_id = parsed.args[0] if parsed.args else None
-                    # num_outputs from parsed.args[1] if provided
-                    await self._cmd_join_mix(ctx, mix_id)
+                    # parsed.args[1] is the "<word1>-<word2>" fallback for a
+                    # name typed with a space instead of a hyphen.
+                    alt = parsed.args[1] if len(parsed.args) > 1 else None
+                    await self._cmd_join_mix(ctx, mix_id, alt)
 
                 case "commit_utxos":
                     utxos = parsed.args[0] if parsed.args else []
@@ -192,8 +194,11 @@ class Coordinator:
         msg = self.parser.format_list_response(available)
         await self.nostr.send_dm(ctx.sender_hex, msg)
 
-    async def _cmd_join_mix(self, ctx: SenderContext, mix_id: Optional[str]):
-        """Handle /join <mix_id> [num_outputs]."""
+    async def _cmd_join_mix(self, ctx: SenderContext, mix_id: Optional[str],
+                            alt_mix_id: Optional[str] = None):
+        """Handle /join <mix_name>. ``alt_mix_id`` is the "<word1>-<word2>"
+        fallback used when the name was typed with a space instead of a hyphen
+        ("/join silver cupcake")."""
         npub_hex = ctx.sender_hex
 
         if not mix_id:
@@ -228,10 +233,17 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, self.parser.format_max_mixes(self.cfg.MAX_PENDING_MIXES))
             return
 
-        # Verify the mix exists and is in collecting state
+        # Verify the mix exists and is in collecting state. If the first token
+        # didn't match, fall back to the hyphen-joined two-word form (handles
+        # "/join silver cupcake").
         mix = await self.db.get_mix(mix_id)
+        if not mix and alt_mix_id:
+            alt = await self.db.get_mix(alt_mix_id)
+            if alt:
+                mix, mix_id = alt, alt_mix_id
         if not mix:
-            await self.nostr.send_dm(npub_hex, f"No mix named '{mix_id}' found.")
+            await self.nostr.send_dm(
+                npub_hex, f"No mix named '{alt_mix_id or mix_id}' found.")
             return
 
         if mix["state"] not in ("announced", "collecting"):

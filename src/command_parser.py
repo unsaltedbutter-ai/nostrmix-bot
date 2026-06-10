@@ -63,15 +63,14 @@ class CommandParser:
         if cmd == "join":
             if len(args) >= 1:
                 mix_id = args[0].strip().lower()
-                # optionally " <num_outputs>" — infer from addresses sent later
-                # Actually in the plan the command is "/join <mix_id> <num_outputs>"
-                num_outputs = None
+                # Names are "<word>-<word>". Tolerate a user who typed a space
+                # instead of the hyphen ("/join silver cupcake"): also offer the
+                # joined "<word1>-<word2>" as a fallback the coordinator tries if
+                # the first token doesn't match an open mix.
+                alt = None
                 if len(args) >= 2:
-                    try:
-                        num_outputs = int(args[1])
-                    except ValueError:
-                        pass
-                return ParsedCommand("join_mix", [mix_id, num_outputs], raw)
+                    alt = f"{args[0].strip()}-{args[1].strip()}".lower()
+                return ParsedCommand("join_mix", [mix_id, alt], raw)
             return ParsedCommand("join_mix", [], raw)
 
         # -- COMMIT UTXOS --

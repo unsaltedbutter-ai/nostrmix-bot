@@ -116,11 +116,14 @@ It replies with each open mix: its name, output size, how many mixers it's
 waiting for, and how many same-size (conforming) UTXOs it'll take for free, e.g.:
 
 ```
-mix 2a253160a93f: 0.0100 BTC outputs (collecting). Needs 2 mixer(s). Up to 10
+mix silver-cupcake: 0.0100 BTC outputs (collecting). Needs 2 mixer(s). Up to 10
 same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
 ```
 
-The operator may also announce open mixes publicly on Nostr.
+Each mix has a short, memorable **two-word name** like `silver-cupcake` or
+`blue-grape` (a color and an everyday object) — easy to remember while you go
+gather your inputs, and easy to type back. The operator may also announce open
+mixes publicly on Nostr.
 
 ---
 
@@ -129,10 +132,12 @@ The operator may also announce open mixes publicly on Nostr.
 **Join an existing mix** by name:
 
 ```
-/join 2a253160a93f
+/join silver-cupcake
 ```
 
-The bot registers your interest and asks for your UTXOs and addresses.
+The bot registers your interest and asks for your UTXOs and addresses. If you
+type the two words with a space instead of the hyphen — `/join silver cupcake` —
+the bot understands that too.
 
 **Start a new mix:** there's no separate "create" command and you can't pick the
 size — mixes use the operator's defaults (typically **0.01 BTC** outputs,
@@ -163,16 +168,24 @@ above the dust floor) and tells you which it accepted or rejected.
 /addresses bc1qaaa… bc1qbbb… bc1qccc…
 ```
 
-How many to send:
-- **One per conforming UTXO** (each maps 1→1), **plus**
-- For a non-conforming contribution: **one per mixed output you can fund, plus one
-  for change**.
+> **Send one address for every output you'll get, PLUS one extra for change.**
+> This is the single most important thing to get right. The number of addresses
+> you provide is the hard cap on how many outputs you receive, so too few means
+> you mix fewer coins than you could.
+
+How many is that, concretely:
+- **One per conforming UTXO** (each passes through 1→1), **plus**
+- For a non-conforming contribution: **one per equal output it can fund, plus one
+  more for change.** Example: a 2,500,000-sat input in a 0.01 BTC (1,000,000-sat)
+  mix funds **two** equal outputs and leaves ~500,000 change → send **three**
+  addresses (two mixed + one change).
 
 If you send too few, the bot won't burn your coins — it turns your last address
 into an (oversized) change output and **warns you** that adding an address would
-mix more and shrink that change. A change address is technically optional, but
-without one a small leftover may be donated or folded into the fee — so include
-one.
+mix more and shrink that change. So heed that warning and re-send `/addresses`
+with one more. (With only a *single* address and an above-dust leftover, that
+excess is donated or folded into the miner fee — another reason to always include
+a change address.)
 
 **Pay the service fee, if any.** It's **off by default** (you'll see "No service
 fee — you're all set"). If the operator enabled one, the bot tells you how many
@@ -210,11 +223,12 @@ afterward. Check three things:
 3. **Fee** — the miner fee is reasonable for the size (the real risk is value
    quietly siphoned into an absurd fee).
 
-**Option A — Sparrow / Electrum (no install).** Load the PSBT (Sparrow: *File →
-Open Transaction*; Electrum: *Tools → Load PSBT*). The wallet decodes each output
-back into an **address** and shows the **fee**. Confirm your receive addresses
-appear with the right amounts and the fee is sane. "It loaded without error" is
-**not** enough — read the outputs and the fee.
+**Option A — Sparrow / Electrum (no install).** Load the PSBT — in **Sparrow**:
+*File → Open Transaction → From Text*; in **Electrum**: *Tools → Load Transaction
+→ From Text*. The wallet decodes each output back into an **address** and shows
+the **fee**. Confirm your receive addresses appear with the right amounts and the
+fee is sane. "It loaded without error" is **not** enough — read the outputs and
+the fee.
 
 **Option B — `psbt_decode.py` (if you have this repo).** Fully local, no node:
 
@@ -235,10 +249,12 @@ unspendable output — **don't sign.** Use `/cancel` and ask the operator.
 
 ## 10. Sign the PSBT
 
-In **Sparrow**: open the PSBT, review the inputs/outputs/fee one more time, click
-**Sign**, then **Save/Export** the *signed* PSBT (as text/hex).
+In **Sparrow**: with the transaction open (*File → Open Transaction → From Text*),
+review the inputs/outputs/fee one more time, click **Sign**, then **Export/Save**
+the *signed* PSBT as text/hex.
 
-In **Electrum**: *Tools → Load PSBT* → **Sign** → **Export/Copy** the signed PSBT.
+In **Electrum**: *Tools → Load Transaction → From Text* → **Sign** → **Export/Copy**
+the signed PSBT.
 
 You sign **only your own inputs** — which is all you *can* sign anyway, since you
 only hold those keys.
@@ -253,12 +269,17 @@ DM the bot the signed hex:
 /psbt_accept 70736274ff…<your signed PSBT>…
 ```
 
-If it's too large for one DM, send it in chunks:
+Only if it's very large — **over ~50,000 hex characters (~25 KB)**, the bot's
+chunking threshold — send it in numbered pieces instead (split the hex into
+in-order chunks):
 
 ```
 /psbt_chunk 1/2 70736274ff…
 /psbt_chunk 2/2 …rest…
 ```
+
+In practice a 2-5 participant mix produces a PSBT far smaller than that, so a
+single `/psbt_accept` almost always fits — only large mixes need chunking.
 
 The bot cryptographically verifies your signature against the exact skeleton it
 sent. When **everyone** has returned a valid signature, it combines them,
@@ -315,8 +336,10 @@ left of the traceable change is negligible.
 
 ```
 /list                                  → see open mixes
-/commit <txid:vout> …                  → declare your coins (auto-starts a mix if none open)
-/addresses bc1q… bc1q… bc1q…           → one per mixed output + one for change
+/join silver-cupcake                   → join the mix you picked
+                                         (or skip /join and just /commit to auto-start a new mix)
+/commit <txid:vout> …                  → register the coins you'll contribute
+/addresses bc1q… bc1q… bc1q…           → one per mixed output + one extra for change
    (pay the zap only if a fee is charged — off by default)
 …bot DMs your fee share + the PSBT…
    → VERIFY it (psbt_decode.py / Sparrow): inputs, outputs (your addrs), fee

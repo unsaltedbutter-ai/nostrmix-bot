@@ -26,12 +26,20 @@ class TestCommandParser:
         assert parsed.command == "join_mix"
         assert parsed.args[0] == "east-gate"
 
-    def test_join_with_num_outputs(self):
-        """Test /join with num_outputs."""
-        parsed = self.parser.parse("/join east-gate 4")
+    def test_join_two_words_offers_hyphen_fallback(self):
+        """/join typed with a space instead of the hyphen → the parser keeps the
+        first token AND offers the joined "<word1>-<word2>" as a fallback."""
+        parsed = self.parser.parse("/join silver cupcake")
         assert parsed.command == "join_mix"
-        assert parsed.args[0] == "east-gate"
-        assert parsed.args[1] == 4
+        assert parsed.args[0] == "silver"
+        assert parsed.args[1] == "silver-cupcake"
+
+    def test_join_hyphenated_has_no_fallback(self):
+        """A correctly hyphenated name is a single token; no fallback needed."""
+        parsed = self.parser.parse("/join silver-cupcake")
+        assert parsed.command == "join_mix"
+        assert parsed.args[0] == "silver-cupcake"
+        assert parsed.args[1] is None
 
     def test_commit_utxos(self):
         """Test /commit with UTXOs."""

@@ -1122,6 +1122,26 @@ class TestAutoMixOnCommit:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_join_tolerates_space_instead_of_hyphen(self):
+        """`/join silver cupcake` (space, not hyphen) still finds silver-cupcake:
+        the first token doesn't match, so the coordinator tries the joined form."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)  # e.g. silver-cupcake
+            await db.update_mix(mix_id, state="collecting")
+
+            primary = mix_id.split("-")[0]  # first word alone — won't match a mix
+            # alt is the hyphen-joined form the parser would build from two words.
+            await coord._cmd_join_mix(FakeCtx("spacer"), primary, mix_id)
+
+            parts = await db.get_participants_by_mix(mix_id)
+            assert any(p["npub_hex"] == "spacer" for p in parts), (
+                "two-word /join should have registered interest in the real mix"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_skips_locked_incompatible_mix_creates_new(self):
         coord, db, nostr, chain, lightning = await make_coord()
         try:
