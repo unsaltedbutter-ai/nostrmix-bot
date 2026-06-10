@@ -6,11 +6,14 @@ phone keyboard. So the words are chosen to be **short and very common**:
 
 - adjectives are simple everyday descriptors: the basic colors (red, blue,
   green…) plus plain words like big, little, soft, hard, wet, dry, open, smooth,
-- nouns are everyday **objects** — fruit, cutlery, household things, gadgets
-  (apple, spoon, lamp, phone…), favouring 3-5 letters or longer-but-common words.
+- nouns are everyday **things** — objects, food, animals, people — every one
+  chosen to be **3 or 4 letters** and very common (bag, dog, lamp, mug…).
 
 The only rules are common, short, and inoffensive (not constrained to BIP-39 —
-that pulled in rare words like "gosling").
+that pulled in rare words like "gosling"). The noun list is kept to 3-4 letter
+words on purpose: there are easily enough common ones to make the name space
+large (79 adjectives × ~250 nouns ≈ 19k pairs), so collisions among the ≤10
+live mixes stay well under 1% without ever reaching for a longer word.
 
 Two ways to get a name:
 
@@ -44,39 +47,36 @@ _ADJECTIVES = [
     "yellow",
 ]
 
-# Everyday objects — fruit/veg, cutlery, household items, gadgets, clothes, treats.
-# Short and common; longer words are kept only when very familiar.
+# Everyday nouns — objects, food, animals, people. Every word is 3-4 letters and
+# very common, so a name is quick to read and retype from memory on a phone.
+# (No 5+ letter words: there are more than enough short common nouns to keep the
+# space large, so we never need a "webcam" where "web" does the same job.)
 _NOUNS = [
-    "atom", "apple", "bag", "bagel", "ball", "balloon", "banana", "bat",
-    "battery", "bean", "bed", "beet", "bell", "belt", "bench", "berry", "bike",
-    "bit", "blanket", "blender", "book", "boot", "bottle", "bowl", "box",
-    "bread", "brick", "broom", "brush", "bucket", "butter", "button", "cab",
-    "cabinet", "cable", "cake", "camera", "candle", "candy", "cap", "carpet",
-    "carrot", "cashew", "celery", "cereal", "chair", "charger", "cheese",
-    "cherry", "chip", "clip", "clock", "coat", "cork", "coin", "collar",
-    "comb", "console", "cookie", "cord", "cork", "corn", "couch", "cracker",
-    "crayon", "cup", "cupcake", "curtain", "desk", "dice", "dish", "disk",
-    "domino", "donut", "door", "drawer", "dress", "drill", "drive", "drum",
-    "egg", "fan", "faucet", "fence", "fig", "flag", "fork", "frame", "fridge",
-    "garlic", "gate", "ginger", "glove", "glue", "grape", "grater", "hammer",
-    "hanger", "hat", "headset", "honey", "hoodie", "hook", "hose", "jacket",
-    "jam", "jar", "jeans", "jelly", "kale", "kettle", "key", "keyboard", "kite",
-    "knife", "ladder", "ladle", "lamp", "lantern", "laptop", "leek", "lemon",
-    "mango", "marble", "mat", "match", "melon", "mirror", "mitten", "mixer",
-    "modem", "monitor", "mop", "mouse", "muffin", "mug", "nail", "napkin",
-    "noodle", "onion", "oven", "pan", "pancake", "pants", "pea", "peach",
-    "peanut", "pear", "pen", "pepper", "phone", "pillow", "pipe", "pitcher",
-    "pizza", "plate", "plug", "plum", "pocket", "popcorn", "pot", "potato",
-    "pretzel", "printer", "pudding", "pumpkin", "puzzle", "radio", "radish",
-    "raisin", "remote", "rice", "ring", "robe", "robot", "router", "rug",
-    "ruler", "sandal", "satoshi", "saucer", "saw", "scarf", "scooter", "screen",
-    "sensor", "shelf", "shirt", "shoe", "shorts", "sink", "skirt", "slipper",
-    "soap", "sock", "socket", "sofa", "soup", "spatula", "speaker", "sponge",
-    "spoon", "squash", "stamp", "stool", "stove", "straw", "sugar", "sweater",
-    "switch", "syrup", "table", "tablet", "tape", "teapot", "thermos", "tie",
-    "tile", "toast", "toaster", "tomato", "tongs", "top", "torch", "towel",
-    "tray", "tub", "turnip", "vacuum", "vase", "vest", "wagon", "walnut",
-    "watch", "webcam", "whisk", "window", "wrench", "zipper",
+    "ant", "ape", "bag", "ball", "bar", "bat", "bean", "bed", "bee", "bell",
+    "belt", "bike", "bird", "bit", "boat", "bone", "book", "boot", "bot",
+    "bowl", "box", "bug", "bulb", "bun", "bus", "cab", "cake", "can", "cane",
+    "cap", "car", "card", "cart", "case", "cat", "cell", "chip", "clip", "coat",
+    "coin", "comb", "cone", "cord", "corn", "cot", "cow", "crab", "cub", "cube",
+    "cup", "dad", "dart", "desk", "dice", "dish", "disk", "dock", "dog", "doll",
+    "door", "drum", "duck", "ear", "egg", "elf", "eye", "fan", "fig", "fish",
+    "flag", "fork", "fox", "frog", "gal", "gate", "gear", "gem", "gift", "glue",
+    "goat", "gold", "gum", "guy", "ham", "hand", "hat", "hen", "hill", "hook",
+    "horn", "hose", "hut", "ice", "ink", "iron", "jam", "jar", "jet", "jug",
+    "kale", "key", "kid", "kite", "knee", "knob", "lab", "lake", "lamb", "lamp",
+    "leaf", "leek", "leg", "lens", "lid", "lime", "line", "lion", "lip", "lock",
+    "log", "mail", "map", "mask", "mat", "meat", "milk", "mint", "mom", "moon",
+    "mop", "moth", "mug", "mule", "nail", "neck", "nest", "net", "note", "nut",
+    "oak", "oar", "oil", "owl", "pad", "palm", "pan", "paw", "pea", "pear",
+    "pen", "pet", "pie", "pig", "pill", "pin", "pine", "pipe", "plum", "pole",
+    "pond", "pony", "pool", "pot", "pub", "pump", "pup", "raft", "rag", "rail",
+    "rake", "ram", "ramp", "rat", "rice", "ring", "road", "robe", "rock", "rod",
+    "rope", "rose", "rug", "sack", "sail", "salt", "sand", "saw", "sea", "seal",
+    "seat", "shed", "ship", "shoe", "sign", "silk", "sink", "soap", "sock",
+    "sofa", "son", "soup", "spy", "star", "step", "suit", "sun", "swan", "tag",
+    "tank", "tap", "tape", "tea", "tent", "tie", "tile", "tin", "toad", "toe",
+    "tool", "top", "toy", "tray", "tree", "tub", "tube", "tuna", "van", "vase",
+    "vest", "vine", "wall", "wand", "wasp", "wave", "web", "well", "wig", "wine",
+    "wing", "wire", "wolf", "wood", "wool", "worm", "yak", "yarn", "yolk", "zip",
 ]
 
 
