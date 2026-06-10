@@ -30,33 +30,48 @@ from typing import Optional
 
 # Everyday colors — short, common, visual, easy to spell (no turquoise/chartreuse).
 _ADJECTIVES = [
-    "amber", "aqua", "beige", "black", "blue", "bronze", "brown", "coral",
-    "copper", "cream", "crimson", "cyan", "gold", "gray", "green", "indigo",
-    "ivory", "jade", "lime", "maroon", "mint", "navy", "olive", "orange",
-    "pink", "purple", "red", "rose", "ruby", "rust", "scarlet", "silver",
-    "sky", "tan", "teal", "violet", "white", "yellow",
+    "amber", "aqua", "beige", "black", "blue", "blush", "bronze", "brown",
+    "charcoal", "clay", "cocoa", "copper", "coral", "cream", "crimson", "cyan",
+    "denim", "emerald", "gold", "gray", "green", "indigo", "ivory", "jade",
+    "jet", "khaki", "lavender", "lilac", "lime", "maroon", "mint", "mustard",
+    "navy", "olive", "orange", "pearl", "pink", "purple", "red", "rose", "ruby",
+    "rust", "sage", "salmon", "sand", "sapphire", "scarlet", "silver", "sky",
+    "slate", "snow", "steel", "tan", "teal", "violet", "white", "wine", "yellow",
 ]
 
-# Everyday objects — fruit, cutlery, household items, gadgets, clothes, treats.
-# Short and common; a few 6-8 letter words are kept only when very familiar.
+# Everyday objects — fruit/veg, cutlery, household items, gadgets, clothes, treats.
+# Short and common; longer words are kept only when very familiar.
 _NOUNS = [
-    "apple", "bagel", "ball", "banana", "basket", "battery", "bean", "bed",
-    "bell", "belt", "bench", "berry", "blanket", "book", "boot", "bottle",
-    "bowl", "box", "bread", "broom", "brush", "bucket", "button", "cabbage",
-    "cable", "cake", "camera", "candle", "candy", "cap", "carrot", "chair",
-    "charger", "cherry", "chip", "clip", "clock", "coat", "coconut", "coin",
-    "comb", "cookie", "cord", "cork", "corn", "couch", "crayon", "cup",
-    "cupcake", "desk", "dish", "donut", "door", "drum", "egg", "fan", "fig",
-    "flag", "fork", "garlic", "glove", "grape", "hat", "honey", "jar", "key",
-    "keyboard", "kettle", "kite", "knife", "lamp", "laptop", "lemon", "mango",
-    "mat", "melon", "mirror", "mitten", "monitor", "mouse", "muffin", "mug",
-    "onion", "pan", "pancake", "peach", "pear", "pen", "pepper", "phone",
-    "pillow", "pizza", "plate", "plug", "plum", "pot", "potato", "printer",
-    "pumpkin", "radio", "remote", "rice", "ring", "robe", "router", "rug",
-    "ruler", "satoshi", "scarf", "screen", "shelf", "shirt", "shoe", "sink",
-    "soap", "sock", "sofa", "soup", "speaker", "spoon", "sponge", "stamp",
-    "stool", "straw", "sugar", "table", "taco", "tablet", "tie", "toast",
-    "tomato", "towel", "tray", "tub", "vase", "vest", "watch", "window",
+    "adapter", "apple", "apron", "bagel", "ball", "balloon", "banana", "basket",
+    "battery", "bean", "bed", "beet", "bell", "belt", "bench", "berry", "bike",
+    "biscuit", "blanket", "blender", "book", "boot", "bottle", "bowl", "box",
+    "bread", "brick", "broom", "brush", "bucket", "butter", "button", "cabbage",
+    "cabinet", "cable", "cake", "camera", "candle", "candy", "cap", "carpet",
+    "carrot", "cashew", "celery", "cereal", "chair", "charger", "cheese",
+    "cherry", "chip", "clip", "clock", "coat", "coconut", "coin", "collar",
+    "comb", "console", "cookie", "cord", "cork", "corn", "couch", "cracker",
+    "crayon", "cup", "cupcake", "curtain", "desk", "dice", "dish", "disk",
+    "domino", "donut", "door", "drawer", "dress", "drill", "drive", "drum",
+    "egg", "fan", "faucet", "fence", "fig", "flag", "fork", "frame", "fridge",
+    "garlic", "gate", "ginger", "glove", "glue", "grape", "grater", "hammer",
+    "hanger", "hat", "headset", "honey", "hoodie", "hook", "hose", "jacket",
+    "jam", "jar", "jeans", "jelly", "kale", "kettle", "key", "keyboard", "kite",
+    "knife", "ladder", "ladle", "lamp", "lantern", "laptop", "leek", "lemon",
+    "mango", "marble", "mat", "match", "melon", "mirror", "mitten", "mixer",
+    "modem", "monitor", "mop", "mouse", "muffin", "mug", "nail", "napkin",
+    "noodle", "onion", "oven", "pan", "pancake", "pants", "pea", "peach",
+    "peanut", "pear", "pen", "pepper", "phone", "pillow", "pipe", "pitcher",
+    "pizza", "plate", "plug", "plum", "pocket", "popcorn", "pot", "potato",
+    "pretzel", "printer", "pudding", "pumpkin", "puzzle", "radio", "radish",
+    "raisin", "remote", "rice", "ring", "robe", "robot", "router", "rug",
+    "ruler", "sandal", "satoshi", "saucer", "saw", "scarf", "scooter", "screen",
+    "sensor", "shelf", "shirt", "shoe", "shorts", "sink", "skirt", "slipper",
+    "soap", "sock", "socket", "sofa", "soup", "spatula", "speaker", "sponge",
+    "spoon", "squash", "stamp", "stool", "stove", "straw", "sugar", "sweater",
+    "switch", "syrup", "table", "tablet", "tape", "teapot", "thermos", "tie",
+    "tile", "toast", "toaster", "tomato", "tongs", "top", "torch", "towel",
+    "tray", "tub", "turnip", "vacuum", "vase", "vest", "wagon", "walnut",
+    "watch", "webcam", "whisk", "window", "wrench", "zipper",
 ]
 
 

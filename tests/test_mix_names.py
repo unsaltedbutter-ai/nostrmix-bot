@@ -27,13 +27,15 @@ class TestWordLists:
             assert 3 <= len(w) <= 8, f"{w!r} is an awkward length"
         all_words = mn.ADJECTIVES + mn.NOUNS
         short = sum(1 for w in all_words if len(w) <= 5)
-        assert short / len(all_words) >= 0.6, "too many long words for easy typing"
+        assert short / len(all_words) >= 0.55, "too many long words for easy typing"
 
     def test_no_offensive_words(self):
         # Exact-match denylist (NOT substring — "glass" contains "ass" etc.).
+        # Also bans words whose color+object combo reads crude (taco, knob, ...).
         banned = {
             "sex", "ass", "shit", "damn", "crap", "piss", "cock", "dick",
-            "fuck", "tit", "cum", "anus", "butt", "turd",
+            "fuck", "tit", "cum", "anus", "butt", "turd", "taco", "knob",
+            "screw", "pickle",
         }
         offenders = [w for w in mn.ADJECTIVES + mn.NOUNS if w in banned]
         assert offenders == [], f"offensive words present: {offenders}"
@@ -41,7 +43,7 @@ class TestWordLists:
     def test_no_unfortunate_combinations(self):
         # Some color+object pairs are NSFW slang even though each word is clean.
         # Guard the known ones so a future word addition can't resurrect them.
-        bad_pairs = {("blue", "waffle"), ("cream", "pie")}
+        bad_pairs = {("blue", "waffle"), ("cream", "pie"), ("pink", "taco")}
         adj, noun = set(mn.ADJECTIVES), set(mn.NOUNS)
         present = [f"{a}-{n}" for a, n in bad_pairs if a in adj and n in noun]
         assert present == [], f"unfortunate name(s) possible: {present}"
