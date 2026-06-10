@@ -2645,8 +2645,14 @@ class Coordinator:
         """Run the coordinator until interrupted."""
         # Start before running
         await self.start()
-        # The nostr handler's run_forever blocks
-        await self.nostr.run_forever()
+        # The nostr handler's run_forever blocks until a shutdown signal. It
+        # does NOT re-start the bot (start() already did). When it returns,
+        # tear everything down cleanly — cancel the event-loop / announcement
+        # tasks, stop the bot, close the chain client and DB.
+        try:
+            await self.nostr.run_forever()
+        finally:
+            await self.stop()
 
     async def stop(self):
         """Graceful shutdown."""

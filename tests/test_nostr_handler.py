@@ -6,6 +6,7 @@ config translation, identity wrapping, and delegation. The point isn't to
 test the SDK — it's to catch the wrapper's own integration bugs (the
 audit's S10: ``.identity`` being SDK-dependent with no fallback)."""
 
+import asyncio
 import os
 import sys
 import pytest
@@ -179,23 +180,22 @@ class TestDelegations:
 
 
 class TestGetIdentity:
-    """get_identity is the audit's S10 hotspot — it calls .identity.fetch
-    on the SDK's NostrBot. If the SDK doesn't expose .identity, this raises
-    AttributeError. These tests confirm the happy path AND that the
-    wrapper does not silently mask an SDK breakage (it should raise so
-    the coordinator's outer try/except surfaces the issue)."""
+    """get_identity reads lud16 off the SDK via .identity.resolve(). The
+    method name matters: the SDK exposes resolve() (NOT fetch()), and
+    resolve() ALWAYS returns an Identity — never None — with unset fields as
+    None. These tests pin that contract; TestSdkInterfacePinning below pins
+    the method name against the real SDK so a future rename fails loudly."""
 
     @pytest.mark.asyncio
     async def test_returns_dict_with_name_lud16_picture(self):
         h = NostrHandler(_cfg())
         h._bot = MagicMock()
-        identity_obj = MagicMock(name="alice", lud16="alice@x", picture="https://x/p.png")
-        # MagicMock's `name=` is special — fix by setting attribute directly.
+        identity_obj = MagicMock()
         identity_obj.name = "alice"
         identity_obj.lud16 = "alice@x"
         identity_obj.picture = "https://x/p.png"
         resolver = MagicMock()
-        resolver.fetch = AsyncMock(return_value=identity_obj)
+        resolver.resolve = AsyncMock(return_value=identity_obj)
         h._bot.identity = resolver
 
         result = await h.get_identity("npub_hex_abc")
@@ -204,22 +204,93 @@ class TestGetIdentity:
             "lud16": "alice@x",
             "picture": "https://x/p.png",
         }
-        resolver.fetch.assert_awaited_once_with("npub_hex_abc")
+        resolver.resolve.assert_awaited_once_with("npub_hex_abc")
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_identity_not_found(self):
+    async def test_empty_profile_returns_dict_with_blank_lud16(self):
+        """resolve() returns an Identity with only pubkey_hex set for an
+        unknown/empty profile (never None). get_identity must surface that as
+        a dict with blank fields — NOT crash, and NOT a None lud16 that would
+        flow into the DB. '' means 'no refund address on file'."""
         h = NostrHandler(_cfg())
         h._bot = MagicMock()
+        identity_obj = MagicMock()
+        identity_obj.name = None
+        identity_obj.lud16 = None
+        identity_obj.picture = None
         resolver = MagicMock()
-        resolver.fetch = AsyncMock(return_value=None)
+        resolver.resolve = AsyncMock(return_value=identity_obj)
         h._bot.identity = resolver
-        assert await h.get_identity("missing_npub") is None
+        result = await h.get_identity("unknown_npub")
+        assert result == {"name": "", "lud16": "", "picture": ""}
 
     @pytest.mark.asyncio
     async def test_returns_none_when_bot_not_started(self):
         h = NostrHandler(_cfg())
         h._bot = None
         assert await h.get_identity("anyone") is None
+
+
+class TestSdkInterfacePinning:
+    """Pin the NostrBot/IdentityResolver API we depend on against the REAL
+    installed SDK (no network). The prior bug — calling .identity.fetch() and
+    re-calling bot.run() after bot.start() — passed every mocked test while
+    breaking the live bot. These assertions fail loudly if the SDK renames or
+    removes the surface NostrHandler relies on."""
+
+    def test_identity_resolver_exposes_resolve_not_fetch(self):
+        from nostrbot_sdk.identity import IdentityResolver, Identity
+        assert hasattr(IdentityResolver, "resolve"), "SDK dropped resolve()"
+        assert not hasattr(IdentityResolver, "fetch"), (
+            "SDK now has fetch(); get_identity may need updating"
+        )
+        for field in ("name", "lud16", "picture"):
+            assert field in Identity.__dataclass_fields__
+
+    def test_bot_run_restarts_so_run_forever_must_not_call_it(self):
+        """run() begins with start(), and start() raises if already started.
+        This is WHY NostrHandler.run_forever must not call bot.run() after
+        start(). If the SDK ever stops re-starting in run(), this test flags
+        that the workaround can be simplified."""
+        import inspect
+        from nostrbot_sdk.bot import NostrBot
+        run_src = inspect.getsource(NostrBot.run)
+        start_src = inspect.getsource(NostrBot.start)
+        assert "self.start()" in run_src, "run() no longer calls start()"
+        assert "already started" in start_src, "start() no longer guards re-entry"
+        assert hasattr(NostrBot, "stop")
+
+
+class TestRunForeverDoesNotRestart:
+    """Regression for the boot crash: start() already started the bot, so
+    run_forever() must just wait for a shutdown signal — never call bot.run()
+    or bot.start() again (which would raise 'NostrBot already started')."""
+
+    @pytest.mark.asyncio
+    async def test_run_forever_waits_without_restarting_bot(self):
+        h = NostrHandler(_cfg())
+        h._bot = MagicMock()
+        h._bot.run = AsyncMock()
+        h._bot.start = AsyncMock()
+
+        task = asyncio.create_task(h.run_forever())
+        # Let run_forever create its shutdown event and start waiting.
+        await asyncio.sleep(0)
+        assert h._shutdown_event is not None, "run_forever did not arm a waiter"
+        assert not task.done(), "run_forever returned without waiting for shutdown"
+
+        # Trip the shutdown the way a SIGINT handler would.
+        h._shutdown_event.set()
+        await asyncio.wait_for(task, timeout=1)
+
+        h._bot.run.assert_not_called()
+        h._bot.start.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_forever_no_op_when_bot_absent(self):
+        h = NostrHandler(_cfg())
+        h._bot = None
+        await asyncio.wait_for(h.run_forever(), timeout=1)  # returns immediately
 
 
 class TestKeysAndPubkeyProperties:

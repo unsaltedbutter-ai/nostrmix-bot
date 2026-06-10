@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import signal
 from typing import Optional, Callable, Awaitable, List, Dict, Any
 from collections.abc import AsyncIterator
 
@@ -36,6 +38,7 @@ class NostrHandler:
         self._zap_callback: Optional[OnZapCallback] = None
         self._heartbeat_callback: Optional[Callable] = None
         self._on_ready: Optional[Callable] = None  # called when bot is ready
+        self._shutdown_event: Optional[asyncio.Event] = None  # set by run_forever on signal
 
     def set_dm_handler(self, cb: OnDmCallback):
         self._dm_callback = cb
@@ -114,9 +117,39 @@ class NostrHandler:
             await self._bot.stop()
 
     async def run_forever(self):
-        """Block until SIGINT/SIGTERM (calls run() on the bot)."""
-        if self._bot:
-            await self._bot.run()
+        """Block until a SIGINT/SIGTERM shutdown signal, then return.
+
+        The bot is ALREADY live once start() has run — start() connects,
+        subscribes, and spawns the SDK's notification/maintenance/heartbeat
+        tasks. We must NOT call bot.run() here: run() begins with another
+        bot.start(), which raises RuntimeError("NostrBot already started")
+        and crashes the process at boot. Instead we install our own signal
+        handlers and wait, mirroring the SDK's run() loop minus the re-start.
+        Shutdown/cleanup (bot.stop) is the coordinator's responsibility via
+        its own stop().
+        """
+        if not self._bot:
+            return
+        self._shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        installed: List[int] = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._shutdown_event.set)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError):
+                # Windows or a non-main thread: handler unavailable. The
+                # coordinator's stop() (e.g. from KeyboardInterrupt) is then
+                # the only shutdown path.
+                pass
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            for sig in installed:
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
 
     async def send_dm(self, recipient_hex: str, message: str):
         """Send a NIP-17 DM to a participant."""
@@ -141,15 +174,23 @@ class NostrHandler:
         return None
 
     async def get_identity(self, pubkey_hex: str) -> Optional[Dict]:
-        """Fetch kind 0 identity for a pubkey (used for lud16 discovery)."""
+        """Fetch kind 0 identity for a pubkey (used for lud16 discovery).
+
+        Returns a dict with name/lud16/picture, or None only when the bot
+        isn't started. The SDK's IdentityResolver.resolve() ALWAYS returns an
+        Identity (never None) — an unknown/empty profile comes back with only
+        pubkey_hex set and the rest None — so a missing lud16 surfaces here as
+        "" (no refund address on file), not as a None dict. (The method is
+        resolve(), not fetch() — fetch() does not exist on the SDK and calling
+        it raised AttributeError on every /join.)
+        """
         if self._bot:
-            # Use the public .identity property on NostrBot
             resolver = self._bot.identity
-            identity = await resolver.fetch(pubkey_hex)
+            identity = await resolver.resolve(pubkey_hex)
             if identity:
                 return {
-                    "name": identity.name,
-                    "lud16": identity.lud16,
-                    "picture": identity.picture,
+                    "name": identity.name or "",
+                    "lud16": identity.lud16 or "",
+                    "picture": identity.picture or "",
                 }
         return None
