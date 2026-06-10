@@ -147,11 +147,12 @@ and the bot spins up a fresh default mix and puts you in it automatically.
 
 ## 8. Declare your inputs and outputs
 
-**Commit your UTXO(s)** — `txid:vout`, space-separated. You can send `/commit`
-more than once to add more:
+**Commit your UTXO(s)** — `txid:vout`, separated by spaces **or** commas. You can
+send `/commit` more than once to add more:
 
 ```
 /commit 4a5f…e1:0 9c2b…7d:1
+/commit 4a5f…e1:0, 9c2b…7d:1
 ```
 
 The bot looks each one up on-chain (must be unspent, confirmed, `p2wpkh`, and

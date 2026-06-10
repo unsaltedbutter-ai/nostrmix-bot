@@ -53,6 +53,20 @@ class TestCommandParser:
         assert utxos[0]["vout"] == 0
         assert utxos[1]["vout"] == 1
 
+    def test_commit_accepts_commas_and_spaces(self):
+        """/commit takes txid:vout pairs separated by spaces, commas, or ", "."""
+        a = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        b = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        expected = [{"txid": a, "vout": 0}, {"txid": b, "vout": 1}]
+        for sep in (
+            f"{a}:0 {b}:1",      # spaces
+            f"{a}:0,{b}:1",      # commas, no spaces
+            f"{a}:0, {b}:1",     # comma + space (wallet copy-all)
+        ):
+            parsed = self.parser.parse(f"/commit {sep}")
+            assert parsed.command == "commit_utxos"
+            assert parsed.args[0] == expected, f"failed for: {sep!r}"
+
     def test_addresses(self):
         """Test /addresses command."""
         parsed = self.parser.parse("/addresses bc1qabc... bc1qdef...")

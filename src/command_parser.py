@@ -75,15 +75,12 @@ class CommandParser:
 
         # -- COMMIT UTXOS --
         if cmd == "commit":
-            # Parse UTXOs from the args
-            utxos = []
-            raw_text = raw[len(cmd) + 1:].strip() if cmd in raw else raw
-            # Remove /commit prefix
-            # Format: txid:vout txid:vout ...
-            for part in args:
-                m = UTXO_PATTERN.match(part)
-                if m:
-                    utxos.append({"txid": m.group(1), "vout": int(m.group(2))})
+            # Find every txid:vout pair regardless of separator — spaces, commas,
+            # or ", " (a wallet "copy all"). finditer ignores whatever sits
+            # between matches, so all forms parse the same. (The "/commit" word
+            # itself can't match a 64-hex:vout pattern.)
+            utxos = [{"txid": m.group(1), "vout": int(m.group(2))}
+                     for m in UTXO_PATTERN.finditer(raw)]
             return ParsedCommand("commit_utxos", [utxos], raw)
 
         # -- ADDRESSES --
