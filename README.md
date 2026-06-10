@@ -245,7 +245,12 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 
 Commands are matched case-insensitively; the `/` prefix is optional for `list`.
 
-- `/list` (or `open`, `mixes`) — list open mixes
+- `/list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
+  a default one (`DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`) and lists
+  it, so there's always something to join.
+- `/help` (or `commands`, `?`) — show the commands relevant to your current stage
+  (e.g. `/commit` while gathering, `/psbt_accept` while signing). Every command
+  still works regardless of what's listed; this only tunes the guidance.
 - `/join <mix_name>` — join a mix by name; or `/join <amount>` (e.g. `/join 0.01`)
   to join an open mix of that BTC output size, or create one if none exists
 - `/commit <txid:vout> ...` — register UTXOs (may be sent more than once)

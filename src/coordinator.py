@@ -105,6 +105,9 @@ class Coordinator:
                 case "list_mixes":
                     await self._cmd_list_mixes(ctx)
 
+                case "help":
+                    await self._cmd_help(ctx)
+
                 case "join_mix":
                     mix_id = parsed.args[0] if parsed.args else None
                     # parsed.args[1] is the "<word1>-<word2>" fallback for a
@@ -139,7 +142,13 @@ class Coordinator:
                     await self._cmd_exit_mix(ctx, npub_hex, mix_id)
 
                 case _:
-                    await self.nostr.send_dm(npub_hex, "Unknown command. Try: /list, /join <mix_id>, /commit, /addresses, /psbt_accept, /cancel")
+                    # Tune the suggested commands to where this user is (e.g.
+                    # don't suggest /psbt_accept while they're still gathering).
+                    cmds = await self._relevant_commands(npub_hex)
+                    await self.nostr.send_dm(
+                        npub_hex,
+                        "Unknown command.\n" + self.parser.format_help(cmds),
+                    )
         except Exception as e:
             # exc_info would dump frame locals (UTXOs, addresses, PSBT hex)
             # into the log. Just record the participant token + command
@@ -158,8 +167,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     "Error processing your message. Check the command format "
-                    "(see /list, /join, /commit, /addresses, /psbt_accept, /cancel) "
-                    "and try again.",
+                    "and try again — send /help for the commands available to you.",
                 )
             except Exception:
                 pass
@@ -190,13 +198,81 @@ class Coordinator:
         except Exception:
             pass
 
+    async def _create_default_mix(self) -> str:
+        """Create a fresh mix with DEFAULT_* settings, set it collecting, and
+        return its id. input_type is left NULL — it locks at the first /commit.
+        Shared by /list, the /commit auto-create, and the daily announcement so
+        "open a default mix when none exist" lives in exactly one place."""
+        deadline_unix = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        mid = await self.db.create_mix(
+            output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
+            max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
+            fee_per_element=self.cfg.FEE_PER_ELEMENT,
+            deadline_unix=deadline_unix,
+            required_nonconforming=self.cfg.DEFAULT_REQUIRED_NONCONFORMING,
+            max_conforming_utxos=self.cfg.MAX_CONFORMING_UTXOS,
+        )
+        await self.db.update_mix(mid, state="collecting")
+        return mid
+
     async def _cmd_list_mixes(self, ctx: SenderContext):
-        """Handle /list — show open mixes."""
+        """Handle /list — show open mixes. If none are open, open a default one
+        so the user always has something to join right now rather than being
+        told to come back later."""
         active = await self.db.get_active_mixes()
-        # Filter to only collecting/announced
         available = [m for m in active if m["state"] in ("announced", "collecting")]
+        if not available:
+            mid = await self._create_default_mix()
+            logger.info("Auto-created mix %s on /list (no open mixes)",
+                        tokens.m(mid))
+            # Re-fetch so the new mix (and anything created concurrently) shows.
+            active = await self.db.get_active_mixes()
+            available = [m for m in active
+                         if m["state"] in ("announced", "collecting")]
         msg = self.parser.format_list_response(available)
         await self.nostr.send_dm(ctx.sender_hex, msg)
+
+    # Participant states that count as "actively in a mix" for help/stage
+    # purposes (terminal/exited states — cancelled/ghosted/refunded/etc. — and
+    # the post-broadcast states don't shape what the user should do next).
+    _ACTIVE_PARTICIPANT_STATES = ("interested", "committed", "paid",
+                                  "signing", "signed")
+
+    async def _relevant_commands(self, npub_hex: str) -> List[str]:
+        """Return the command keys worth *suggesting* to this user, tuned to
+        where they are across their active mixes. /list is always relevant;
+        the rest appear only when they're an actual next step. This shapes only
+        the help text — every command still works regardless of what's listed.
+
+        - Not in any mix → list, join
+        - Joined / committed (still assembling their entry) → commit, addresses
+        - Signing (PSBT sent) → psbt_accept
+        - join is offered again only when nothing is half-finished and the user
+          is under MAX_PENDING_MIXES; cancel whenever they're in a mix.
+        """
+        parts = await self.db.get_participants_by_npub(npub_hex)
+        stages = {p["state"] for p in parts
+                  if p["state"] in self._ACTIVE_PARTICIPANT_STATES}
+        cmds = ["list"]
+        if not stages:
+            cmds.append("join")
+            return cmds
+        assembling = bool({"interested", "committed"} & stages)
+        if assembling:
+            cmds += ["commit", "addresses"]
+        if "signing" in stages:
+            cmds.append("psbt_accept")
+        if not assembling:
+            active_count = await self.db.count_active_participant_mixes(npub_hex)
+            if active_count < self.cfg.MAX_PENDING_MIXES:
+                cmds.append("join")
+        cmds.append("cancel")
+        return cmds
+
+    async def _cmd_help(self, ctx: SenderContext):
+        """Handle /help — send the command list tuned to the user's stage."""
+        cmds = await self._relevant_commands(ctx.sender_hex)
+        await self.nostr.send_dm(ctx.sender_hex, self.parser.format_help(cmds))
 
     async def _cmd_join_mix(self, ctx: SenderContext, mix_id: Optional[str],
                             alt_mix_id: Optional[str] = None,
@@ -2572,18 +2648,8 @@ class Coordinator:
         available = [m for m in active if m["state"] in ("announced", "collecting")]
 
         if not available:
-            # No open mixes — create one using defaults
-            deadline_unix = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
-            mid = await self.db.create_mix(
-                output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
-                max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
-                fee_per_element=self.cfg.FEE_PER_ELEMENT,
-                deadline_unix=deadline_unix,
-                required_nonconforming=self.cfg.DEFAULT_REQUIRED_NONCONFORMING,
-                max_conforming_utxos=self.cfg.MAX_CONFORMING_UTXOS,
-            )
-            await self.db.update_mix(mid, state="collecting",
-                                     deadline_unix=deadline_unix)
+            # No open mixes — create one using defaults (shared helper).
+            mid = await self._create_default_mix()
             msg = self.parser.format_list_response([{"id": mid, "output_size": self.cfg.DEFAULT_OUTPUT_SIZE, "state": "collecting"}])
 
         else:

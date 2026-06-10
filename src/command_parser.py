@@ -66,6 +66,10 @@ class CommandParser:
         if cmd in ("list", "open", "mixes"):
             return ParsedCommand("list_mixes", [], raw)
 
+        # -- HELP / COMMANDS --
+        if cmd in ("help", "commands", "?"):
+            return ParsedCommand("help", [], raw)
+
         # -- JOIN --
         # Args are [mix_id, alt, amount_btc]. A name-join fills the first two
         # (amount None); an amount-join fills only the third (name slots None).
@@ -153,6 +157,31 @@ class CommandParser:
         return [p.strip() for p in parts if p.startswith("bc1") or
                 p.startswith("1") or p.startswith("3") or
                 p.startswith("2") or p.startswith("q")][1:]  # skip command
+
+    # One-line description per command, in the order we want them shown. The
+    # help output is *filtered* to the keys the coordinator decides are relevant
+    # to the user's current stage — every command still works regardless of
+    # whether it's listed (the list only shapes guidance, not behaviour).
+    _HELP_CATALOG = [
+        ("list", "/list — show open mixes you can join"),
+        ("join", "/join <mix>  (or /join 0.01 to pick a size) — join a mix"),
+        ("commit", "/commit <txid:vout> … — register the UTXOs you're mixing"),
+        ("addresses", "/addresses <addr> … — addresses to receive your outputs"),
+        ("psbt_accept", "/psbt_accept <hex> — return your signed PSBT"),
+        ("cancel", "/cancel — leave a mix"),
+    ]
+
+    def format_help(self, commands: List[str],
+                    header: str = "Commands available to you:") -> str:
+        """Render the help text for just the given command keys, in catalog
+        order. Unknown keys are ignored; `list` is always shown as a floor so a
+        user is never left without a way to see open mixes."""
+        keys = set(commands) | {"list"}
+        lines = [header]
+        for key, desc in self._HELP_CATALOG:
+            if key in keys:
+                lines.append(f"  {desc}")
+        return "\n".join(lines)
 
     def format_list_response(self, active_mixes: List[Dict]) -> str:
         """Format the /list response with active mixes."""

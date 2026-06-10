@@ -4790,6 +4790,91 @@ class TestBroadcastConflict:
             await db.close()
 
 
+class TestListAutoCreate:
+    """/list opens a default mix when none are open, instead of telling the
+    user to come back later."""
+
+    @pytest.mark.asyncio
+    async def test_list_creates_default_mix_when_none_open(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await coord._cmd_list_mixes(FakeCtx("npub_list_autocreate"))
+            available = [m for m in await db.get_active_mixes()
+                         if m["state"] in ("announced", "collecting")]
+            assert len(available) == 1  # a fresh default mix now exists
+            assert available[0]["output_size"] == coord.cfg.DEFAULT_OUTPUT_SIZE
+            msg = nostr.sent_dms[-1][1].lower()
+            assert "no open mixes" not in msg   # not the come-back-later line
+            assert "btc outputs" in msg          # the new mix is listed
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_list_does_not_create_a_second_mix(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await db.create_mix(output_size=1_000_000)  # already open (announced)
+            await coord._cmd_list_mixes(FakeCtx("npub_x"))
+            available = [m for m in await db.get_active_mixes()
+                         if m["state"] in ("announced", "collecting")]
+            assert len(available) == 1  # no duplicate created
+        finally:
+            await db.close()
+
+
+class TestStageAwareHelp:
+    """The /help command list is tuned to where the user is. Tuning only the
+    guidance — every command still works regardless of what's shown."""
+
+    @pytest.mark.asyncio
+    async def test_not_in_a_mix_shows_join_not_signing_commands(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            cmds = await coord._relevant_commands("npub_none")
+            assert "list" in cmds and "join" in cmds
+            assert "commit" not in cmds and "psbt_accept" not in cmds
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_assembling_shows_commit_addresses_not_psbt(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            npub = "npub_interested"
+            await db.add_participant(mix_id, npub, "")  # default 'interested'
+            cmds = await coord._relevant_commands(npub)
+            assert "commit" in cmds and "addresses" in cmds and "cancel" in cmds
+            assert "psbt_accept" not in cmds
+            assert "join" not in cmds  # half-finished → don't invite another mix
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_signing_shows_psbt_accept_not_commit(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            npub = "npub_signing"
+            pid = await db.add_participant(mix_id, npub, "")
+            await db.update_participant(pid, state="signing")
+            cmds = await coord._relevant_commands(npub)
+            assert "psbt_accept" in cmds and "cancel" in cmds
+            assert "commit" not in cmds
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_help_command_replies_with_a_command_list(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await coord._on_dm(FakeCtx("npub_help"), "/help")
+            msg = nostr.sent_dms[-1][1]
+            assert "/list" in msg and "/join" in msg
+        finally:
+            await db.close()
+
+
 class TestFeeRateStoredAsFloat:
     @pytest.mark.asyncio
     async def test_fractional_fee_rate_round_trips(self):
