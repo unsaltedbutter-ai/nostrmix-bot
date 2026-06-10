@@ -60,6 +60,19 @@ class TestCommandParser:
         addrs = parsed.args[0]
         assert len(addrs) >= 1
 
+    def test_addresses_accepts_commas_and_spaces(self):
+        """Addresses may be separated by spaces, commas, or ", " (copy-all)."""
+        expected = ["bc1qaaa", "bc1qbbb", "bc1qccc"]
+        for sep_form in (
+            "bc1qaaa bc1qbbb bc1qccc",      # spaces
+            "bc1qaaa,bc1qbbb,bc1qccc",      # commas, no spaces
+            "bc1qaaa, bc1qbbb, bc1qccc",    # comma + space (wallet copy-all)
+            "bc1qaaa ,bc1qbbb , bc1qccc",   # messy mix
+        ):
+            parsed = self.parser.parse(f"/addresses {sep_form}")
+            assert parsed.command == "provide_addresses"
+            assert parsed.args[0] == expected, f"failed for: {sep_form!r}"
+
     def test_psbt_accept(self):
         """Test /psbt_accept command."""
         hex_str = "70736274ff0100..."

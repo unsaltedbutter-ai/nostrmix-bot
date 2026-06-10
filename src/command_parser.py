@@ -88,8 +88,14 @@ class CommandParser:
 
         # -- ADDRESSES --
         if cmd == "addresses":
-            # Parse addresses from remaining args
-            addrs = [a.strip() for a in args if a.strip()]
+            # Accept addresses separated by spaces and/or commas — a wallet
+            # "copy all" often joins them with ", ".
+            addrs = []
+            for tok in args:
+                for a in tok.split(","):
+                    a = a.strip()
+                    if a:
+                        addrs.append(a)
             return ParsedCommand("provide_addresses", [addrs], raw)
 
         # -- PSBT ACCEPT --

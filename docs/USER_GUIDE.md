@@ -120,11 +120,6 @@ mix silver-cupcake: 0.0100 BTC outputs (collecting). Needs 2 mixer(s). Up to 10
 same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
 ```
 
-Each mix has a short, memorable **two-word name** like `silver-cupcake` or
-`blue-grape` (a color and an everyday object) — easy to remember while you go
-gather your inputs, and easy to type back. The operator may also announce open
-mixes publicly on Nostr.
-
 ---
 
 ## 7. Join — or start — a mix
@@ -162,10 +157,15 @@ more than once to add more:
 The bot looks each one up on-chain (must be unspent, confirmed, `p2wpkh`, and
 above the dust floor) and tells you which it accepted or rejected.
 
-**Send fresh output addresses** — `bc1q…`, space-separated:
+> **Where to find `txid:vout`:** in **Electrum**, open the *Coins* tab — the long
+> "output point" column **is** the `txid:vout`. In **Sparrow**, open the *UTXOs*
+> tab — it's the "Transaction Output" value. Copy that string verbatim.
+
+**Send fresh output addresses** — `bc1q…`, separated by spaces **or** commas:
 
 ```
 /addresses bc1qaaa… bc1qbbb… bc1qccc…
+/addresses bc1qaaa…, bc1qbbb…, bc1qccc…
 ```
 
 > **Send one address for every output you'll get, PLUS one extra for change.**
