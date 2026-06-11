@@ -167,7 +167,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     "Error processing your message. Check the command format "
-                    "and try again — send /help for the commands available to you.",
+                    "and try again — send help for the commands available to you.",
                 )
             except Exception:
                 pass
@@ -291,7 +291,7 @@ class Coordinator:
         if not mix_id and not amount_btc:
             await self.nostr.send_dm(
                 npub_hex,
-                "Usage: /join <mix_name>  or  /join <amount_btc>  (e.g. /join 0.01)",
+                "Usage: join <mix_name>  or  join <amount_btc>  (e.g. join 0.01)",
             )
             return
 
@@ -309,7 +309,7 @@ class Coordinator:
         if unfinished:
             blocking = unfinished[0]
             if blocking["state"] == "interested":
-                msg = (f"Finish sending /commit and /addresses for "
+                msg = (f"Finish sending commit and addresses for "
                        f"{blocking['mix_id']} before joining another mix.")
             else:  # committed
                 msg = (f"Zap the service fee for {blocking['mix_id']} "
@@ -329,7 +329,7 @@ class Coordinator:
             sats = self._parse_btc_to_sats(amount_btc)
             if sats is None:
                 await self.nostr.send_dm(
-                    npub_hex, "Couldn't read that amount — try e.g. /join 0.01")
+                    npub_hex, "Couldn't read that amount — try e.g. join 0.01")
                 return
             if sats < self.cfg.MINIMUM_UTXO_SIZE:
                 await self.nostr.send_dm(
@@ -345,7 +345,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     "The mix size must be less than 1 BTC — amounts are in BTC, "
-                    "so use a decimal like /join 0.01 (not sats).",
+                    "so use a decimal like join 0.01 (not sats).",
                 )
                 return
             mix_id, created = await self._find_or_create_mix_by_size(sats)
@@ -353,7 +353,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     f"Too many open mixes right now (max {self.cfg.MAX_OPEN_MIXES}). "
-                    f"Try /list and /join an existing one.",
+                    f"Try list and join an existing one.",
                 )
                 return
             mix = await self.db.get_mix(mix_id)
@@ -393,8 +393,8 @@ class Coordinator:
             npub_hex,
             f"{lead}\n"
             f"Send me txid(s) and vout(s) and your output addresses:\n"
-            f"/commit <txid:vout> ...\n"
-            f"/addresses <addr1> <addr2> ..."
+            f"commit <txid:vout> ...\n"
+            f"addresses <addr1> <addr2> ..."
         )
 
     @staticmethod
@@ -489,7 +489,7 @@ class Coordinator:
     async def _cmd_commit_utxos(self, ctx: SenderContext, npub_hex: str, utxos: List[Dict]):
         """Handle /commit <txid:vout> ... — register UTXOs."""
         if not utxos:
-            await self.nostr.send_dm(npub_hex, "No UTXOs found. Format: /commit <txid:vout> <txid:vout> ...")
+            await self.nostr.send_dm(npub_hex, "No UTXOs found. Format: commit <txid:vout> <txid:vout> ...")
             return
 
         # Find the participant's record
@@ -507,7 +507,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     f"Could not look up {first['txid']}:{first['vout']}. "
-                    f"Try /list to see open mixes, or /join one.",
+                    f"Try list to see open mixes, or join one.",
                 )
                 return
             peek_type = peek.get("scriptpubkey_type", "p2wpkh")
@@ -536,7 +536,7 @@ class Coordinator:
                 chosen_mix = await self._find_or_create_mix_for(peek_type)
                 if chosen_mix is None:
                     await self.nostr.send_dm(
-                        npub_hex, "No compatible mix available — try /list and /join.",
+                        npub_hex, "No compatible mix available — try list and join.",
                     )
                     return
                 identity = await self.nostr.get_identity(npub_hex)
@@ -717,8 +717,8 @@ class Coordinator:
         min_addrs = (conforming_total + 1) if has_nc else max(conforming_total, 1)
         recommended = (conforming_total + 2) if has_nc else max(conforming_total, 1)
         guidance = (
-            f"Provide at least {min_addrs} output address(es) with /addresses "
-            f"<addr1> <addr2> ..."
+            f"Provide at least {min_addrs} output address(es):\n"
+            f"addresses <addr1> <addr2> ..."
         )
         if has_nc:
             guidance += (
@@ -777,14 +777,14 @@ class Coordinator:
                     candidates.append(p)
 
         if not candidates:
-            await self.nostr.send_dm(npub_hex, "You haven't committed UTXOs yet. Start with /commit")
+            await self.nostr.send_dm(npub_hex, "You haven't committed UTXOs yet. Start with commit")
             return
         if len(candidates) > 1:
             names = ", ".join(c["mix_id"] for c in candidates)
             await self.nostr.send_dm(
                 npub_hex,
                 f"You're awaiting addresses in multiple mixes: {names}. "
-                f"Please /cancel one before resubmitting addresses for the other.",
+                f"Please cancel one before resubmitting addresses for the other.",
             )
             return
 
@@ -836,7 +836,7 @@ class Coordinator:
             await self.nostr.send_dm(
                 npub_hex,
                 f"Each output address must be unique. You repeated: {sample}. "
-                f"Re-send /addresses with distinct, fresh addresses.",
+                f"Re-send addresses with distinct, fresh addresses.",
             )
             return
 
@@ -958,7 +958,7 @@ class Coordinator:
         if will_donate:
             donation_note = (
                 f"\n⚠️ ~{chg_amt} sats of change will be DONATED — you didn't include "
-                f"a change address. Re-send /addresses with {len(addrs) + 1} addresses "
+                f"a change address. Re-send addresses with {len(addrs) + 1} addresses "
                 f"(one extra) to keep it."
             )
         # Warn when the no-burn rule had to sacrifice a mixed output because the
@@ -977,7 +977,7 @@ class Coordinator:
             undermix_note = (
                 f"\n⚠️ You sent {len(addrs)} address(es), so you'll mix {total_equal} "
                 f"output(s) and receive {chg_amt} sats of change — larger than the "
-                f"{output_size}-sat mix size, and easy to trace. Re-send /addresses "
+                f"{output_size}-sat mix size, and easy to trace. Re-send addresses "
                 f"with {ideal_addrs} ({ideal_addrs - len(addrs)} more) to mix "
                 f"{potential_mixed} output(s) and shrink your change to ~{potential_change} sats."
             )
@@ -1159,7 +1159,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     f"You are a part of {len(active)} mixes: {' & '.join(names)}. "
-                    f"Say /cancel {names[0]} (or another mix name) to exit one."
+                    f"Say cancel {names[0]} (or another mix name) to exit one."
                 )
                 return
         else:
@@ -1168,7 +1168,7 @@ class Coordinator:
             await self.nostr.send_dm(
                 npub_hex,
                 f"You are a part of {len(active)} mixes: {' & '.join(names)}. "
-                f"Say /cancel {names[0]} (or another mix name) to exit one."
+                f"Say cancel {names[0]} (or another mix name) to exit one."
             )
             return
 
@@ -1437,7 +1437,7 @@ class Coordinator:
                         await self.nostr.send_dm(
                             p["npub_hex"],
                             f"Your slot in {mix_id} expired (no payment within "
-                            f"{self.cfg.PAY_DEADLINE_HOURS}h). Use /join {mix_id} to retry.",
+                            f"{self.cfg.PAY_DEADLINE_HOURS}h). Use join {mix_id} to retry.",
                         )
                     except Exception:
                         pass
@@ -1536,7 +1536,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     p["npub_hex"],
                     f"Mix {mix_id} has started without you — you never sent "
-                    f"/commit. Use /list to find another open mix.",
+                    f"commit. Use list to find another open mix.",
                 )
             except Exception:
                 pass
@@ -1788,7 +1788,7 @@ class Coordinator:
         msg = (
             f"Dropped from mix {mix_id}: we didn't have enough output addresses "
             f"on file to pay you when the mix assembled. Re-join and send "
-            f"/addresses to try again."
+            f"addresses to try again."
         )
 
         if fee_paid > 0 and lud16:
@@ -2655,7 +2655,7 @@ class Coordinator:
         else:
             msg = self.parser.format_list_response(available)
 
-        full_text = f"🌟 Open Mixes:\n\n{msg}\n\nUse /join <mix_name> to participate."
+        full_text = f"🌟 Open Mixes:\n\n{msg}\n\nUse join <mix_name> to participate."
         event_id = await self.nostr.post_announcement(full_text)
 
         # If we just auto-created a mix above, `available` was empty when we

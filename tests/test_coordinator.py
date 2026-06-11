@@ -1236,7 +1236,7 @@ class TestOneAtATimeMix:
             allp = await db.get_participants_by_npub(npub)
             assert len(allp) == 1
             joined = " ".join(m for _, m in nostr.sent_dms).lower()
-            assert "send /commit and /addresses" in joined.lower() or "before joining another" in joined
+            assert "send commit and addresses" in joined.lower() or "before joining another" in joined
         finally:
             await db.close()
 
@@ -3714,7 +3714,7 @@ class TestConformingModelGaps:
             await self._commit(coord, chain, "donA", [(TXID[0], 0, 2_500_000)])
             await coord._cmd_provide_addresses(FakeCtx("donA"), "donA", [P2WPKH_ADDRS[0]])
             warn = nostr.sent_dms[-1][1].lower()
-            assert "donated" in warn and "re-send /addresses" in warn
+            assert "donated" in warn and "re-send addresses" in warn
             assert (await db.get_participant(a))["state"] == "paid"
             # Only the equal output is stored — the donation is added at assembly.
             outs = await db.get_outputs_by_participant(a)
@@ -3847,7 +3847,7 @@ class TestConformingModelGaps:
                 FakeCtx("ucA"), "ucA", P2WPKH_ADDRS[0:2])
             msg = nostr.sent_dms[-1][1].lower()
             assert "donated" not in msg          # nothing is donated
-            assert "re-send /addresses" in msg
+            assert "re-send addresses" in msg
             assert "easy to trace" in msg
             # Suggests 4 addresses (3 mixed + 1 change), i.e. 2 more.
             assert "with 4" in msg and "2 more" in msg

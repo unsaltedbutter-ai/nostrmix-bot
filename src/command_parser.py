@@ -227,7 +227,7 @@ class CommandParser:
         return (
             f"Someone ghosted us during the signing phase and saw your addresses. "
             f"To insure your privacy, we've thrown out your addresses.\n"
-            f"Reply with new addresses: /addresses <addr1> <addr2> ..."
+            f"Reply with new ones:\naddresses <addr1> <addr2> ..."
         )
 
     def format_refund(self, amount_sats: int, reason: str = "") -> str:
