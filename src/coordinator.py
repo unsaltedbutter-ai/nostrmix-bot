@@ -1299,7 +1299,7 @@ class Coordinator:
                 await self.nostr.send_dm(
                     npub_hex,
                     f"Thank you for the {amount_sats} sats! "
-                    f"Value for value keeps this mixer running. 🧡")
+                    f"Your support keeps this mixer running. 🧡")
             except Exception:
                 pass
             return
