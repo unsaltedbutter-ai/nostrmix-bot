@@ -162,13 +162,16 @@ class CommandParser:
     # help output is *filtered* to the keys the coordinator decides are relevant
     # to the user's current stage — every command still works regardless of
     # whether it's listed (the list only shapes guidance, not behaviour).
+    # Shown without a leading "/" — it's friendlier to type on mobile. The
+    # parser strips a leading "/" anyway, so "join foo-bar" and "/join foo-bar"
+    # both work.
     _HELP_CATALOG = [
-        ("list", "/list — open mixes"),
-        ("join", "/join <mix> — join (or /join 0.01)"),
-        ("commit", "/commit <txid:vout> … — add UTXOs"),
-        ("addresses", "/addresses <addr> … — payout addrs"),
-        ("psbt_accept", "/psbt_accept <hex> — return signed PSBT"),
-        ("cancel", "/cancel — leave"),
+        ("list", "list — open mixes"),
+        ("join", "join <mix> — join (or join 0.01)"),
+        ("commit", "commit <txid:vout> … — add UTXOs"),
+        ("addresses", "addresses <addr> … — payout addrs"),
+        ("psbt_accept", "psbt_accept <hex> — return signed PSBT"),
+        ("cancel", "cancel — leave"),
     ]
 
     def format_help(self, commands: List[str],

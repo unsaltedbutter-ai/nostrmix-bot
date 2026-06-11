@@ -4870,7 +4870,7 @@ class TestStageAwareHelp:
         try:
             await coord._on_dm(FakeCtx("npub_help"), "/help")
             msg = nostr.sent_dms[-1][1]
-            assert "/list" in msg and "/join" in msg
+            assert "list" in msg and "join" in msg
         finally:
             await db.close()
 
