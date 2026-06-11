@@ -1289,10 +1289,17 @@ class Coordinator:
                 )
                 return
 
+            # Genuine donation / unknown sender — keep it and thank them.
             logger.info(
-                "Unmatched zap: sender=%s amount=%d sats — no committed participant; ignored",
+                "Unmatched zap: sender=%s amount=%d sats — no committed "
+                "participant; kept as donation, thanked",
                 tokens.p(npub_hex), amount_sats,
             )
+            try:
+                await self.nostr.send_dm(
+                    npub_hex, f"Thank you for the {amount_sats} sats! 🧡")
+            except Exception:
+                pass
             return
 
         pid = awaiting[0]["id"]

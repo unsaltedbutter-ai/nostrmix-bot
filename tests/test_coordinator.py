@@ -1804,6 +1804,9 @@ class TestSilentZapNoLongerSilent:
             messages = " ".join(r.message.lower() for r in caplog.records)
             assert "unmatched zap" in messages or "no pending fee" in messages
             assert "1234" in messages
+            # The donor gets a succinct thank-you for the 1234 sats.
+            dm = " ".join(m for _, m in nostr.sent_dms)
+            assert "thank you" in dm.lower() and "1234" in dm
         finally:
             await db.close()
 
