@@ -2664,7 +2664,10 @@ class Coordinator:
         else:
             msg = self.parser.format_list_response(available)
 
-        full_text = f"🌟 Open Mixes:\n\n{msg}\n\nUse join <mix_name> to participate."
+        full_text = (
+            f"🌟 Open Mixes:\n\n{msg}\n\n"
+            f"DM me to participate in any of these mixes, or start one of your own."
+        )
         event_id = await self.nostr.post_announcement(full_text)
 
         # If we just auto-created a mix above, `available` was empty when we
