@@ -70,27 +70,31 @@ the 1-to-1 link between your coin and your identity is broken. The leftover that
 
 ## 4. Command reference
 
-Everything is a DM to the bot. Commands start with `/` (case-insensitive).
+Everything is a DM to the bot. Commands are **case-insensitive**, and the leading
+`/` is **optional** — `join 0.01` and `/join 0.01` both work. The bot's own
+prompts show the bare form, so this guide does too.
 
 | Command | What it does |
 |---|---|
-| `/list` (or `open`, `mixes`) | Show open mixes you can join |
-| `/join <mix_name>` | Register interest in a specific open mix |
-| `/join <amount>` | Join — or start — a mix of that BTC size (e.g. `/join 0.01`) |
-| `/commit <txid:vout> ...` | Declare the UTXO(s) you'll contribute (may be sent more than once) |
-| `/addresses <addr1> <addr2> ...` | Give your fresh output addresses |
-| `/psbt_accept <hex>` | Return your **signed** PSBT |
-| `/psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large) |
-| `/cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
+| `list` (or `open`, `mixes`) | Show open mixes you can join |
+| `join <mix_name>` | Register interest in a specific open mix |
+| `join <amount>` | Join — or start — a mix of that BTC size (e.g. `join 0.01`) |
+| `commit <txid:vout> ...` | Declare the UTXO(s) you'll contribute (may be sent more than once) |
+| `addresses <addr1> <addr2> ...` | Give your fresh output addresses |
+| `psbt_accept <hex>` | Return your **signed** PSBT |
+| `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large) |
+| `cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
+| `help` (or `commands`, `?`) | Show the commands relevant to where you are right now |
 
-If you send something the bot doesn't understand, it replies with this same list.
+If you send something the bot doesn't understand, it replies with a command list
+tuned to your current step.
 
 ---
 
 ## 5. Conforming vs non-conforming
 
 Every UTXO you commit is classified against the mix's **output size** (shown in
-`/list`, e.g. `0.01000000 BTC`):
+`list`, e.g. `0.01000000 BTC`):
 
 - **Conforming** — amount is **exactly** the output size. It moves **1 input → 1
   output** to a fresh address of yours. **No change, no miner fee, no service
@@ -110,15 +114,14 @@ grow everyone's anonymity set.
 DM the bot:
 
 ```
-/list
+list
 ```
 
 It replies with each open mix: its name, output size, how many mixers it's
 waiting for, and how many same-size (conforming) UTXOs it'll take for free, e.g.:
 
 ```
-mix silver-cupcake: 0.0100 BTC outputs (collecting). Needs 2 mixer(s). Up to 10
-same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
+silver-cupcake: 0.0100 BTC · needs 2 · +10 same-size free · p2wpkh
 ```
 
 ---
@@ -128,7 +131,7 @@ same-size (0.0100 BTC) UTXOs welcome free of charge. p2wpkh addresses only.
 **Join an existing mix** by name:
 
 ```
-/join silver-cupcake
+join silver-cupcake
 ```
 
 The bot registers your interest and asks for your UTXOs and addresses.
@@ -136,23 +139,23 @@ The bot registers your interest and asks for your UTXOs and addresses.
 **Start — or join — a mix by size** with a BTC amount instead of a name:
 
 ```
-/join 0.01
+join 0.01
 ```
 
 If an open mix with **that exact output size** has room, the bot adds you to it
 (picking the one closest to filling). If none exists, it **creates** a fresh mix of
 that size — using the operator's default participant and conforming-UTXO counts — and
-puts you in it. Custom sizes work too (`/join 0.00125` → 125,000-sat outputs); the
+puts you in it. Custom sizes work too (`join 0.00125` → 125,000-sat outputs); the
 only floor is the operator's minimum UTXO size, and the bot caps how many mixes can be
-open at once (if it's full, it asks you to `/list` and join an existing one). The bot
+open at once (if it's full, it asks you to `list` and join an existing one). The bot
 echoes the size it created or joined, so a mistyped amount is visible before you commit
 any coins.
 
-**Start a new mix the lazy way:** you can also skip `/join` entirely and just
-**`/commit` a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
+**Start a new mix the lazy way:** you can also skip `join` entirely and just
+**`commit` a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
 you in it automatically.
 
-> One at a time: finish `/commit` **and** `/addresses` (and pay, if a fee is
+> One at a time: finish `commit` **and** `addresses` (and pay, if a fee is
 > charged) for your current mix before joining another.
 
 ---
@@ -160,11 +163,11 @@ you in it automatically.
 ## 8. Declare your inputs and outputs
 
 **Commit your UTXO(s)** — `txid:vout`, separated by spaces **or** commas. You can
-send `/commit` more than once to add more:
+send `commit` more than once to add more:
 
 ```
-/commit 4a5f…e1:0 9c2b…7d:1
-/commit 4a5f…e1:0, 9c2b…7d:1
+commit 4a5f…e1:0 9c2b…7d:1
+commit 4a5f…e1:0, 9c2b…7d:1
 ```
 
 The bot looks each one up on-chain (must be unspent, confirmed, `p2wpkh`, and
@@ -177,8 +180,8 @@ above the dust floor) and tells you which it accepted or rejected.
 **Send fresh output addresses** — `bc1q…`, separated by spaces **or** commas:
 
 ```
-/addresses bc1qaaa… bc1qbbb… bc1qccc…
-/addresses bc1qaaa…, bc1qbbb…, bc1qccc…
+addresses bc1qaaa… bc1qbbb… bc1qccc…
+addresses bc1qaaa…, bc1qbbb…, bc1qccc…
 ```
 
 > **Send one address for every output you'll get, PLUS one extra for change.**
@@ -195,7 +198,7 @@ How many is that, concretely:
 
 If you send too few, the bot won't burn your coins — it turns your last address
 into an (oversized) change output and **warns you** that adding an address would
-mix more and shrink that change. So heed that warning and re-send `/addresses`
+mix more and shrink that change. So heed that warning and re-send `addresses`
 with one more. (With only a *single* address and an above-dust leftover, that
 excess is donated or folded into the miner fee — another reason to always include
 a change address.)
@@ -212,8 +215,8 @@ Once the mix has enough participants, the bot assembles the transaction and DMs
 you, over the same NIP-17 thread:
 
 1. **Your miner-fee share**, e.g. `Your share of the miner fee: 270 sats …`.
-2. **The unsigned PSBT**, delivered as a message that begins `/psbt_accept
-   70736274ff…`. (If it's very large it arrives in pieces as `/psbt_chunk
+2. **The unsigned PSBT**, delivered as a message that begins `psbt_accept
+   70736274ff…`. (If it's very large it arrives in pieces as `psbt_chunk
    1/3 …`, `2/3 …` — concatenate the hex in order to get the whole PSBT.)
 
 Copy out that PSBT hex. **Do not sign yet** — verify it first.
@@ -256,7 +259,7 @@ right thing to decode here — it carries input amounts, so the fee is shown; a
 finalized raw transaction doesn't.
 
 If anything is off — wrong amount, an address that isn't yours, a crazy fee, an
-unspendable output — **don't sign.** Use `/cancel` and ask the operator.
+unspendable output — **don't sign.** Use `cancel` and ask the operator.
 
 ---
 
@@ -279,7 +282,7 @@ only hold those keys.
 DM the bot the signed hex:
 
 ```
-/psbt_accept 70736274ff…<your signed PSBT>…
+psbt_accept 70736274ff…<your signed PSBT>…
 ```
 
 Only if it's very large — **over ~50,000 hex characters (~25 KB)**, the bot's
@@ -287,12 +290,12 @@ chunking threshold — send it in numbered pieces instead (split the hex into
 in-order chunks):
 
 ```
-/psbt_chunk 1/2 70736274ff…
-/psbt_chunk 2/2 …rest…
+psbt_chunk 1/2 70736274ff…
+psbt_chunk 2/2 …rest…
 ```
 
 In practice a 2-5 participant mix produces a PSBT far smaller than that, so a
-single `/psbt_accept` almost always fits — only large mixes need chunking.
+single `psbt_accept` almost always fits — only large mixes need chunking.
 
 The bot cryptographically verifies your signature against the exact skeleton it
 sent. When **everyone** has returned a valid signature, it combines them,
@@ -302,7 +305,7 @@ outputs are on-chain.
 > Heads-up on the deadline: you have **48h** (default) to return your signature.
 > If you ghost, you're blacklisted and the mix re-forms without you. If *someone
 > else* ghosts after seeing your addresses, the bot discards your addresses for
-> privacy and asks for fresh ones — just send a new `/addresses …`.
+> privacy and asks for fresh ones — just send a new `addresses …`.
 
 ---
 
@@ -348,18 +351,18 @@ left of the traceable change is negligible.
 ## Quick reference: the happy path
 
 ```
-/list                                  → see open mixes
-/join silver-cupcake                   → join the mix you picked
-   (or /join 0.01 to join-or-start a mix of that size,
-    or skip /join and just /commit to auto-start a new mix)
-/commit <txid:vout> …                  → register the coins you'll contribute
-/addresses bc1q… bc1q… bc1q…           → one per mixed output + one extra for change
+list                                   → see open mixes
+join silver-cupcake                    → join the mix you picked
+   (or join 0.01 to join-or-start a mix of that size,
+    or skip join and just commit to auto-start a new mix)
+commit <txid:vout> …                   → register the coins you'll contribute
+addresses bc1q… bc1q… bc1q…            → one per mixed output + one extra for change
    (pay the zap only if a fee is charged — off by default)
 …bot DMs your fee share + the PSBT…
    → VERIFY it (psbt_decode.py / Sparrow): inputs, outputs (your addrs), fee
    → SIGN it in your wallet
-/psbt_accept <signed-hex>              → return it
+psbt_accept <signed-hex>               → return it
 …bot broadcasts and DMs you the txid…
 ```
 
-Changed your mind at any point before signing? `/cancel`.
+Changed your mind at any point before signing? `cancel`.

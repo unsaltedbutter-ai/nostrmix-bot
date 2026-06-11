@@ -2165,12 +2165,12 @@ class Coordinator:
                 for idx, chunk in enumerate(chunks, 1):
                     await self.nostr.send_dm(
                         p["npub_hex"],
-                        f"/psbt_chunk {idx}/{len(chunks)} {chunk}",
+                        f"psbt_chunk {idx}/{len(chunks)} {chunk}",
                     )
             else:
                 await self.nostr.send_dm(
                     p["npub_hex"],
-                    f"/psbt_accept {psbt_hex}",
+                    f"psbt_accept {psbt_hex}",
                 )
 
             # Move participant to signing

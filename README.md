@@ -121,7 +121,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
-| `FEE_PER_ELEMENT` | `0` | int ≥ 0 (negative → 0) | Service-fee zap, in sats, per **non-conforming** element (input + used output). **0 disables zaps entirely**: no payment is requested and participants go straight to `paid` after `/addresses`. Conforming UTXOs are always free. |
+| `FEE_PER_ELEMENT` | `0` | int ≥ 0 (negative → 0) | Service-fee zap, in sats, per **non-conforming** element (input + used output). **0 disables zaps entirely**: no payment is requested and participants go straight to `paid` after `addresses`. Conforming UTXOs are always free. |
 | `FEE_MULTIPLIER` | `1.5` | float > 0 | Safety multiplier applied to the estimated sat/vB miner-fee rate. |
 | `MIN_FEE_RATE_SATS` | `1.5` | float > 0 | Floor for the miner fee-rate clamp, and the floor used by the pre-broadcast sum-invariant ("tx must pay at least this"). |
 | `MAX_FEE_RATE_SATS` | `510` | float; `0` = no ceiling | Ceiling for the miner fee-rate clamp. Set `0` to disable the ceiling. |
@@ -134,13 +134,13 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
 | `DEFAULT_OUTPUT_SIZE` | `1000000` | int ≥ `MINIMUM_UTXO_SIZE` (else load fails) | Equal-output size (sats) of auto-created mixes. Also the conforming/non-conforming dividing line. |
-| `MAX_PARTICIPANTS_DEFAULT` | `20` | int > 0 | Upper bound used by the auto-mix-on-`/commit` capacity check. |
-| `MAX_PENDING_MIXES` | `5` | int ≥ 1 | Max simultaneous **paid** mixes a single npub may be in. A 4th/Nth `/join` is refused. |
-| `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `/join <amount>` and the `/commit` auto-create. At the cap, creation is refused and the user is pointed at `/list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
+| `MAX_PARTICIPANTS_DEFAULT` | `20` | int > 0 | Upper bound used by the auto-mix-on-`commit` capacity check. |
+| `MAX_PENDING_MIXES` | `5` | int ≥ 1 | Max simultaneous **paid** mixes a single npub may be in. A 4th/Nth `join` is refused. |
+| `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `join <amount>` and the `commit` auto-create. At the cap, creation is refused and the user is pointed at `list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
 | `SIGNING_DEADLINE_HOURS` | `48` | int > 0 | Time participants have to return a signed PSBT. Reminder DMs fire at ⅛, ¼, ½ of this; past it, the participant is ghosted + blacklisted. |
 | `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set); also the collecting deadline and the ghost-recovery deadline extension. |
 | `MAX_GHOST_RETRIES` | `3` | int ≥ 0 | How many times a mix restarts collecting after a ghost before it cancels and refunds everyone. |
-| `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at `/commit`. |
+| `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at `commit`. |
 
 ### Conforming / non-conforming model
 
@@ -162,8 +162,8 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
-| `ACCEPTED_INPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | UTXO script types accepted at `/commit`. Each mix additionally locks to the type of its first commit. |
-| `ACCEPTED_OUTPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | Output address types accepted at `/addresses`. Each mix locks to the type of its first `/addresses`. |
+| `ACCEPTED_INPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | UTXO script types accepted at `commit`. Each mix additionally locks to the type of its first commit. |
+| `ACCEPTED_OUTPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | Output address types accepted at `addresses`. Each mix locks to the type of its first `addresses`. |
 
 Recognized type tokens: `p2pkh`, `p2sh`, `p2sh-p2wpkh`, `p2wpkh`, `p2wsh`, `p2tr`.
 The MVP defaults to `p2wpkh` only.
@@ -207,7 +207,7 @@ Participant (Nostr DM)
        ↓
 NostrHandler (NIP-17 DMs, NIP-57 zaps, daily announcements)
        ↓
-CommandParser (/list, /join, /commit, /addresses, /psbt_accept, /cancel)
+CommandParser (list, join, commit, addresses, psbt_accept, cancel)
        ↓
 Coordinator (state machine, event loop)
        ↓
@@ -243,26 +243,27 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 > for the full walkthrough — joining, committing, verifying the PSBT before you
 > sign, toxic change, and re-mixing.
 
-Commands are matched case-insensitively; the `/` prefix is optional for `list`.
+Commands are matched case-insensitively, and the leading `/` is optional —
+`join 0.01` and `/join 0.01` both work (the bot's prompts show the bare form).
 
-- `/list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
+- `list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
   a default one (`DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`) and lists
   it, so there's always something to join.
-- `/help` (or `commands`, `?`) — show the commands relevant to your current stage
-  (e.g. `/commit` while gathering, `/psbt_accept` while signing). Every command
+- `help` (or `commands`, `?`) — show the commands relevant to your current stage
+  (e.g. `commit` while gathering, `psbt_accept` while signing). Every command
   still works regardless of what's listed; this only tunes the guidance.
-- `/join <mix_name>` — join a mix by name; or `/join <amount>` (e.g. `/join 0.01`)
+- `join <mix_name>` — join a mix by name; or `join <amount>` (e.g. `join 0.01`)
   to join an open mix of that BTC output size, or create one if none exists
-- `/commit <txid:vout> ...` — register UTXOs (may be sent more than once)
-- `/addresses <addr1> <addr2> ...` — provide output addresses (one per conforming
+- `commit <txid:vout> ...` — register UTXOs (may be sent more than once)
+- `addresses <addr1> <addr2> ...` — provide output addresses (one per conforming
   UTXO; non-conforming participants need ≥1 more for an equal output, plus one more
   to receive change. The address count caps your outputs: if you supply too few,
   the bot turns your last address into an (oversized) change output rather than
   burning the leftover — so you get fewer mixed outputs but keep the sats. Only
   with a single address and an above-dust leftover is that excess donated/folded.)
-- `/psbt_accept <hex>` — return a signed PSBT (or `/psbt_chunk <i>/<n> <hex>` for
+- `psbt_accept <hex>` — return a signed PSBT (or `psbt_chunk <i>/<n> <hex>` for
   large PSBTs)
-- `/cancel [mix_name]` — exit a mix (auto-detects when you're in exactly one)
+- `cancel [mix_name]` — exit a mix (auto-detects when you're in exactly one)
 
 ## Testing
 
@@ -281,7 +282,7 @@ Tests that hit the live mempool.space API are marked `@pytest.mark.live`.
 Two scripts let you validate the deployment in layers without launching the full
 bot or risking funds. Launching `src/main.py` itself touches no funds — it
 connects and waits; a transaction is only built/broadcast once participants
-`/commit` UTXOs and a mix reaches its non-conforming target.
+`commit` UTXOs and a mix reaches its non-conforming target.
 
 **`scripts/preflight.py`** — config sanity + connectivity. Loads the same config
 `main.py` uses (printing only non-secret fields), confirms mempool.space is
@@ -308,7 +309,7 @@ on-chain and produce a real, importable PSBT. See the file headers for the spec
 format. Neither script broadcasts or sends a DM.
 
 Suggested order before a live coinjoin: `pytest -m "not live"` → `preflight.py` →
-`psbt_dryrun.py` → launch + DM `/list` → a controlled self-test with your own
+`psbt_dryrun.py` → launch + DM `list` → a controlled self-test with your own
 identities and small-value UTXOs.
 
 ## License
