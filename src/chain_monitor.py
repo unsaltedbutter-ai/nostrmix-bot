@@ -2,10 +2,20 @@
 
 All networking uses httpx.AsyncClient so it never blocks the asyncio event loop.
 """
+import logging
 import statistics
 
 import httpx
 from typing import Optional, Dict, List, Any
+
+# Privacy: httpx logs every request URL at INFO ("HTTP Request: GET
+# https://mempool.space/api/tx/<txid>"). Those URLs carry the broadcast
+# coinjoin txid and every user-supplied outpoint — exactly the linkage the
+# tokenised logging elsewhere exists to avoid. Cap the HTTP client loggers
+# at WARNING here, at import, so EVERY entry point that can make these
+# requests (bot, scripts, tests) is covered regardless of its logging setup.
+for _noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 _DEFAULT_API = "https://mempool.space/api"
 _DEFAULT_BACKUP_API = "https://blockstream.info/api"  # API-compatible Esplora mirror

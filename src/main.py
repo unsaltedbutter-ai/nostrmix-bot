@@ -27,6 +27,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# Privacy: HTTP client libraries log full request URLs at INFO, which would
+# write coinjoin txids, user outpoints, and lnurl endpoints into the log
+# file. chain_monitor caps httpx/httpcore at import; repeat here so the
+# policy holds even if a future module talks HTTP through something else.
+for _noisy_logger in ("httpx", "httpcore", "urllib3", "aiohttp.client"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger("nostrmix-bot")
 
 # ANSI styling for the startup mast. Renders when the log is tailed in a

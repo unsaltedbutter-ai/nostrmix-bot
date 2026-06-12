@@ -435,3 +435,31 @@ class TestRuntimeLogsHaveNoLeaks:
             )
         finally:
             await db.close()
+
+
+# ---------------------------------------------------------------------------
+# HTTP client loggers: request URLs carry txids/outpoints — must be capped
+# ---------------------------------------------------------------------------
+
+
+class TestHttpClientLoggersAreCapped:
+    """httpx logs every request URL at INFO ("HTTP Request: GET
+    .../tx/<txid>"), which would write the public coinjoin txid and every
+    user-supplied outpoint into the bot's log — linkage the tokenised
+    logging exists to prevent. chain_monitor caps httpx/httpcore at import;
+    these guards fail if that cap is ever removed."""
+
+    def test_httpx_logger_capped_at_warning(self):
+        import src.chain_monitor  # noqa: F401 — the import applies the cap
+        for name in ("httpx", "httpcore"):
+            lg = logging.getLogger(name)
+            assert lg.getEffectiveLevel() >= logging.WARNING, (
+                f"{name} logger must not emit INFO request lines (URL = txid leak)"
+            )
+            assert not lg.isEnabledFor(logging.INFO)
+
+    def test_chain_monitor_source_keeps_the_cap(self):
+        # Static guard: the cap lives in chain_monitor.py next to the only
+        # httpx client. Don't let a refactor drop it silently.
+        src = (Path(__file__).parent.parent / "src" / "chain_monitor.py").read_text()
+        assert 'logging.getLogger(_noisy_logger).setLevel(logging.WARNING)' in src
