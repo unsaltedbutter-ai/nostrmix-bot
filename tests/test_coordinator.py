@@ -5259,3 +5259,46 @@ class TestDepartedParticipantScrub:
             assert all(r["participant_id"] != pid for r in rounds)
         finally:
             await db.close()
+
+
+# --- Mixed bare paste + join-at-cap suggestions ---
+
+
+class TestMixedPasteAndJoinSuggestions:
+    @pytest.mark.asyncio
+    async def test_one_message_with_utxo_and_address_does_both(self):
+        """A single DM carrying a txid:vout AND a payout address registers
+        the input and the address in one go (auto-creating a mix)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            npub = "npub_onepaste"
+            chain.txouts[f"{TXID[0]}:0"] = _fake_txout(2_500_000)
+            await coord._on_dm(
+                FakeCtx(npub), f"{TXID[0]}:0\n{P2WPKH_ADDRS[0]}")
+
+            parts = await db.get_participants_by_npub(npub)
+            assert parts, "participant should exist after mixed paste"
+            pid = parts[0]["id"]
+            utxos = await db.get_utxos_by_participant(pid)
+            assert [(u["txid"], u["vout"]) for u in utxos] == [(TXID[0], 0)]
+            # NC participant, 1 address (min) → layout ran, no-fee → paid.
+            assert (await db.get_participant(pid))["state"] == "paid"
+            assert len(await db.get_outputs_by_participant(pid)) >= 1
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_join_at_cap_suggests_closest_open_sizes(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            coord.cfg._values["MAX_OPEN_MIXES"] = 1
+            mix_id = await db.create_mix(output_size=1_000_000)  # 0.01 BTC
+            await db.update_mix(mix_id, state="collecting")
+
+            await coord._cmd_join_mix(FakeCtx("npub_capped"), None, None, "0.5")
+
+            last = nostr.sent_dms[-1][1]
+            assert "Too many open mixes" in last
+            assert "join 0.01" in last, f"expected a closest-size hint: {last}"
+        finally:
+            await db.close()

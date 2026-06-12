@@ -5,7 +5,7 @@ thing from private Nostr DMs, and **you keep custody the entire time**: the bot
 only ever builds an *unsigned* transaction and asks you to sign it. Nothing moves
 until you've inspected it and added your signature in your own wallet.
 
-> Mixing involves real bitcoin. Read [§9 — Check the PSBT isn't cheating you](#9-check-the-psbt-isnt-cheating-you)
+> ⚠️ Mixing involves real bitcoin. Read [§9 — Check the PSBT isn't cheating you](#9-check-the-psbt-isnt-cheating-you)
 > before you ever sign, and start with small amounts until you trust the flow.
 
 **Contents**
@@ -79,26 +79,27 @@ Everything is a DM to the bot — and **mostly, you just paste**:
   running tally (`2 of 3 address(es) on file`).
 - Send **signed PSBT hex** and it's taken as the signature for your inputs.
 
-The bot recognizes each by its shape, so no command words are needed. The verbs
-below all still work (they're what `help` shows); commands are
-**case-insensitive** and the leading `/` is **optional** — `join 0.01` and
-`/join 0.01` both work.
+The bot recognizes each by its shape, so no command words are needed. Separate
+items with spaces, commas, or new lines — and you can even put inputs and
+addresses in the **same message**.
 
-| You send | What it does |
+| You send | What happens |
 |---|---|
-| `list` (or `open`, `mixes`) | Show open mixes you can join |
-| `join <mix_name>` | Register interest in a specific open mix |
-| `join <amount>` | Join — or start — a mix of that BTC size (e.g. `join 0.01`) |
-| `<txid:vout> …` — or `inputs <txid:vout> …` | Add UTXO(s) as your inputs; repeats **add** to your set |
-| `bc1q… …` — or `addresses bc1q… …` | Add fresh payout addresses; they **accumulate** across messages |
-| `addresses clear` | Wipe your address list and start over (the fix for a mis-paste) |
-| `70736274ff…` — or `psbt_accept 70736274ff…` | Return your **signed** PSBT |
-| `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large; verb required) |
-| `cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
-| `help` (or `commands`, `?`) | Show the commands relevant to where you are right now |
+| `list` | See the open mixes |
+| `join 0.01` | Join (or start) a mix that pays out in 0.01 BTC pieces |
+| `join silver-cupcake` | Join an open mix by its name |
+| `<txid:vout> …` | Your coins go in as inputs (paste again to add more) |
+| `bc1q… …` | Your payout addresses (they add up across messages) |
+| `addresses clear` | Start your address list over |
+| `70736274ff…` | Hand back your signed PSBT |
+| `psbt_chunk <i>/<n> <hex>` | Signed PSBT in pieces, if it's too big for one DM |
+| `cancel` | Leave the mix (any service fee is refunded) |
+| `help` | The commands that matter at your current step |
 
-Verb spellings are forgiving: `inputs` = `input` = `commit`, and `addresses` =
-`address` = `outputs`.
+Verb spellings are forgiving: `inputs` (= `input` = `commit`) before outpoints,
+`addresses` (= `address` = `outputs`) before addresses, and `psbt_accept`
+before a PSBT all work — as do `/list`, `open`, `mixes`, `exit`, `leave`,
+`cancel <mix_name>`, and any capitalization.
 
 If you send something the bot doesn't understand, it replies with a command list
 tuned to your current step.
@@ -142,43 +143,41 @@ silver-cupcake: 0.0100 BTC · needs 2 · +10 same-size free · p2wpkh
 
 ## 7. Join — or start — a mix
 
-**Join an existing mix** by name:
-
-```
-join silver-cupcake
-```
-
-The bot registers your interest and asks for your UTXOs and addresses.
-
-**Start — or join — a mix by size** with a BTC amount instead of a name:
+**The easy way: pick a size.** Tell the bot how big you want each mixed output
+to be, in BTC:
 
 ```
 join 0.01
 ```
 
-If an open mix with **that exact output size** has room, the bot adds you to it
-(picking the one closest to filling). If none exists, it **creates** a fresh mix of
-that size — using the operator's default participant and conforming-UTXO counts — and
-puts you in it. Custom sizes work too (`join 0.00125` → 125,000-sat outputs); the
-only floor is the operator's minimum UTXO size, and the bot caps how many mixes can be
-open at once (if it's full, it asks you to `list` and join an existing one). The bot
-echoes the size it created or joined, so a mistyped amount is visible before you commit
-any coins.
+If an open mix with **that exact output size** has room, you're in (the bot
+picks the one closest to filling). If none exists, the bot **creates** one of
+that size and puts you in it. Custom sizes work too (`join 0.00125` →
+125,000-sat outputs); the only floor is the operator's minimum UTXO size. The
+bot echoes back the size it created or joined, so a mistyped amount is visible
+before you commit any coins. And if too many mixes are already open to start
+another, it replies with the closest open sizes — e.g. `join 0.01 or join 0.02`
+— so you can take the best fit.
 
-**Start a new mix the lazy way:** you can also skip `join` entirely and just
-**paste a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
-you in it automatically.
+**Or join by name**, picking one from `list`:
 
-> One at a time: finish your inputs **and** outputs (and pay, if a fee is
+```
+join silver-cupcake
+```
+
+💡 **The lazy way:** skip `join` entirely and just **paste a UTXO** (next
+step) — the bot spins up a fresh default-size mix and puts you in it
+automatically.
+
+> ⚠️ One at a time: finish your inputs **and** outputs (and pay, if a fee is
 > charged) for your current mix before joining another.
 
 ---
 
 ## 8. Declare your inputs and outputs
 
-**Paste your UTXO(s)** — `txid:vout`, separated by spaces **or** commas, no
-command needed (typing `inputs` in front also works). Paste again any time to
-add more:
+**Paste your UTXO(s)** — `txid:vout`, separated by spaces, commas, or new
+lines. Paste again any time to add more:
 
 ```
 4a5f…e1:0 9c2b…7d:1
@@ -188,21 +187,25 @@ add more:
 The bot looks each one up on-chain (must be unspent, confirmed, `p2wpkh`, and
 above the dust floor) and tells you which it accepted or rejected.
 
-> **Where to find `txid:vout`:** in **Electrum**, open the *Coins* tab — the long
+> 💡 **Where to find `txid:vout`:** in **Electrum**, open the *Coins* tab — the long
 > "output point" column **is** the `txid:vout`. In **Sparrow**, open the *UTXOs*
 > tab — it's the "Transaction Output" value. Copy that string verbatim.
 
-**Paste fresh payout addresses** — `bc1q…`, again no command needed (or prefix
-with `addresses`). They **accumulate**: one address per message is fine, and the
-bot replies with a running tally (`2 of 3 address(es) on file`) until you've
-sent enough. Pasted a wrong one? `addresses clear` wipes the list to start over.
+**Paste fresh payout addresses** — `bc1q…`. They **accumulate**: one address
+per message is fine, and the bot replies with a running tally (`2 of 3
+address(es) on file`) until you've sent enough. Pasted a wrong one?
+`addresses clear` wipes the list to start over.
 
 ```
 bc1qaaa… bc1qbbb… bc1qccc…
 bc1qaaa…, bc1qbbb…, bc1qccc…
 ```
 
-> **Send one address for every output you'll get, PLUS one extra for change.**
+💡 In a hurry? Inputs and addresses can ride in **one message** — paste the
+`txid:vout` lines and the `bc1q…` lines together and the bot files each where
+it belongs.
+
+> ⚠️ **Send one address for every output you'll get, PLUS one extra for change.**
 > This is the single most important thing to get right. The number of addresses
 > you provide is the hard cap on how many outputs you receive, so too few means
 > you mix fewer coins than you could.
@@ -229,17 +232,18 @@ sats to zap and to which address; you advance once it's paid.
 
 ## 9. Receive the PSBT
 
-Once the mix has enough participants, the bot assembles the transaction and DMs
-you, over the same NIP-17 thread:
+Once the mix has enough participants, the bot assembles the transaction and
+sends you two DMs:
 
 1. **Your miner-fee share and the rate it was computed at**, e.g.
    `Your share of the miner fee: 270 sats (~0.00000270 BTC) at 1.5 sat/vB.`
    (Conforming-only participants see `0 sats` — pass-throughs ride free.)
-2. **The unsigned PSBT**, delivered as a message that begins `psbt_accept
-   70736274ff…`. (If it's very large it arrives in pieces as `psbt_chunk
-   1/3 …`, `2/3 …` — concatenate the hex in order to get the whole PSBT.)
+2. **The unsigned PSBT** — a message containing **only** the PSBT hex
+   (`70736274ff…`), nothing else, so select-all → copy grabs exactly the
+   PSBT. (If it's very large it arrives in pieces as `psbt_chunk 1/3 …`,
+   `2/3 …` — concatenate the hex parts in order to get the whole PSBT.)
 
-Copy out that PSBT hex. **Do not sign yet** — verify it first.
+**👀 Do not sign yet — verify it first.**
 
 <a name="9-check-the-psbt-isnt-cheating-you"></a>
 
@@ -286,11 +290,20 @@ unspendable output — **don't sign.** Use `cancel` and ask the operator.
 ## 10. Sign the PSBT
 
 In **Sparrow**: with the transaction open (*File → Open Transaction → From Text*),
-review the inputs/outputs/fee one more time, click **Sign**, then **Export/Save**
-the *signed* PSBT as text/hex.
+review the inputs/outputs/fee before you sign — this is very important — then
+click **Sign** and **Export/Save** the *signed* PSBT as a file.
 
-In **Electrum**: *Tools → Load Transaction → From Text* → **Sign** → **Export/Copy**
-the signed PSBT.
+In **Electrum**: *Tools → Load Transaction → From Text* → review → **Sign** →
+**Export/Save** the signed PSBT as a file.
+
+Wallets save the signed PSBT as a **binary `.psbt` file**; the bot needs it as a
+**hex string**. Convert it in a terminal:
+
+```bash
+xxd -p signed.psbt | tr -d '\n'; echo
+```
+
+Copy the output — that `70736274ff…` string is what you DM back in the next step.
 
 You sign **only your own inputs** — which is all you *can* sign anyway, since you
 only hold those keys.
@@ -318,11 +331,14 @@ In practice a 2-5 participant mix produces a PSBT far smaller than that, so a
 single pasted message almost always fits — only large mixes need chunking.
 
 The bot cryptographically verifies your signature against the exact skeleton it
-sent. When **everyone** has returned a valid signature, it combines them,
+sent. If what you sent isn't actually signed — or signs the wrong inputs —
+nothing is recorded: the bot replies with what's missing (e.g. `Input #0
+(yours) was not signed`) and keeps waiting, so just sign, convert, and paste
+again. When **everyone** has returned a valid signature, it combines them,
 finalizes, and broadcasts — then DMs you the transaction id. Done: your mixed
 outputs are on-chain.
 
-> Heads-up on the deadline: you have **48h** (default) to return your signature.
+> ⚠️ Heads-up on the deadline: you have **48h** (default) to return your signature.
 > If you ghost, you're blacklisted and the mix re-forms without you. If *someone
 > else* ghosts after seeing your addresses, the bot discards your addresses for
 > privacy and asks for fresh ones — just paste new addresses.

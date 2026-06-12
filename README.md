@@ -261,9 +261,10 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 **Mostly, participants just paste.** A `txid:vout` list becomes the sender's mix
 **inputs**, bitcoin addresses become their payout **outputs**, and signed PSBT
 hex is taken as their **signature** — each recognized by shape, no verb needed.
-The verbs below all still work (they're what `help` shows); commands are matched
-case-insensitively and the leading `/` is optional — `join 0.01` and `/join 0.01`
-both work.
+Items may be separated by spaces, commas, or new lines, and one message may
+carry both inputs and addresses. The verbs below all still work (they're what
+`help` shows); commands are matched case-insensitively and the leading `/` is
+optional — `join 0.01` and `/join 0.01` both work.
 
 - `list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
   a default one (`DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`) and lists

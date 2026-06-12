@@ -271,9 +271,19 @@ class TestAliasesAndBarePaste:
         assert parsed.command == "provide_addresses"
         assert parsed.args[0] == [self.ADDR_BECH32]
 
-    def test_bare_utxo_wins_over_address_in_same_message(self):
-        parsed = self.parser.parse(f"{self.GOOD_TXID}:0 {self.ADDR_BECH32}")
+    def test_mixed_paste_routes_both_inputs_and_addresses(self):
+        parsed = self.parser.parse(f"{self.GOOD_TXID}:0\n{self.ADDR_BECH32}")
+        assert parsed.command == "paste_mixed"
+        assert parsed.args[0] == [{"txid": self.GOOD_TXID, "vout": 0}]
+        assert parsed.args[1] == [self.ADDR_BECH32]
+
+    def test_newline_separated_pastes(self):
+        parsed = self.parser.parse(f"{self.GOOD_TXID}:0\n{self.GOOD_TXID}:1")
         assert parsed.command == "commit_utxos"
+        assert [u["vout"] for u in parsed.args[0]] == [0, 1]
+        parsed = self.parser.parse(f"{self.ADDR_BECH32}\n{self.ADDR_BASE58}")
+        assert parsed.command == "provide_addresses"
+        assert parsed.args[0] == [self.ADDR_BECH32, self.ADDR_BASE58]
 
     def test_plain_text_still_unknown(self):
         for text in ("hello there friend",

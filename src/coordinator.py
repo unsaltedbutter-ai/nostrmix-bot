@@ -129,6 +129,13 @@ class Coordinator:
                 case "clear_addresses":
                     await self._cmd_clear_addresses(ctx, npub_hex)
 
+                case "paste_mixed":
+                    # One paste carrying both txid:vout pairs and addresses.
+                    # Inputs first, so the address intake sees the new UTXOs
+                    # (min-address math, auto-mix-on-paste).
+                    await self._cmd_commit_utxos(ctx, npub_hex, parsed.args[0])
+                    await self._cmd_provide_addresses(ctx, npub_hex, parsed.args[1])
+
                 case "accept_psbt":
                     psbt_hex = parsed.args[0] if parsed.args else ""
                     await self._cmd_accept_psbt(ctx, npub_hex, psbt_hex)
@@ -370,10 +377,19 @@ class Coordinator:
                 return
             mix_id, created = await self._find_or_create_mix_by_size(sats)
             if mix_id is None:
+                # At the open-mix cap. Don't dead-end — offer the closest
+                # open sizes as ready-to-send joins (an exact-size `join`
+                # joins the existing mix rather than creating one).
+                open_mixes = await self.db.get_mixes_by_state(
+                    "announced", "collecting")
+                sizes = sorted({m["output_size"] for m in open_mixes},
+                               key=lambda s: abs(s - sats))[:3]
+                opts = " or ".join(f"join {s / 1e8:g}" for s in sizes)
                 await self.nostr.send_dm(
                     npub_hex,
-                    f"Too many open mixes right now (max {self.cfg.MAX_OPEN_MIXES}). "
-                    f"Try list and join an existing one.",
+                    f"Too many open mixes to start another (max "
+                    f"{self.cfg.MAX_OPEN_MIXES})."
+                    + (f" Closest open sizes: {opts}" if opts else " Try list."),
                 )
                 return
             mix = await self.db.get_mix(mix_id)
@@ -2438,10 +2454,10 @@ class Coordinator:
                         f"psbt_chunk {idx}/{len(chunks)} {chunk}",
                     )
             else:
-                await self.nostr.send_dm(
-                    p["npub_hex"],
-                    f"psbt_accept {psbt_hex}",
-                )
+                # The PSBT goes in a bubble of its own, nothing else — a
+                # phone user selects-all and copies; any prefix would ride
+                # along and corrupt the paste into their wallet.
+                await self.nostr.send_dm(p["npub_hex"], psbt_hex)
 
             # Move participant to signing
             await self.db.update_participant(pid, state="signing", psbt_sent_at_unix=now_ts)

@@ -65,7 +65,9 @@ class CommandParser:
 
     A message with no verb that contains txid:vout pairs, bitcoin
     addresses, or PSBT hex routes to commit_utxos / provide_addresses /
-    accept_psbt respectively — pasting the data is enough.
+    accept_psbt respectively — pasting the data is enough. A paste holding
+    BOTH outpoints and addresses routes to paste_mixed (inputs first).
+    Separators may be spaces, commas, or new lines.
     """
 
     def __init__(self, bot_name: str = "butterbot"):
@@ -179,14 +181,17 @@ class CommandParser:
             return ParsedCommand("accept_psbt", [joined], raw)
         utxos = [{"txid": m.group(1).lower(), "vout": int(m.group(2))}
                  for m in UTXO_PATTERN.finditer(raw)]
-        if utxos:
-            return ParsedCommand("commit_utxos", [utxos], raw)
         addrs = []
         for tok in parts:
             for a in tok.split(","):
                 a = a.strip()
                 if a and _looks_like_address(a):
                     addrs.append(a)
+        if utxos and addrs:
+            # One message carrying both inputs AND payout addresses.
+            return ParsedCommand("paste_mixed", [utxos, addrs], raw)
+        if utxos:
+            return ParsedCommand("commit_utxos", [utxos], raw)
         if addrs:
             return ParsedCommand("provide_addresses", [addrs], raw)
 
