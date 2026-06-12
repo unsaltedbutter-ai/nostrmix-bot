@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS participants (
     fee_paid        INTEGER,                    -- sats zap received
     fee_share       INTEGER,                    -- on-chain fee share (calculated)
     change_amount   INTEGER,                    -- change output sats, 0 = no change
+    -- JSON list of payout addresses accumulated across `outputs` messages
+    -- (append-mode intake). Cleared whenever the participant's outputs are
+    -- cleared — delete_outputs_by_participant keeps the pair in lockstep.
+    pending_addresses TEXT,
     lightning_addr  TEXT,                       -- from Nostr profile kind 0, for refunds
     psbt_sent_at_unix INTEGER,
     reminder_count  INTEGER DEFAULT 0,

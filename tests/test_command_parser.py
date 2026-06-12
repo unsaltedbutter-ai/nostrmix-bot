@@ -212,3 +212,77 @@ class TestCommandParser:
         parsed = self.parser.parse("/cancel")
         assert parsed.command == "exit_mix"
         assert parsed.args[0] is None
+
+
+class TestAliasesAndBarePaste:
+    """inputs/outputs are the documented verbs (commit/addresses stay as
+    aliases), and pasting bare txid:vout pairs or bitcoin addresses needs no
+    verb at all."""
+
+    GOOD_TXID = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    ADDR_BECH32 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    ADDR_BECH32_B = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+    ADDR_BASE58 = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+
+    def setup_method(self):
+        self.parser = CommandParser(bot_name="butterbot")
+
+    def test_inputs_alias_for_commit(self):
+        for verb in ("inputs", "/inputs", "commit", "/commit"):
+            parsed = self.parser.parse(f"{verb} {self.GOOD_TXID}:0")
+            assert parsed.command == "commit_utxos"
+            assert parsed.args[0] == [{"txid": self.GOOD_TXID, "vout": 0}]
+
+    def test_outputs_alias_for_addresses(self):
+        for verb in ("outputs", "/outputs", "addresses", "/addresses"):
+            parsed = self.parser.parse(f"{verb} {self.ADDR_BECH32}")
+            assert parsed.command == "provide_addresses"
+            assert parsed.args[0] == [self.ADDR_BECH32]
+
+    def test_outputs_clear(self):
+        for text in ("outputs clear", "/outputs CLEAR", "addresses clear"):
+            assert self.parser.parse(text).command == "clear_addresses"
+
+    def test_outputs_clear_with_extra_args_is_not_clear(self):
+        # "clear" only as the sole argument — anything else is an address list.
+        parsed = self.parser.parse(f"outputs clear {self.ADDR_BECH32}")
+        assert parsed.command == "provide_addresses"
+
+    def test_bare_utxo_paste(self):
+        parsed = self.parser.parse(f"{self.GOOD_TXID}:0, {self.GOOD_TXID}:1")
+        assert parsed.command == "commit_utxos"
+        assert [u["vout"] for u in parsed.args[0]] == [0, 1]
+
+    def test_bare_address_paste_single(self):
+        parsed = self.parser.parse(self.ADDR_BECH32)
+        assert parsed.command == "provide_addresses"
+        assert parsed.args[0] == [self.ADDR_BECH32]
+
+    def test_bare_address_paste_mixed_separators(self):
+        text = f"{self.ADDR_BECH32}, {self.ADDR_BECH32_B} {self.ADDR_BASE58}"
+        parsed = self.parser.parse(text)
+        assert parsed.command == "provide_addresses"
+        assert parsed.args[0] == [self.ADDR_BECH32, self.ADDR_BECH32_B,
+                                  self.ADDR_BASE58]
+
+    def test_bare_address_paste_ignores_surrounding_words(self):
+        parsed = self.parser.parse(f"my address is {self.ADDR_BECH32}")
+        assert parsed.command == "provide_addresses"
+        assert parsed.args[0] == [self.ADDR_BECH32]
+
+    def test_bare_utxo_wins_over_address_in_same_message(self):
+        parsed = self.parser.parse(f"{self.GOOD_TXID}:0 {self.ADDR_BECH32}")
+        assert parsed.command == "commit_utxos"
+
+    def test_plain_text_still_unknown(self):
+        for text in ("hello there friend",
+                     "what is this bot",
+                     "npub1sn0wdnkukk0lpma0ngsq6sjmfmjewxnsnvy7nptxqgu5dkj5z0hs5rxepl",
+                     "silver-cupcake",
+                     "0.01"):
+            assert self.parser.parse(text).command == "unknown", text
+
+    def test_psbt_hex_blob_not_misrouted(self):
+        # PSBT hex (70736274ff...) must not look like a UTXO or an address.
+        blob = "70736274ff" + "00" * 60
+        assert self.parser.parse(blob).command == "unknown"

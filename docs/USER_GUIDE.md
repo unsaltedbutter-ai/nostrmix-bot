@@ -79,12 +79,18 @@ prompts show the bare form, so this guide does too.
 | `list` (or `open`, `mixes`) | Show open mixes you can join |
 | `join <mix_name>` | Register interest in a specific open mix |
 | `join <amount>` | Join — or start — a mix of that BTC size (e.g. `join 0.01`) |
-| `commit <txid:vout> ...` | Declare the UTXO(s) you'll contribute (may be sent more than once) |
-| `addresses <addr1> <addr2> ...` | Give your fresh output addresses |
+| `inputs <txid:vout> ...` (or `commit`) | Declare the UTXO(s) you'll contribute; repeats **add** to your set |
+| `outputs <addr1> <addr2> ...` (or `addresses`) | Give your fresh payout addresses; they **accumulate** across messages |
+| `outputs clear` | Wipe your address list and start over (the fix for a mis-paste) |
 | `psbt_accept <hex>` | Return your **signed** PSBT |
 | `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large) |
 | `cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
 | `help` (or `commands`, `?`) | Show the commands relevant to where you are right now |
+
+**You usually don't need the `inputs`/`outputs` verbs at all**: a pasted
+`txid:vout` list or a pasted bitcoin address is recognized on its own. Copy from
+your wallet, paste to the bot, done — one address per message is fine; the bot
+keeps a running tally (`2 of 3 address(es) on file`).
 
 If you send something the bot doesn't understand, it replies with a command list
 tuned to your current step.
@@ -152,22 +158,23 @@ echoes the size it created or joined, so a mistyped amount is visible before you
 any coins.
 
 **Start a new mix the lazy way:** you can also skip `join` entirely and just
-**`commit` a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
+**paste a UTXO** (next step) — the bot spins up a fresh default-size mix and puts
 you in it automatically.
 
-> One at a time: finish `commit` **and** `addresses` (and pay, if a fee is
+> One at a time: finish your inputs **and** outputs (and pay, if a fee is
 > charged) for your current mix before joining another.
 
 ---
 
 ## 8. Declare your inputs and outputs
 
-**Commit your UTXO(s)** — `txid:vout`, separated by spaces **or** commas. You can
-send `commit` more than once to add more:
+**Paste your UTXO(s)** — `txid:vout`, separated by spaces **or** commas, no
+command needed (typing `inputs` in front also works). Paste again any time to
+add more:
 
 ```
-commit 4a5f…e1:0 9c2b…7d:1
-commit 4a5f…e1:0, 9c2b…7d:1
+4a5f…e1:0 9c2b…7d:1
+4a5f…e1:0, 9c2b…7d:1
 ```
 
 The bot looks each one up on-chain (must be unspent, confirmed, `p2wpkh`, and
@@ -177,11 +184,14 @@ above the dust floor) and tells you which it accepted or rejected.
 > "output point" column **is** the `txid:vout`. In **Sparrow**, open the *UTXOs*
 > tab — it's the "Transaction Output" value. Copy that string verbatim.
 
-**Send fresh output addresses** — `bc1q…`, separated by spaces **or** commas:
+**Paste fresh payout addresses** — `bc1q…`, again no command needed (or prefix
+with `outputs`). They **accumulate**: one address per message is fine, and the
+bot replies with a running tally (`2 of 3 address(es) on file`) until you've
+sent enough. Pasted a wrong one? `outputs clear` wipes the list to start over.
 
 ```
-addresses bc1qaaa… bc1qbbb… bc1qccc…
-addresses bc1qaaa…, bc1qbbb…, bc1qccc…
+bc1qaaa… bc1qbbb… bc1qccc…
+bc1qaaa…, bc1qbbb…, bc1qccc…
 ```
 
 > **Send one address for every output you'll get, PLUS one extra for change.**
@@ -198,10 +208,10 @@ How many is that, concretely:
 
 If you send too few, the bot won't burn your coins — it turns your last address
 into an (oversized) change output and **warns you** that adding an address would
-mix more and shrink that change. So heed that warning and re-send `addresses`
-with one more. (With only a *single* address and an above-dust leftover, that
-excess is donated or folded into the miner fee — another reason to always include
-a change address.)
+mix more and shrink that change. So heed that warning and just paste one more
+address. (With only a *single* address and an above-dust leftover, that excess
+is donated or folded into the miner fee — another reason to always include a
+change address.)
 
 **Pay the service fee, if any.** It's **off by default** (you'll see "No service
 fee — you're all set"). If the operator enabled one, the bot tells you how many
@@ -305,7 +315,7 @@ outputs are on-chain.
 > Heads-up on the deadline: you have **48h** (default) to return your signature.
 > If you ghost, you're blacklisted and the mix re-forms without you. If *someone
 > else* ghosts after seeing your addresses, the bot discards your addresses for
-> privacy and asks for fresh ones — just send a new `addresses …`.
+> privacy and asks for fresh ones — just paste new addresses.
 
 ---
 
@@ -354,9 +364,11 @@ left of the traceable change is negligible.
 list                                   → see open mixes
 join silver-cupcake                    → join the mix you picked
    (or join 0.01 to join-or-start a mix of that size,
-    or skip join and just commit to auto-start a new mix)
-commit <txid:vout> …                   → register the coins you'll contribute
-addresses bc1q… bc1q… bc1q…            → one per mixed output + one extra for change
+    or skip join — pasting a UTXO auto-starts a new mix)
+<txid:vout> …                          → paste the coins you'll contribute
+bc1q… bc1q… bc1q…                      → paste one address per mixed output
+                                         + one extra for change (tally builds
+                                         across messages; outputs clear resets)
    (pay the zap only if a fee is charged — off by default)
 …bot DMs your fee share + the PSBT…
    → VERIFY it (psbt_decode.py / Sparrow): inputs, outputs (your addrs), fee

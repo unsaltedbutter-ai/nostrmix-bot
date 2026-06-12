@@ -43,6 +43,13 @@ class Database:
         with open(SCHEMA_PATH) as f:
             schema = f.read()
         await self._conn.executescript(schema)
+        # Migrations — executescript only creates MISSING tables, so columns
+        # added to schema.sql after a deployment must be ALTERed in by hand.
+        cur = await self._conn.execute("PRAGMA table_info(participants)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "pending_addresses" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE participants ADD COLUMN pending_addresses TEXT")
         await self._conn.commit()
 
     async def close(self):
@@ -305,11 +312,22 @@ class Database:
             "DELETE FROM outputs WHERE participant_id = ?",
             (participant_id,),
         )
+        # Invariant: outputs cleared ⇒ accumulated address list cleared. Every
+        # "throw away addresses" path (ghost recovery, cancel, refund, clear,
+        # relayout) funnels through here, so the pair can never drift apart.
+        await self._execute(
+            "UPDATE participants SET pending_addresses=NULL WHERE id=?",
+            (participant_id,),
+        )
         await self._conn.commit()
 
     async def delete_outputs_for_mix(self, mix_id: str):
         await self._execute(
             "DELETE FROM outputs WHERE participant_id IN (SELECT id FROM participants WHERE mix_id = ?)",
+            (mix_id,),
+        )
+        await self._execute(
+            "UPDATE participants SET pending_addresses=NULL WHERE mix_id=?",
             (mix_id,),
         )
         await self._conn.commit()

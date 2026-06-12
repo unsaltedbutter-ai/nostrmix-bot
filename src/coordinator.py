@@ -126,6 +126,9 @@ class Coordinator:
                     addrs = parsed.args[0] if parsed.args else []
                     await self._cmd_provide_addresses(ctx, npub_hex, addrs)
 
+                case "clear_addresses":
+                    await self._cmd_clear_addresses(ctx, npub_hex)
+
                 case "accept_psbt":
                     psbt_hex = parsed.args[0] if parsed.args else ""
                     await self._cmd_accept_psbt(ctx, npub_hex, psbt_hex)
@@ -262,7 +265,7 @@ class Coordinator:
         the help text — every command still works regardless of what's listed.
 
         - Not in any mix → list, join
-        - Joined / committed (still assembling their entry) → commit, addresses
+        - Joined / committed (still assembling their entry) → inputs, outputs
         - Signing (PSBT sent) → psbt_accept
         - join is offered again only when nothing is half-finished and the user
           is under MAX_PENDING_MIXES; cancel whenever they're in a mix.
@@ -276,7 +279,7 @@ class Coordinator:
             return cmds
         assembling = bool({"interested", "committed"} & stages)
         if assembling:
-            cmds += ["commit", "addresses"]
+            cmds += ["inputs", "outputs"]
         if "signing" in stages:
             cmds.append("psbt_accept")
         if not assembling:
@@ -421,9 +424,8 @@ class Coordinator:
         await self.nostr.send_dm(
             npub_hex,
             f"{lead}\n"
-            f"Send me txid(s) and vout(s) and your output addresses:\n"
-            f"commit <txid:vout> ...\n"
-            f"addresses <addr1> <addr2> ..."
+            f"Paste your UTXOs (txid:vout), then your payout addresses — "
+            f"no commands needed."
         )
 
     @staticmethod
@@ -521,7 +523,7 @@ class Coordinator:
     async def _cmd_commit_utxos(self, ctx: SenderContext, npub_hex: str, utxos: List[Dict]):
         """Handle /commit <txid:vout> ... — register UTXOs."""
         if not utxos:
-            await self.nostr.send_dm(npub_hex, "No UTXOs found. Format: commit <txid:vout> <txid:vout> ...")
+            await self.nostr.send_dm(npub_hex, "No UTXOs found. Paste txid:vout pairs (no command needed).")
             return
 
         # Find the participant's record
@@ -742,6 +744,7 @@ class Coordinator:
         # Address requirement depends on the conforming/non-conforming split of
         # ALL the participant's committed UTXOs (this commit + any prior ones).
         all_utxos = await self.db.get_utxos_by_participant(pid)
+        all_total = sum(u["amount"] for u in all_utxos)
         conforming_total = sum(1 for u in all_utxos if u["amount"] == output_size)
         has_nc = any(u["amount"] != output_size for u in all_utxos)
         # Required floor: one fresh address per conforming UTXO, plus at least
@@ -749,24 +752,100 @@ class Coordinator:
         # more for change so leftover sats aren't donated unintentionally.
         min_addrs = (conforming_total + 1) if has_nc else max(conforming_total, 1)
         recommended = (conforming_total + 2) if has_nc else max(conforming_total, 1)
+        registered = (
+            f"{len(valid_utxos)} UTXO(s) registered, "
+            f"total {total_sats / 1e8:.4f} BTC."
+        )
+
+        # Addresses may already be on file (a top-up commit after the donation
+        # warning, or a pre-deploy row's stored outputs). If the accumulated
+        # list still covers the new requirement, re-lay out right away so the
+        # stored outputs track the grown input set; otherwise say how many
+        # more to paste.
+        prow = await self.db.get_participant(pid)
+        pending = self._pending_list(prow)
+        if not pending:
+            pending = [o["address"]
+                       for o in await self.db.get_outputs_by_participant(pid)]
+        if (pending and len(pending) >= min_addrs
+                and not (has_nc and all_total < output_size)):
+            await self.nostr.send_dm(npub_hex, registered)
+            mix = await self.db.get_mix(mix_id) or mix
+            await self._layout_outputs_and_quote(
+                npub_hex, pid, mix, pending, already_paid=False)
+            return
+
+        on_file = f" ({len(pending)} on file)" if pending else ""
         guidance = (
-            f"Provide at least {min_addrs} output address(es):\n"
-            f"addresses <addr1> <addr2> ..."
+            f"Now paste at least {min_addrs} payout address(es){on_file} — "
+            f"one or more per message, no command needed."
         )
         if has_nc:
             guidance += (
-                f"\nTip: send one address per mixed output PLUS one for change "
+                f"\nTip: one address per mixed output PLUS one for change "
                 f"(≈{recommended} total). Without a change address, any above-dust "
                 f"leftover is donated."
             )
-        await self.nostr.send_dm(
-            npub_hex,
-            f"{len(valid_utxos)} UTXO(s) registered, total {total_sats / 1e8:.4f} BTC.\n"
-            + guidance
-        )
+        await self.nostr.send_dm(npub_hex, registered + "\n" + guidance)
+
+    # --- Address intake (append-mode) helpers ---
+
+    @staticmethod
+    def _pending_list(prow: Dict) -> List[str]:
+        """Decode a participant row's accumulated payout-address list."""
+        try:
+            lst = json.loads((prow or {}).get("pending_addresses") or "[]")
+            return [a for a in lst if isinstance(a, str)]
+        except Exception:
+            return []
+
+    async def _address_candidates(
+            self, participants: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Split a user's participant rows into (candidates, locked) for
+        address intake.
+
+        Candidates, in priority order:
+          - 'committed' — the normal flow, or re-sending while awaiting a zap
+          - 'paid' with no stored outputs — ghost-recovery resubmission
+          - 'paid' with outputs, NO service fee charged, mix still
+            announced/collecting — append-friendly relayout (e.g. adding a
+            change address after the donation warning). A paid service fee
+            pins the layout it was quoted against, so those stay locked.
+        When either of the first two ("awaiting") exists, only those are
+        returned — an appendable paid row never shadows a mix that actually
+        needs addresses.
+
+        Locked: paid-with-outputs that isn't appendable, plus signing/signed
+        rows — addresses there are frozen.
+        """
+        awaiting, appendable, locked = [], [], []
+        for p in participants:
+            if p["state"] == "committed":
+                awaiting.append(p)
+            elif p["state"] == "paid":
+                outs = await self.db.get_outputs_by_participant(p["id"])
+                if not outs:
+                    awaiting.append(p)
+                else:
+                    pmix = await self.db.get_mix(p["mix_id"])
+                    if (pmix and pmix.get("state") in ("announced", "collecting")
+                            and not (p.get("fee_paid") or 0)):
+                        appendable.append(p)
+                    else:
+                        locked.append(p)
+            elif p["state"] in ("signing", "signed"):
+                locked.append(p)
+        return (awaiting if awaiting else appendable), locked
 
     async def _cmd_provide_addresses(self, ctx: SenderContext, npub_hex: str, addrs: List[str]):
-        """Handle /addresses <addr> ... — register output addresses."""
+        """Handle payout addresses (verb or bare paste) — append-mode intake.
+
+        Addresses ACCUMULATE across messages: mobile wallets hand out receive
+        addresses one at a time, so "copy, paste, switch app, repeat" is the
+        natural rhythm. Below the required count we store the partial list and
+        reply with a tally; at/above it we (re)compute the output layout from
+        the full accumulated list. `outputs clear` starts the list over.
+        """
         if not addrs:
             await self.nostr.send_dm(npub_hex, "Send me at least one output address.")
             return
@@ -793,24 +872,27 @@ class Coordinator:
             )
             return
 
-        # Find the mix this /addresses applies to. Eligible candidates:
-        #   - state='committed' (the normal flow: UTXOs registered, no addresses yet)
-        #   - state='paid' AND no stored outputs (ghost-recovery resubmission)
-        # The one-at-a-time rule in /join means there's at most one 'committed'
-        # row per npub, so the only multi-candidate case is multiple paid mixes
-        # in simultaneous ghost-recovery.
+        # Find the mix these addresses apply to. The one-at-a-time rule in
+        # /join means there's at most one 'committed' row per npub, so the
+        # only multi-candidate case is multiple paid mixes in simultaneous
+        # ghost-recovery.
         participants = await self.db.get_participants_by_npub(npub_hex)
-        candidates = []
-        for p in participants:
-            if p["state"] == "committed":
-                candidates.append(p)
-            elif p["state"] == "paid":
-                outs = await self.db.get_outputs_by_participant(p["id"])
-                if not outs:
-                    candidates.append(p)
+        candidates, locked = await self._address_candidates(participants)
 
         if not candidates:
-            await self.nostr.send_dm(npub_hex, "You haven't committed UTXOs yet. Start with commit")
+            if locked:
+                names = ", ".join(sorted({p["mix_id"] for p in locked}))
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Your addresses for {names} are locked — the mix is "
+                    f"underway and they can't change now.",
+                )
+            else:
+                await self.nostr.send_dm(
+                    npub_hex,
+                    "You haven't committed any inputs yet. Paste your "
+                    "txid:vout list to start.",
+                )
             return
         if len(candidates) > 1:
             names = ", ".join(c["mix_id"] for c in candidates)
@@ -830,9 +912,10 @@ class Coordinator:
             await self.nostr.send_dm(npub_hex, f"Mix {mix_id} not found.")
             return
 
-        # Per-mix output type lock. First /addresses sets it; subsequent must
-        # match. Combined with the allowlist gate above, this prevents mixed-type
-        # outputs from fragmenting the anonymity set.
+        # Per-mix output type lock. The first accepted batch sets it (below);
+        # subsequent batches must match. Combined with the allowlist gate
+        # above, this prevents mixed-type outputs from fragmenting the
+        # anonymity set.
         locked_output_type: Optional[str] = mix.get("output_type")
         if locked_output_type:
             mismatched = []
@@ -853,11 +936,17 @@ class Coordinator:
                 )
                 return
 
-        # Reject duplicate output addresses. Reusing an address (within this
-        # batch, or one already pledged by another participant in the same mix)
-        # collides two outputs into one on-chain — wrecking both the per-output
-        # accounting and the privacy of an equal-output set. Say so plainly
-        # rather than silently de-duping.
+        # Accumulated list so far. Fall back to the stored outputs' addresses
+        # for rows that predate pending_addresses (mid-flight at deploy time).
+        accumulated = self._pending_list(candidates[0])
+        if not accumulated:
+            accumulated = [o["address"]
+                           for o in await self.db.get_outputs_by_participant(pid)]
+
+        # Reject duplicate output addresses within the batch. Reusing an
+        # address collides two outputs into one on-chain — wrecking both the
+        # per-output accounting and the privacy of an equal-output set. Say so
+        # plainly rather than silently de-duping.
         seen_in_batch = set()
         dupes_in_batch = set()
         for a in addrs:
@@ -869,19 +958,32 @@ class Coordinator:
             await self.nostr.send_dm(
                 npub_hex,
                 f"Each output address must be unique. You repeated: {sample}. "
-                f"Re-send addresses with distinct, fresh addresses.",
+                f"Send distinct, fresh addresses.",
             )
             return
 
-        # Addresses already claimed by OTHER participants in this mix. (We're
-        # about to replace THIS participant's own outputs, so theirs don't count.)
+        # Drop addresses already on file rather than erroring — a double-send
+        # of the same paste (easy to do on a phone) should be harmless.
+        on_file = set(accumulated)
+        new_addrs = [a for a in addrs if a not in on_file]
+        if not new_addrs:
+            await self.nostr.send_dm(
+                npub_hex,
+                f"Already have those — {len(accumulated)} address(es) on file "
+                f"for {mix_id}.",
+            )
+            return
+
+        # Addresses already claimed by OTHER participants in this mix. (This
+        # participant's own layout is recomputed from the accumulated list, so
+        # their own stored outputs don't count.)
         others_addrs = set()
         for other in await self.db.get_participants_by_mix(mix_id):
             if other["id"] == pid:
                 continue
             for o in await self.db.get_outputs_by_participant(other["id"]):
                 others_addrs.add(o["address"])
-        clash = [a for a in addrs if a in others_addrs]
+        clash = [a for a in new_addrs if a in others_addrs]
         if clash:
             sample = ", ".join(sorted(set(clash))[:3])
             await self.nostr.send_dm(
@@ -891,39 +993,113 @@ class Coordinator:
             )
             return
 
-        # Get participant's UTXOs and classify against the mix's output size.
+        combined = accumulated + new_addrs
+
+        # First accepted batch sets the per-mix output-type lock — at intake,
+        # not layout, so a partial submission pins the type for everyone too.
+        if not locked_output_type:
+            try:
+                first_type = self.psbt_mgr._address_type(new_addrs[0])
+                await self.db.update_mix(mix_id, output_type=first_type)
+            except Exception:
+                pass  # allowlist already validated parseability; best-effort
+
+        # Classify the participant's UTXOs against the mix's output size.
         output_size = mix["output_size"]
         utxos = await self.db.get_utxos_by_participant(pid)
         total_sats = sum(u["amount"] for u in utxos)
         conforming_count = sum(1 for u in utxos if u["amount"] == output_size)
-        num_nc_inputs = sum(1 for u in utxos if u["amount"] != output_size)
-        is_nc = num_nc_inputs > 0
-        nc_total = sum(u["amount"] for u in utxos if u["amount"] != output_size)
+        is_nc = any(u["amount"] != output_size for u in utxos)
 
         # Address-count rule: one fresh address per conforming UTXO, plus at
         # least one for a non-conforming participant's equal output. A change
         # address is OPTIONAL — if omitted, any above-dust leftover is donated
         # (and the user is warned) rather than blocking the join.
         min_addrs = (conforming_count + 1) if is_nc else max(conforming_count, 1)
-        if len(addrs) < min_addrs:
+
+        # Non-conforming participants must bring enough to fund at least one
+        # full equal output (Q4: total inputs >= output_size). Keep the
+        # addresses — they're fine — but point at the real blocker.
+        if is_nc and total_sats < output_size:
+            await self.db.update_participant(
+                pid, pending_addresses=json.dumps(combined))
             await self.nostr.send_dm(
                 npub_hex,
-                f"This commit needs at least {min_addrs} output address(es) "
-                f"({conforming_count} conforming UTXO(s)"
-                + (" + an equal output" if is_nc else "")
-                + f"). You sent {len(addrs)}.",
+                f"{len(combined)} address(es) on file. But your inputs total "
+                f"{total_sats} sats, below one {output_size}-sat output — "
+                f"paste more inputs (txid:vout) first.",
             )
             return
 
-        # Non-conforming participants must bring enough to fund at least one
-        # full equal output (Q4: total inputs >= output_size).
-        if is_nc and total_sats < output_size:
+        # Partial set: store it and reply with a tally instead of an error —
+        # the next paste keeps building the same list.
+        if len(combined) < min_addrs:
+            await self.db.update_participant(
+                pid, pending_addresses=json.dumps(combined))
             await self.nostr.send_dm(
                 npub_hex,
-                f"Your inputs total {total_sats} sats, below one {output_size}-sat "
-                f"output. Commit more before joining as a mixer.",
+                f"{len(combined)} of {min_addrs} address(es) on file — paste "
+                f"{min_addrs - len(combined)} more. (outputs clear starts over.)",
             )
             return
+
+        await self._layout_outputs_and_quote(npub_hex, pid, mix, combined,
+                                             already_paid)
+
+    async def _cmd_clear_addresses(self, ctx: SenderContext, npub_hex: str):
+        """Handle `outputs clear` — wipe the accumulated/stored addresses so
+        the list can be rebuilt from scratch. This is the fix path for a
+        mis-pasted address, since intake otherwise only appends."""
+        participants = await self.db.get_participants_by_npub(npub_hex)
+        candidates, locked = await self._address_candidates(participants)
+        if not candidates:
+            if locked:
+                names = ", ".join(sorted({p["mix_id"] for p in locked}))
+                await self.nostr.send_dm(
+                    npub_hex,
+                    f"Your addresses for {names} are locked — the mix is "
+                    f"underway and they can't change now.",
+                )
+            else:
+                await self.nostr.send_dm(npub_hex, "No addresses on file.")
+            return
+        if len(candidates) > 1:
+            names = ", ".join(c["mix_id"] for c in candidates)
+            await self.nostr.send_dm(
+                npub_hex,
+                f"You're awaiting addresses in multiple mixes: {names}. "
+                f"Please cancel one before clearing addresses for the other.",
+            )
+            return
+        p = candidates[0]
+        had = len(self._pending_list(p)) or len(
+            await self.db.get_outputs_by_participant(p["id"]))
+        if not had:
+            await self.nostr.send_dm(npub_hex, "No addresses on file.")
+            return
+        await self.db.delete_outputs_by_participant(p["id"])
+        await self.nostr.send_dm(
+            npub_hex,
+            f"Cleared {had} address(es) for {p['mix_id']}. Paste fresh ones "
+            f"when ready.",
+        )
+
+    async def _layout_outputs_and_quote(self, npub_hex: str, pid: str,
+                                        mix: Dict, addrs: List[str],
+                                        already_paid: bool):
+        """(Re)compute a participant's output layout from their full
+        accumulated address list, store it, and send the summary / fee-quote
+        DM. The accumulated list is canonical: any previous layout is wiped
+        and rebuilt, so re-running with one more address yields the grown
+        layout — never a doubled one (C3).
+        """
+        mix_id = mix["id"]
+        output_size = mix["output_size"]
+        utxos = await self.db.get_utxos_by_participant(pid)
+        conforming_count = sum(1 for u in utxos if u["amount"] == output_size)
+        num_nc_inputs = sum(1 for u in utxos if u["amount"] != output_size)
+        is_nc = num_nc_inputs > 0
+        nc_total = sum(u["amount"] for u in utxos if u["amount"] != output_size)
 
         # Preliminary non-conforming output layout (real miner fee is unknown
         # until assembly, so estimate with fee_share=0 — the maximum equal-output
@@ -952,14 +1128,11 @@ class Coordinator:
             fee_per_element=mix.get("fee_per_element"),
         )
 
-        # /addresses is replace-not-append: clear any outputs already on file
-        # for this participant before storing the new set. This covers BOTH a
-        # ghost-recovery resubmission (state 'paid') AND a fee-charged
-        # participant who is still 'committed' (they have stored outputs from a
-        # prior /addresses while awaiting their zap) re-sending a new list — e.g.
-        # after we prompted them to add a change address. Without this the
-        # outputs doubled, inflating the expected zap fee past what we quoted so
-        # the user could never pay it. (C3)
+        # Wipe the previous layout and rebuild from the full accumulated list
+        # (delete_outputs_by_participant also clears pending_addresses; it's
+        # re-stored with the state update below). Recomputing from the list —
+        # never appending to stored outputs — is what keeps the quoted zap fee
+        # in sync with the layout. (C3)
         await self.db.delete_outputs_by_participant(pid)
 
         # Lay out in order: conforming pass-throughs, then NC equal outputs, then
@@ -991,8 +1164,7 @@ class Coordinator:
         if will_donate:
             donation_note = (
                 f"\n⚠️ ~{chg_amt} sats of change will be DONATED — you didn't include "
-                f"a change address. Re-send addresses with {len(addrs) + 1} addresses "
-                f"(one extra) to keep it."
+                f"a change address. Paste 1 more address to keep it."
             )
         # Warn when the no-burn rule had to sacrifice a mixed output because the
         # participant is address-constrained: they have a spare-address change
@@ -1008,10 +1180,10 @@ class Coordinator:
             ideal_addrs = potential_mixed + 1  # one per mixed output + one change
             potential_change = nc_total - funds_max_equal * output_size
             undermix_note = (
-                f"\n⚠️ You sent {len(addrs)} address(es), so you'll mix {total_equal} "
+                f"\n⚠️ You have {len(addrs)} address(es) on file, so you'll mix {total_equal} "
                 f"output(s) and receive {chg_amt} sats of change — larger than the "
-                f"{output_size}-sat mix size, and easy to trace. Re-send addresses "
-                f"with {ideal_addrs} ({ideal_addrs - len(addrs)} more) to mix "
+                f"{output_size}-sat mix size, and easy to trace. Paste "
+                f"{ideal_addrs - len(addrs)} more to mix "
                 f"{potential_mixed} output(s) and shrink your change to ~{potential_change} sats."
             )
         notes = donation_note + undermix_note
@@ -1032,15 +1204,10 @@ class Coordinator:
                 npub_hex,
                 summary + notes + f"\nPay {service_fee} sats (service fee) via zap to {self.cfg.BOT_LUD16}.",
             )
-        await self.db.update_participant(pid, state=new_state, change_amount=chg_amt)
+        await self.db.update_participant(
+            pid, state=new_state, change_amount=chg_amt,
+            pending_addresses=json.dumps(addrs))
 
-        # Set the mix-level output lock if this was the first /addresses.
-        if not locked_output_type and addrs:
-            try:
-                first_type = self.psbt_mgr._address_type(addrs[0])
-                await self.db.update_mix(mix_id, output_type=first_type)
-            except Exception:
-                pass  # allowlist already validated parseability; best-effort
         # Move mix to collecting if not already; set deadline if unset
         if mix["state"] == "announced":
             deadline = mix.get("deadline_unix")
@@ -2197,7 +2364,7 @@ class Coordinator:
             await self.nostr.send_dm(
                 p["npub_hex"],
                 f"Your share of the miner fee: {share} sats "
-                f"(~{share / 1e8:.8f} BTC). "
+                f"(~{share / 1e8:.8f} BTC) at {fee_rate:g} sat/vB. "
                 + ("Conforming UTXOs pass through free." if share == 0
                    else "The PSBT to review and sign follows."),
             )

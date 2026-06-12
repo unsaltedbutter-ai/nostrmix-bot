@@ -375,11 +375,12 @@ class TestProvideAddressesPaidState:
             await db.close()
 
     @pytest.mark.asyncio
-    async def test_committed_resubmit_replaces_not_appends(self):
-        """C3: a fee-charged participant stays 'committed' with outputs stored,
-        then re-sends /addresses (e.g. after we asked for a change address).
-        The new set must REPLACE the old — appending doubled the outputs and
-        inflated the expected zap past what we quoted, making it unpayable."""
+    async def test_committed_resubmit_appends_without_doubling_layout(self):
+        """C3 (append era): a fee-charged participant stays 'committed' with
+        outputs stored, then sends MORE addresses. The layout is recomputed
+        from the full accumulated list — funds still bound the output count,
+        so the quoted zap stays in sync and never doubles. A wrong address is
+        fixed via `outputs clear` + re-paste, not by re-sending the list."""
         coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
             mix_id = await db.create_mix(output_size=1_000_000, fee_per_element=100)
@@ -390,13 +391,24 @@ class TestProvideAddressesPaidState:
 
             await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
             first = await db.get_outputs_by_participant(pid)
-            # Re-send a different set of the same size.
+            # Send three more — they accumulate as spares.
             await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[3:6])
             second = await db.get_outputs_by_participant(pid)
 
-            assert len(second) == len(first), "outputs were appended, not replaced"
-            # The stored addresses are the NEW set, not a mix of both.
-            stored = {o["address"] for o in second}
+            # 2.5M sats into 1M outputs → 2 equal + change; extra addresses
+            # can't mint more outputs, so the layout must not grow.
+            assert len(second) == len(first), "outputs doubled on resubmit"
+            # The earlier addresses still anchor the layout (list order).
+            assert ({o["address"] for o in second}
+                    == {o["address"] for o in first})
+
+            # Fix path: clear, then paste the corrected set.
+            await coord._cmd_clear_addresses(FakeCtx(npub), npub)
+            assert await db.get_outputs_by_participant(pid) == []
+            assert "cleared" in nostr.sent_dms[-1][1].lower()
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[3:6])
+            third = await db.get_outputs_by_participant(pid)
+            stored = {o["address"] for o in third}
             assert stored <= set(P2WPKH_ADDRS[3:6])
             assert stored.isdisjoint(set(P2WPKH_ADDRS[0:3]))
         finally:
@@ -1053,6 +1065,10 @@ class TestAssemblePsbt:
             # Each participant has a psbt_round row.
             rounds = await db.get_psbt_rounds_by_mix(mix_id)
             assert len(rounds) == 3
+
+            # The fee-disclosure DM states the rate, not just the share.
+            fee_dms = [m for _, m in nostr.sent_dms if "miner fee" in m]
+            assert fee_dms and all("sat/vB" in m for m in fee_dms)
         finally:
             await db.close()
 
@@ -3514,9 +3530,15 @@ class TestConformingModel:
             await db.add_utxo(pid, TXID[3], 1, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
             await db.update_participant(pid, state="committed")
 
+            # First address is STORED (append-mode) and tallied, not rejected.
             await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
-            assert "at least 2" in nostr.sent_dms[-1][1].lower()
+            assert "1 of 2" in nostr.sent_dms[-1][1].lower()
             assert (await db.get_participant(pid))["state"] == "committed"
+            # The second paste completes the set.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[1]])
+            assert (await db.get_participant(pid))["state"] == "paid"
+            outs = await db.get_outputs_by_participant(pid)
+            assert sorted(o["address"] for o in outs) == sorted(P2WPKH_ADDRS[0:2])
         finally:
             await db.close()
 
@@ -3710,9 +3732,9 @@ class TestConformingModelGaps:
                 (TXID[0], 1, 2_500_000),   # non-conforming
             ])
             # Floor is conforming(1) + 1 = 2 (change address optional). Give
-            # only 1 → rejected, stays committed.
+            # only 1 → stored with a tally, stays committed.
             await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
-            assert "at least 2" in nostr.sent_dms[-1][1].lower()
+            assert "1 of 2" in nostr.sent_dms[-1][1].lower()
             assert (await db.get_participant(pid))["state"] == "committed"
         finally:
             await db.close()
@@ -3739,7 +3761,7 @@ class TestConformingModelGaps:
             await self._commit(coord, chain, "donA", [(TXID[0], 0, 2_500_000)])
             await coord._cmd_provide_addresses(FakeCtx("donA"), "donA", [P2WPKH_ADDRS[0]])
             warn = nostr.sent_dms[-1][1].lower()
-            assert "donated" in warn and "re-send addresses" in warn
+            assert "donated" in warn and "paste 1 more address" in warn
             assert (await db.get_participant(a))["state"] == "paid"
             # Only the equal output is stored — the donation is added at assembly.
             outs = await db.get_outputs_by_participant(a)
@@ -3872,10 +3894,9 @@ class TestConformingModelGaps:
                 FakeCtx("ucA"), "ucA", P2WPKH_ADDRS[0:2])
             msg = nostr.sent_dms[-1][1].lower()
             assert "donated" not in msg          # nothing is donated
-            assert "re-send addresses" in msg
             assert "easy to trace" in msg
-            # Suggests 4 addresses (3 mixed + 1 change), i.e. 2 more.
-            assert "with 4" in msg and "2 more" in msg
+            # Suggests pasting 2 more (3 mixed + 1 change = 4 total).
+            assert "paste 2 more" in msg and "mix 3 output(s)" in msg
             # And it actually kept all the sats as change (no burn).
             outs = sorted(o["amount"] for o in await db.get_outputs_by_participant(a))
             assert outs == [1_000_000, 2_500_000]
@@ -4950,7 +4971,7 @@ class TestStageAwareHelp:
             npub = "npub_interested"
             await db.add_participant(mix_id, npub, "")  # default 'interested'
             cmds = await coord._relevant_commands(npub)
-            assert "commit" in cmds and "addresses" in cmds and "cancel" in cmds
+            assert "inputs" in cmds and "outputs" in cmds and "cancel" in cmds
             assert "psbt_accept" not in cmds
             assert "join" not in cmds  # half-finished → don't invite another mix
         finally:
@@ -4992,5 +5013,143 @@ class TestFeeRateStoredAsFloat:
             await db.update_mix(mix_id, fee_rate=1.5)
             m = await db.get_mix(mix_id)
             assert m["fee_rate"] == 1.5
+        finally:
+            await db.close()
+
+
+# --- Append-mode address intake (tally, double-send, lock, clear, relayout) ---
+
+
+class TestAppendModeAddressIntake:
+    """Addresses accumulate across messages (phone wallets hand them out one
+    at a time). Partial sets tally instead of erroring; double-sends are
+    harmless; `outputs clear` restarts the list; a no-fee paid participant can
+    still append while the mix is collecting; a top-up commit re-lays out from
+    the accumulated list."""
+
+    async def _interested(self, db, mix_id, npub):
+        return await db.add_participant(mix_id, npub, f"{npub}@x")
+
+    async def _commit(self, coord, chain, npub, utxos):
+        for (txid, vout, amt) in utxos:
+            chain.txouts[f"{txid}:{vout}"] = _fake_txout(amt)
+        await coord._cmd_commit_utxos(
+            FakeCtx(npub), npub,
+            [{"txid": t, "vout": v} for (t, v, _a) in utxos],
+        )
+
+    @pytest.mark.asyncio
+    async def test_double_paste_same_address_is_harmless(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000,
+                                         max_conforming_utxos=5)
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_double"
+            pid = await self._interested(db, mix_id, npub)
+            await db.add_utxo(pid, TXID[3], 0, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_utxo(pid, TXID[3], 1, 1_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+            assert "1 of 2" in nostr.sent_dms[-1][1].lower()
+            # Same paste again — absorbed, not an error, nothing laid out.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+            assert "already have those" in nostr.sent_dms[-1][1].lower()
+            assert await db.get_outputs_by_participant(pid) == []
+            assert (await db.get_participant(pid))["state"] == "committed"
+            # A genuinely new address completes the set.
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[1]])
+            assert (await db.get_participant(pid))["state"] == "paid"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fee_paid_layout_is_locked(self):
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000,
+                                         fee_per_element=100)
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_lockedfee"
+            pid = await self._interested(db, mix_id, npub)
+            await db.add_utxo(pid, TXID[0], 0, 2_500_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.add_output(pid, P2WPKH_ADDRS[0], 1_000_000)
+            await db.update_participant(pid, state="paid", fee_paid=500)
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[1]])
+            assert "locked" in nostr.sent_dms[-1][1].lower()
+            outs = await db.get_outputs_by_participant(pid)
+            assert [o["address"] for o in outs] == [P2WPKH_ADDRS[0]]
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_donation_warning_fixed_by_pasting_one_more(self):
+        """The donation warning's own advice must work: a no-fee participant
+        who is already 'paid' with a layout can paste one more address while
+        the mix is collecting, and the leftover becomes their change."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000,
+                                         required_nonconforming=2)
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_fixdon"
+            await self._interested(db, mix_id, npub)
+            await self._commit(coord, chain, npub, [(TXID[0], 0, 2_500_000)])
+            pid = (await db.get_participants_by_npub(npub))[0]["id"]
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[0]])
+            assert "donated" in nostr.sent_dms[-1][1].lower()
+            assert (await db.get_participant(pid))["state"] == "paid"
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, [P2WPKH_ADDRS[1]])
+            outs = await db.get_outputs_by_participant(pid)
+            assert sum(o["amount"] for o in outs) == 2_500_000
+            assert any(o["is_change"] for o in outs)
+            assert (await db.get_participant(pid))["state"] == "paid"
+            assert "donated" not in nostr.sent_dms[-1][1].lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_topup_commit_relayouts_from_accumulated_list(self):
+        """A committed (awaiting-zap) participant who commits MORE inputs gets
+        their layout and zap quote recomputed from the addresses already on
+        file — no need to re-send them."""
+        coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000,
+                                         fee_per_element=100)
+            await db.update_mix(mix_id, state="collecting")
+            npub = "npub_topup"
+            await self._interested(db, mix_id, npub)
+            await self._commit(coord, chain, npub, [(TXID[0], 0, 2_500_000)])
+            pid = (await db.get_participants_by_npub(npub))[0]["id"]
+
+            await coord._cmd_provide_addresses(FakeCtx(npub), npub, P2WPKH_ADDRS[0:3])
+            assert "zap" in nostr.sent_dms[-1][1].lower()
+            assert (await db.get_participant(pid))["state"] == "committed"
+
+            await self._commit(coord, chain, npub, [(TXID[0], 1, 1_500_000)])
+            outs = await db.get_outputs_by_participant(pid)
+            assert sum(o["amount"] for o in outs) == 4_000_000
+            assert "zap" in nostr.sent_dms[-1][1].lower()
+            # Quote tracks the grown layout: 2 NC inputs + 3 outputs @ 100.
+            assert "pay 500 sats" in nostr.sent_dms[-1][1].lower()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_clear_with_nothing_on_file(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            npub = "npub_emptyclear"
+            pid = await self._interested(db, mix_id, npub)
+            await db.add_utxo(pid, TXID[2], 0, 2_000_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+            await coord._cmd_clear_addresses(FakeCtx(npub), npub)
+            assert "no addresses on file" in nostr.sent_dms[-1][1].lower()
         finally:
             await db.close()

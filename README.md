@@ -209,7 +209,7 @@ Participant (Nostr DM)
        ↓
 NostrHandler (NIP-17 DMs, NIP-57 zaps, daily announcements)
        ↓
-CommandParser (list, join, commit, addresses, psbt_accept, cancel)
+CommandParser (list, join, inputs, outputs, psbt_accept, cancel)
        ↓
 Coordinator (state machine, event loop)
        ↓
@@ -248,21 +248,32 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 Commands are matched case-insensitively, and the leading `/` is optional —
 `join 0.01` and `/join 0.01` both work (the bot's prompts show the bare form).
 
+**Bare paste:** `txid:vout` pairs and bitcoin addresses are recognized without a
+command — pasting them straight from a wallet is enough. The `inputs`/`outputs`
+verbs exist mainly for the help text.
+
 - `list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
   a default one (`DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`) and lists
   it, so there's always something to join.
 - `help` (or `commands`, `?`) — show the commands relevant to your current stage
-  (e.g. `commit` while gathering, `psbt_accept` while signing). Every command
+  (e.g. `inputs` while gathering, `psbt_accept` while signing). Every command
   still works regardless of what's listed; this only tunes the guidance.
 - `join <mix_name>` — join a mix by name; or `join <amount>` (e.g. `join 0.01`)
   to join an open mix of that BTC output size, or create one if none exists
-- `commit <txid:vout> ...` — register UTXOs (may be sent more than once)
-- `addresses <addr1> <addr2> ...` — provide output addresses (one per conforming
-  UTXO; non-conforming participants need ≥1 more for an equal output, plus one more
-  to receive change. The address count caps your outputs: if you supply too few,
-  the bot turns your last address into an (oversized) change output rather than
-  burning the leftover — so you get fewer mixed outputs but keep the sats. Only
-  with a single address and an above-dust leftover is that excess donated/folded.)
+- `inputs <txid:vout> ...` (alias `commit`) — register UTXOs. Sent more than
+  once, the new outpoints are **added** to your set.
+- `outputs <addr1> <addr2> ...` (alias `addresses`) — provide payout addresses,
+  one or more per message; they **accumulate** until you've sent enough (the bot
+  replies with a running tally, e.g. `2 of 3 address(es) on file`). You need one
+  per conforming UTXO; non-conforming participants need ≥1 more for an equal
+  output, plus one more to receive change. The address count caps your outputs:
+  if you supply too few, the bot turns your last address into an (oversized)
+  change output rather than burning the leftover — so you get fewer mixed
+  outputs but keep the sats. Only with a single address and an above-dust
+  leftover is that excess donated/folded.
+- `outputs clear` — wipe your accumulated/stored addresses and start the list
+  over (the fix for a mis-pasted address). Addresses lock once your mix starts
+  assembling, or once you've paid a service fee quoted against them.
 - `psbt_accept <hex>` — return a signed PSBT (or `psbt_chunk <i>/<n> <hex>` for
   large PSBTs)
 - `cancel [mix_name]` — exit a mix (auto-detects when you're in exactly one)

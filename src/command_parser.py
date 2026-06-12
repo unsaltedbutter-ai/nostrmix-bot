@@ -31,6 +31,19 @@ UTXO_PATTERN = re.compile(r'([a-fA-F0-9]{64}):(\d+)')
 # a name — the match unambiguously means "join/create a mix of this size".
 AMOUNT_PATTERN = re.compile(r'^\d+(\.\d+)?$|^\.\d+$')
 
+# Bitcoin-address shapes, for routing a bare paste (no command verb) to
+# provide_addresses. Routing only — the coordinator does the real validation.
+# Nothing else in the grammar collides: mix names are word-word, amounts are
+# bare digits, PSBT hex starts 70736274ff, npubs/invoices start npub1/lnbc1.
+BECH32_ADDR_PATTERN = re.compile(r'^(?:bc1|tb1|bcrt1)[02-9ac-hj-np-z]{8,87}$')
+BASE58_ADDR_PATTERN = re.compile(r'^[13][1-9A-HJ-NP-Za-km-z]{25,34}$')
+
+
+def _looks_like_address(token: str) -> bool:
+    # bech32 is case-insensitive (lowercase canonical); base58 is not.
+    return bool(BECH32_ADDR_PATTERN.match(token.lower())
+                or BASE58_ADDR_PATTERN.match(token))
+
 
 class CommandParser:
     """Parse incoming DM text into structured commands.
@@ -38,11 +51,16 @@ class CommandParser:
     Recognized commands:
     - /list or list → list_mixes
     - join <mix_id> <num_outputs> → join_mix
-    - /commit <txid:vout> ... → commit_utxos
-    - /addresses <addr> ... → provide_addresses
+    - /inputs (alias /commit) <txid:vout> ... → commit_utxos
+    - /outputs (alias /addresses) <addr> ... → provide_addresses
+    - /outputs clear → clear_addresses
     - /psbt_accept <hex> → accept_psbt
     - /cancel or exit [mix_id] → exit_mix
     - /psbt_chunk <chunk_idx>/<total> <hex> → accept_psbt_chunk
+
+    A message with no verb that contains txid:vout pairs or bitcoin
+    addresses routes to commit_utxos / provide_addresses respectively —
+    pasting the data is enough.
     """
 
     def __init__(self, bot_name: str = "butterbot"):
@@ -92,18 +110,21 @@ class CommandParser:
                 return ParsedCommand("join_mix", [mix_id, alt, None], raw)
             return ParsedCommand("join_mix", [], raw)
 
-        # -- COMMIT UTXOS --
-        if cmd == "commit":
+        # -- INPUTS (alias: COMMIT) --
+        if cmd in ("inputs", "commit"):
             # Find every txid:vout pair regardless of separator — spaces, commas,
             # or ", " (a wallet "copy all"). finditer ignores whatever sits
-            # between matches, so all forms parse the same. (The "/commit" word
+            # between matches, so all forms parse the same. (The verb word
             # itself can't match a 64-hex:vout pattern.)
             utxos = [{"txid": m.group(1).lower(), "vout": int(m.group(2))}
                      for m in UTXO_PATTERN.finditer(raw)]
             return ParsedCommand("commit_utxos", [utxos], raw)
 
-        # -- ADDRESSES --
-        if cmd == "addresses":
+        # -- OUTPUTS (alias: ADDRESSES) --
+        if cmd in ("outputs", "addresses"):
+            # "outputs clear" — wipe the accumulated address list and start over.
+            if len(args) == 1 and args[0].lower() == "clear":
+                return ParsedCommand("clear_addresses", [], raw)
             # Accept addresses separated by spaces and/or commas — a wallet
             # "copy all" often joins them with ", ".
             addrs = []
@@ -141,6 +162,24 @@ class CommandParser:
                 mix_id = None
             return ParsedCommand("exit_mix", [mix_id], raw)
 
+        # -- BARE PASTE — data with no verb. txid:vout pairs and bitcoin
+        # addresses are shape-unambiguous in this grammar (see the address
+        # patterns above), so pasting them straight from a wallet works
+        # without typing a command first. Non-matching tokens are ignored,
+        # same as the verb forms.
+        utxos = [{"txid": m.group(1).lower(), "vout": int(m.group(2))}
+                 for m in UTXO_PATTERN.finditer(raw)]
+        if utxos:
+            return ParsedCommand("commit_utxos", [utxos], raw)
+        addrs = []
+        for tok in parts:
+            for a in tok.split(","):
+                a = a.strip()
+                if a and _looks_like_address(a):
+                    addrs.append(a)
+        if addrs:
+            return ParsedCommand("provide_addresses", [addrs], raw)
+
         # -- Unknown --
         return ParsedCommand("unknown", [raw], raw)
 
@@ -168,8 +207,8 @@ class CommandParser:
     _HELP_CATALOG = [
         ("list", "list — open mixes"),
         ("join", "join <mix> — join (or join 0.01)"),
-        ("commit", "commit <txid:vout> … — add UTXOs"),
-        ("addresses", "addresses <addr> … — payout addrs"),
+        ("inputs", "inputs <txid:vout> … — add UTXOs (or just paste them)"),
+        ("outputs", "outputs <addr> … — payout addresses (or just paste them)"),
         ("psbt_accept", "psbt_accept <hex> — return signed PSBT"),
         ("cancel", "cancel — leave"),
     ]
@@ -227,7 +266,7 @@ class CommandParser:
         return (
             f"Someone ghosted us during the signing phase and saw your addresses. "
             f"To insure your privacy, we've thrown out your addresses.\n"
-            f"Reply with new ones:\naddresses <addr1> <addr2> ..."
+            f"Reply with new ones — just paste fresh addresses."
         )
 
     def format_refund(self, amount_sats: int, reason: str = "") -> str:
