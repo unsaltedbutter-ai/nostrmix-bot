@@ -4853,6 +4853,59 @@ class TestJoinUnknownNameIsHelpful:
             await db.close()
 
 
+class TestEmptyMixHoldAndFillWindow:
+    """Empty mixes are held open for a long window (so a morning-announced mix
+    is still joinable that night), and joining (re)starts the fill window so a
+    late joiner to a long-held mix isn't insta-cancelled by a stale deadline."""
+
+    @pytest.mark.asyncio
+    async def test_empty_collecting_mix_held_past_its_deadline(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            # Stale deadline, but freshly created and ZERO participants.
+            await db.update_mix(mix_id, state="collecting",
+                                deadline_unix=int(time.time()) - 100)
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert await db.get_mix(mix_id) is not None  # held, not cancelled
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_empty_mix_retired_after_expiry_window(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            old = int(time.time()) - (coord.cfg.EMPTY_MIX_EXPIRY_HOURS * 3600 + 100)
+            await db.update_mix(mix_id, state="collecting", created_at_unix=old,
+                                deadline_unix=int(time.time()) - 100)
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert await db.get_mix(mix_id) is None  # retired after idle window
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_join_restarts_fill_window_late_joiner_not_cancelled(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=1_000_000)
+            # An old, held-open empty mix whose creation-time deadline is stale.
+            await db.update_mix(mix_id, state="collecting",
+                                deadline_unix=int(time.time()) - 100)
+            await coord._cmd_join_mix(FakeCtx("npub_late"), mix_id, None, None)
+            mix = await db.get_mix(mix_id)
+            # Fill window restarted to ~now + FILL_DEADLINE_HOURS.
+            assert mix["deadline_unix"] > int(time.time()) + \
+                (coord.cfg.FILL_DEADLINE_HOURS - 1) * 3600
+            # A tick must NOT insta-cancel the fresh joiner.
+            await coord._process_mix(await db.get_mix(mix_id), int(time.time()))
+            assert await db.get_mix(mix_id) is not None
+            parts = await db.get_participants_by_npub("npub_late")
+            assert parts and parts[0]["state"] == "interested"
+        finally:
+            await db.close()
+
+
 class TestStageAwareHelp:
     """The /help command list is tuned to where the user is. Tuning only the
     guidance — every command still works regardless of what's shown."""

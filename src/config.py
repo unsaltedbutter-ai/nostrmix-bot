@@ -58,6 +58,18 @@ _DEFAULTS = {
     "MAX_OPEN_MIXES": 10,
     "SIGNING_DEADLINE_HOURS": 48,
     "PAY_DEADLINE_HOURS": 12,
+    # How long a mix with ZERO participants stays open before it's retired.
+    # A mix announced in the morning should still be joinable that night / for
+    # days. Default 7 days.
+    "EMPTY_MIX_EXPIRY_HOURS": 168,
+    # Once a mix HAS participants but hasn't reached its non-conforming target,
+    # how long it keeps collecting before it cancels + refunds (freeing the
+    # joined participants' committed UTXOs). Refreshed each time a new
+    # participant joins. Long by default because gathering is slow on a small,
+    # not-yet-popular bot; shorten as traffic grows. Distinct from
+    # PAY_DEADLINE_HOURS, which is only the per-participant pay-after-commit
+    # deadline. Default 7 days.
+    "FILL_DEADLINE_HOURS": 168,
     "MAX_GHOST_RETRIES": 3,
     "MINIMUM_UTXO_SIZE": 10000,
 
@@ -355,6 +367,14 @@ class BotConfig:
     @property
     def PAY_DEADLINE_HOURS(self) -> int:
         return self._values["PAY_DEADLINE_HOURS"]
+
+    @property
+    def EMPTY_MIX_EXPIRY_HOURS(self) -> int:
+        return self._values["EMPTY_MIX_EXPIRY_HOURS"]
+
+    @property
+    def FILL_DEADLINE_HOURS(self) -> int:
+        return self._values["FILL_DEADLINE_HOURS"]
 
     @property
     def MAX_GHOST_RETRIES(self) -> int:

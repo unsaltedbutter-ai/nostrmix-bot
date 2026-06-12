@@ -202,8 +202,13 @@ class Coordinator:
         """Create a fresh mix with DEFAULT_* settings, set it collecting, and
         return its id. input_type is left NULL — it locks at the first /commit.
         Shared by /list, the /commit auto-create, and the daily announcement so
-        "open a default mix when none exist" lives in exactly one place."""
-        deadline_unix = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        "open a default mix when none exist" lives in exactly one place.
+
+        The mix is born empty, so its deadline doesn't matter yet — the empty
+        mix is held by age (EMPTY_MIX_EXPIRY_HOURS) and the fill window is
+        (re)started the moment someone joins (_start_fill_window). We still set
+        a sane FILL_DEADLINE_HOURS deadline for tidiness."""
+        deadline_unix = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
         mid = await self.db.create_mix(
             output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
             max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
@@ -214,6 +219,18 @@ class Coordinator:
         )
         await self.db.update_mix(mid, state="collecting")
         return mid
+
+    async def _start_fill_window(self, mix_id: str):
+        """A participant just joined — (re)start the collecting fill window so
+        the mix has FILL_DEADLINE_HOURS to reach its target. Essential because
+        an empty mix can sit open for days: without this, a late joiner would
+        inherit the mix's stale creation-time deadline and be cancelled almost
+        immediately. Refreshing on each join also gives a trickle of joiners
+        the full window from the most recent one."""
+        await self.db.update_mix(
+            mix_id,
+            deadline_unix=int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600,
+        )
 
     async def _cmd_list_mixes(self, ctx: SenderContext):
         """Handle /list — show open mixes. If none are open, open a default one
@@ -391,6 +408,8 @@ class Coordinator:
 
         # Add participant as 'interested'
         pid = await self.db.add_participant(mix_id, npub_hex, lud16)
+        # Someone's gathering now — start/refresh the fill window.
+        await self._start_fill_window(mix_id)
 
         # Reply asking for UTXOs and addresses. For an amount-join, lead with
         # the created/joined size so a mistyped amount is visible before funds.
@@ -448,7 +467,7 @@ class Coordinator:
         # None compatible — spin up a fresh mix unless we're at the open cap.
         if len(open_mixes) >= self.cfg.MAX_OPEN_MIXES:
             return None, False
-        deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        deadline = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
         mid = await self.db.create_mix(
             output_size=output_size,
             max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
@@ -483,7 +502,7 @@ class Coordinator:
         # open-mix cap (then the caller tells the user to /list and /join).
         if len(open_mixes) >= self.cfg.MAX_OPEN_MIXES:
             return None
-        deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+        deadline = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
         mid = await self.db.create_mix(
             output_size=self.cfg.DEFAULT_OUTPUT_SIZE,
             max_participants=self.cfg.MAX_PARTICIPANTS_DEFAULT,
@@ -552,6 +571,7 @@ class Coordinator:
                 identity = await self.nostr.get_identity(npub_hex)
                 lud16 = identity["lud16"] if identity else ""
                 await self.db.add_participant(chosen_mix, npub_hex, lud16)
+                await self._start_fill_window(chosen_mix)
                 await self.nostr.send_dm(
                     npub_hex,
                     f"Added you to mix {chosen_mix} ({peek_type}). Processing your UTXOs...",
@@ -1022,7 +1042,7 @@ class Coordinator:
         if mix["state"] == "announced":
             deadline = mix.get("deadline_unix")
             if not deadline:
-                deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+                deadline = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
                 await self.db.update_mix(mix_id, state="collecting", deadline_unix=deadline)
             else:
                 await self.db.update_mix(mix_id, state="collecting")
@@ -1475,12 +1495,23 @@ class Coordinator:
                 proceed, _nc, _conf = await self._classify_ready(mix, ready)
                 if proceed:
                     await self._proceed_to_assembling(mix, ready)
+                elif not active:
+                    # Empty mix — nobody to refund and no reason to time out
+                    # fast. Hold it open as the standing mix (a morning-announced
+                    # mix should still be joinable that night / for days), and
+                    # retire it only after the long idle window. Measured from
+                    # creation so it can't be kept alive forever by ticks.
+                    created = int(mix.get("created_at_unix") or now)
+                    if now - created >= self.cfg.EMPTY_MIX_EXPIRY_HOURS * 3600:
+                        await self._cancel_and_refund(
+                            mix, "no one joined before the open window closed")
                 else:
+                    # Has participants but the target isn't met. The fill window
+                    # (FILL_DEADLINE_HOURS, refreshed on each join) is in
+                    # deadline_unix; if it's passed, the deterministic fee split
+                    # can't be honoured — cancel and refund, freeing their UTXOs.
                     deadline = mix.get("deadline_unix")
                     if deadline and now >= deadline:
-                        # We wait for the EXACT non-conforming target; if the
-                        # deadline arrives before we reach it, the deterministic
-                        # fee split can't be honoured — cancel and refund.
                         await self._cancel_and_refund(
                             mix,
                             "deadline passed before the non-conforming target was met",
@@ -2345,7 +2376,7 @@ class Coordinator:
 
                 # Final, single atomic step: bump retries, return to collecting,
                 # extend the deadline so survivors have time to re-submit.
-                new_deadline = int(time.time()) + self.cfg.PAY_DEADLINE_HOURS * 3600
+                new_deadline = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
                 await self.db.update_mix(
                     mix_id, ghost_retries=ghost_retries + 1,
                     state="collecting", deadline_unix=new_deadline,
