@@ -1432,6 +1432,28 @@ class TestJoinByAmount:
             await db.close()
 
     @pytest.mark.asyncio
+    async def test_one_mix_per_size_never_forks_a_second(self):
+        """Even if the single same-size mix is at the old participant cap, a new
+        same-size joiner funnels into it — we never open a 2nd mix of that size
+        (focus all of one size into one mix so it fills)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            existing = await db.create_mix(output_size=1_000_000, max_participants=1)
+            await db.update_mix(existing, state="collecting")
+            await db.add_participant(existing, "first", "")  # at the old cap of 1
+
+            await coord._cmd_join_mix(FakeCtx("npub_second"), None, None, "0.01")
+
+            same_size = [m for m in await db.get_mixes_by_state("announced", "collecting")
+                         if m["output_size"] == 1_000_000]
+            assert len(same_size) == 1            # no 2nd same-size mix forked
+            assert same_size[0]["id"] == existing
+            ps = await db.get_participants_by_npub("npub_second")
+            assert ps and ps[0]["mix_id"] == existing
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
     async def test_below_minimum_rejected(self):
         """An amount below MINIMUM_UTXO_SIZE is rejected and creates no mix."""
         coord, db, nostr, chain, lightning = await make_coord()

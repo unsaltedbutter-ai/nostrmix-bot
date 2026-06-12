@@ -442,29 +442,32 @@ class Coordinator:
     async def _find_or_create_mix_by_size(
         self, output_size: int
     ) -> Tuple[Optional[str], bool]:
-        """Find an open (announced/collecting) mix with this exact output_size
-        that still has room, preferring the closest-to-full so participants
-        coalesce. Otherwise create a fresh mix with DEFAULT_* settings — unless
-        MAX_OPEN_MIXES is reached, in which case return (None, False).
+        """Return the single open (announced/collecting) mix of this
+        output_size, creating one only if none exists.
 
-        Returns (mix_id, created)."""
+        INVARIANT: at most one open mix per output_size. Everyone wanting the
+        same size funnels into the same mix so it fills as fast as possible on a
+        low-traffic bot — we deliberately never fork a second same-size mix,
+        even if its conforming slots fill before any non-conforming inputs
+        arrive. (If two same-size mixes already exist from legacy data, we reuse
+        the fullest, the one closest to assembling.) Returns (mix_id, created);
+        (None, False) only when no same-size mix exists and we're at the
+        MAX_OPEN_MIXES cap."""
         open_mixes = await self.db.get_mixes_by_state("announced", "collecting")
         best_id: Optional[str] = None
         best_count = -1
         for m in open_mixes:
             if m["output_size"] != output_size:
                 continue
-            cap = m.get("max_participants") or self.cfg.MAX_PARTICIPANTS_DEFAULT
+            # No cap skip: a same-size mix is ALWAYS reused, never forked.
             cnt = await self.db.count_participants_by_mix(
                 m["id"], exclude_states=["cancelled", "ghosted", "refunding", "refunded", "refund_failed"],
             )
-            if cnt >= cap:
-                continue
             if cnt > best_count:
                 best_count, best_id = cnt, m["id"]
         if best_id is not None:
             return best_id, False
-        # None compatible — spin up a fresh mix unless we're at the open cap.
+        # No mix of this size — spin up a fresh one unless we're at the open cap.
         if len(open_mixes) >= self.cfg.MAX_OPEN_MIXES:
             return None, False
         deadline = int(time.time()) + self.cfg.FILL_DEADLINE_HOURS * 3600
