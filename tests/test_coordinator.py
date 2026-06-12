@@ -2446,7 +2446,7 @@ class TestBroadcastSweep:
     @pytest.mark.asyncio
     async def test_sweep_throttled_by_interval(self):
         """The sweep tracks last-check in the settings table and only runs
-        once per BROADCAST_CHECK_INTERVAL_HOURS. If the interval hasn't
+        once per BROADCAST_CHECK_INTERVAL_MINUTES. If the interval hasn't
         elapsed, the sweep is a no-op even if there's a pending broadcast."""
         coord, db, nostr, chain, lightning = await make_coord()
         try:
@@ -2466,6 +2466,21 @@ class TestBroadcastSweep:
             mix_after = await db.get_mix(mix_id)
             assert mix_after is not None
             assert mix_after["state"] == "broadcast"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_sweep_is_inert_with_no_pending_broadcast(self):
+        """With nothing in 'broadcast' state the sweep returns before
+        touching the network or the settings table — the short interval
+        must not cause background writes/requests on an idle bot."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await db.set_setting("last_broadcast_check_unix", "0")
+            await coord._broadcast_sweep(int(time.time()))
+            # Timestamp untouched: the sweep never claimed a check happened.
+            assert await db.get_setting("last_broadcast_check_unix", "0") == "0"
+            assert chain.broadcast_calls == []
         finally:
             await db.close()
 

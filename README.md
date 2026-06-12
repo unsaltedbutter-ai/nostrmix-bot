@@ -158,7 +158,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
 | `ANNOUNCEMENT_HOUR_UTC` | `14` | int 0–23 (clamped) | UTC hour the daily "open mixes" note is posted (auto-creating a default mix if none are open). |
-| `BROADCAST_CHECK_INTERVAL_HOURS` | `24` | int > 0 | How often the sweep re-checks broadcast txs for confirmation and re-pushes unconfirmed ones. |
+| `BROADCAST_CHECK_INTERVAL_MINUTES` | `5` | int > 0 | How often the sweep re-checks broadcast txs for confirmation (and re-pushes unconfirmed ones). Short on purpose: participant data is destroyed the moment the tx confirms, so this bounds how long the linkage data outlives the public coinjoin. Skipped entirely when no broadcast is pending. |
 
 ### Script-type allowlist
 

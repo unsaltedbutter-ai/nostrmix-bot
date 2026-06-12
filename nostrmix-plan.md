@@ -680,7 +680,7 @@ ACCEPTED_OUTPUT_TYPES=p2wpkh
 ANNOUNCEMENT_HOUR_UTC=14           # 0..23; fires at this wall-clock hour each day
 
 # Broadcast-sweep cadence (re-broadcast unconfirmed txs + confirm checks)
-BROADCAST_CHECK_INTERVAL_HOURS=24
+BROADCAST_CHECK_INTERVAL_MINUTES=5
 
 # Bitcoin API (mempool.space — free, no key needed)
 MEMPOOL_API=https://mempool.space/api

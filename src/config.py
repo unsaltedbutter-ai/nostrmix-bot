@@ -100,7 +100,11 @@ _DEFAULTS = {
     # explicitly accept that privacy cost in exchange for keeping those sats.
     "DONATION_ADDRESS": "",
 
-    "BROADCAST_CHECK_INTERVAL_HOURS": 24,
+    # How often broadcast-state txs are re-checked for confirmation (and
+    # re-pushed if dropped). Minutes, and deliberately short: once the
+    # coinjoin confirms, every extra minute the mix's data survives in the
+    # DB is a privacy liability. One cheap GET per pending mix per check.
+    "BROADCAST_CHECK_INTERVAL_MINUTES": 5,
     # Hour-of-day (UTC) at which the daily announcement post fires. 14 UTC =
     # morning Americas / evening Europe / late-night Asia. Range 0–23.
     "ANNOUNCEMENT_HOUR_UTC": 14,
@@ -401,8 +405,8 @@ class BotConfig:
         return self._values["DONATION_ADDRESS"]
 
     @property
-    def BROADCAST_CHECK_INTERVAL_HOURS(self) -> int:
-        return self._values["BROADCAST_CHECK_INTERVAL_HOURS"]
+    def BROADCAST_CHECK_INTERVAL_MINUTES(self) -> int:
+        return self._values["BROADCAST_CHECK_INTERVAL_MINUTES"]
 
     @property
     def ANNOUNCEMENT_HOUR_UTC(self) -> int:
