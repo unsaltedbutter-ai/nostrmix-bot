@@ -45,7 +45,7 @@ class TestBotConfig:
         assert cfg.BOT_NAME == "butterbot"
         assert isinstance(cfg.NOSTR_RELAYS, list)
         assert len(cfg.NOSTR_RELAYS) >= 1
-        assert cfg.FEE_MULTIPLIER == 1.5
+        assert cfg.FEE_MULTIPLIER == 1.25
 
         # Clean up
         os.unlink(env_path)

@@ -35,13 +35,13 @@ _DEFAULTS = {
     # Conforming inputs/outputs NEVER incur a service fee; only non-conforming
     # elements are counted when this is > 0.
     "FEE_PER_ELEMENT": 0,
-    "FEE_MULTIPLIER": 1.5,
+    "FEE_MULTIPLIER": 1.25,
     "MIN_FEE_RATE_SATS": 1.5,
     "MAX_FEE_RATE_SATS": 510,
     # How many recently-confirmed blocks to look back when estimating the
-    # sat/vB rate that will probably confirm within an hour. Bitcoin's target
-    # is ~10 min/block, so 6 ≈ 1 hour. Larger values smooth over short fee
-    # spikes (safer) at the cost of paying more in calm mempools.
+    # sat/vB rate (median of the per-block minimum feerates). Bitcoin's
+    # target is ~10 min/block, so 6 ≈ 1 hour. Larger values smooth over
+    # short fee spikes at the cost of reacting slower to real rises.
     "FEE_LOOKBACK_BLOCKS": 6,
     "REFUND_KEEP_PERCENT": 5,
     "REFUND_KEEP_MIN_SATS": 50,

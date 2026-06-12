@@ -122,10 +122,10 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
 | `FEE_PER_ELEMENT` | `0` | int ≥ 0 (negative → 0) | Service-fee zap, in sats, per **non-conforming** element (input + used output). **0 disables zaps entirely**: no payment is requested and participants go straight to `paid` after `addresses`. Conforming UTXOs are always free. |
-| `FEE_MULTIPLIER` | `1.5` | float > 0 | Safety multiplier applied to the estimated sat/vB miner-fee rate. |
+| `FEE_MULTIPLIER` | `1.25` | float > 0 | Headroom multiplier applied to the estimated sat/vB miner-fee rate (the fee is locked at signing and can't be bumped). |
 | `MIN_FEE_RATE_SATS` | `1.5` | float > 0 | Floor for the miner fee-rate clamp, and the floor used by the pre-broadcast sum-invariant ("tx must pay at least this"). |
 | `MAX_FEE_RATE_SATS` | `510` | float; `0` = no ceiling | Ceiling for the miner fee-rate clamp. Set `0` to disable the ceiling. |
-| `FEE_LOOKBACK_BLOCKS` | `6` | int ≥ 1 (clamped) | How many recently-confirmed blocks the fee estimator inspects (≈10 min/block, so 6 ≈ 1 h). Larger = smoother/safer, pricier in calm mempools. |
+| `FEE_LOOKBACK_BLOCKS` | `6` | int ≥ 1 (clamped) | How many recently-confirmed blocks the fee estimator inspects (≈10 min/block, so 6 ≈ 1 h). The rate is the MEDIAN of those blocks' per-block minimum feerates — robust to a single anomalous block. |
 | `REFUND_KEEP_PERCENT` | `5` | int 0–100 | Percentage of a paid fee the bot keeps on refund (covers LN routing). |
 | `REFUND_KEEP_MIN_SATS` | `50` | int ≥ 0 | Minimum sats kept on refund (whichever of percent/min returns more to the user is used). |
 

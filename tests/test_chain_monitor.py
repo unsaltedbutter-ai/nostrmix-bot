@@ -477,18 +477,18 @@ _OFFLINE_API = "https://test-mempool-offline.invalid/api"
 _OFFLINE_BACKUP = "https://test-mempool-backup-offline.invalid/api"
 
 
-# --- C-A: smart fee estimator (max-of-mins over last N blocks) -----------
+# --- C-A: smart fee estimator (median-of-mins over last N blocks) --------
 
 
 class TestSmartFeeEstimator:
     """C-A: estimate_fee_rate looks at recent confirmed blocks' minimum
-    accepted feerates and takes the MAX (price of admission to the tightest
-    block in the lookback), times FEE_MULTIPLIER. Pin down the math."""
+    accepted feerates and takes the MEDIAN (robust to one anomalous block —
+    a coinjoin can wait a few blocks), times FEE_MULTIPLIER. Pin the math."""
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_uses_max_of_min_feerates_across_lookback(self):
-        # 3 blocks; mins are 5, 7, 3 sat/vB. max = 7. multiplier 2.0 → 14.
+    async def test_uses_median_of_min_feerates_across_lookback(self):
+        # 3 blocks; mins are 5, 7, 3 sat/vB. median = 5. multiplier 2.0 → 10.
         blocks = [
             {"id": "blk1", "extras": {"feeRange": [5, 8, 10, 15, 20, 30, 50]}},
             {"id": "blk2", "extras": {"feeRange": [7, 8, 10, 15, 20, 30, 50]}},
@@ -506,7 +506,37 @@ class TestSmartFeeEstimator:
             rate = await cm.estimate_fee_rate()
         finally:
             await cm.close()
-        assert rate == 14.0, f"expected 7 (max of mins) × 2.0 = 14, got {rate}"
+        assert rate == 10.0, f"expected 5 (median of mins) × 2.0 = 10, got {rate}"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_single_spike_block_does_not_set_the_rate(self):
+        """The real-world failure the median fixes: five calm ~1-2 sat/vB
+        blocks plus ONE straggler from a fee spike. Max-of-mins charged the
+        spike rate to everyone; the median ignores the outlier."""
+        blocks = [
+            {"extras": {"feeRange": [1.5, 2, 3, 4, 5, 6, 9]}},
+            {"extras": {"feeRange": [2.0, 2, 3, 4, 5, 6, 9]}},
+            {"extras": {"feeRange": [2.0, 2, 3, 4, 5, 6, 9]}},
+            {"extras": {"feeRange": [2.1, 2, 3, 4, 5, 6, 9]}},
+            {"extras": {"feeRange": [4.59, 5, 6, 7, 8, 9, 12]}},  # the spike straggler
+            {"extras": {"feeRange": [2.22, 3, 4, 5, 6, 7, 9]}},
+        ]
+        respx.get(f"{_OFFLINE_API}/v1/blocks").mock(
+            return_value=httpx.Response(200, json=blocks)
+        )
+        cm = ChainMonitor(
+            api_base=_OFFLINE_API, api_backup=None,
+            min_fee_rate=1.5, max_fee_rate=510, fee_multiplier=1.25,
+            fee_lookback_blocks=6,
+        )
+        try:
+            rate = await cm.estimate_fee_rate()
+        finally:
+            await cm.close()
+        # median(1.5, 2.0, 2.0, 2.1, 2.22, 4.59) = 2.05 × 1.25 = 2.5625
+        # (max-of-mins × old 1.5 multiplier would have been 6.89)
+        assert rate == pytest.approx(2.5625)
 
     @pytest.mark.asyncio
     @respx.mock
@@ -532,8 +562,8 @@ class TestSmartFeeEstimator:
             rate = await cm.estimate_fee_rate()
         finally:
             await cm.close()
-        # max(50, 2) = 50 × 1.0 = 50
-        assert rate == 50.0, f"expected lookback to cap at first 2 blocks: {rate}"
+        # median(50, 2) = 26 × 1.0 = 26 (with all 6 it would be 4.5)
+        assert rate == 26.0, f"expected lookback to cap at first 2 blocks: {rate}"
 
     @pytest.mark.asyncio
     @respx.mock

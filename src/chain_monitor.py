@@ -2,6 +2,8 @@
 
 All networking uses httpx.AsyncClient so it never blocks the asyncio event loop.
 """
+import statistics
+
 import httpx
 from typing import Optional, Dict, List, Any
 
@@ -27,7 +29,7 @@ class ChainMonitor:
     """Bitcoin blockchain monitor via mempool.space API — fully async."""
 
     def __init__(self, api_base: str = _DEFAULT_API, min_fee_rate: float = 1.5,
-                 max_fee_rate: float = 510, fee_multiplier: float = 1.5,
+                 max_fee_rate: float = 510, fee_multiplier: float = 1.25,
                  api_backup: Optional[str] = _DEFAULT_BACKUP_API,
                  fee_lookback_blocks: int = 6):
         self._api_base = api_base.rstrip("/")
@@ -41,7 +43,7 @@ class ChainMonitor:
         self._max_fee_rate = max_fee_rate
         self._fee_multiplier = fee_multiplier
         # How many recently-confirmed blocks to inspect when estimating the
-        # "minimum-to-confirm-within-an-hour" rate. ~6 blocks ≈ 1 hour.
+        # fee rate (median of their per-block minimums). ~6 blocks ≈ 1 hour.
         self._fee_lookback_blocks = max(1, fee_lookback_blocks)
         self._client = httpx.AsyncClient(timeout=30)
 
@@ -160,20 +162,22 @@ class ChainMonitor:
         return rates
 
     async def estimate_fee_rate(self) -> float:
-        """Estimate the sat/vB rate that will probably confirm within an hour.
+        """Estimate a cheap sat/vB rate that still confirms soon-ish.
 
-        Strategy: take the MAX of the per-block minimum-confirmed feerates
+        Strategy: take the MEDIAN of the per-block minimum-confirmed feerates
         across the last `fee_lookback_blocks` (default 6 ≈ 1 hour). Paying
-        that rate would have admitted us to the worst-case block in the
-        recent window, so it should clear within a similar window going
-        forward. Multiply by FEE_MULTIPLIER for a safety buffer, clamp to
-        [MIN_FEE_RATE, MAX_FEE_RATE].
+        that rate would have admitted us to half the blocks in the recent
+        window. Multiply by FEE_MULTIPLIER for headroom (the fee is locked at
+        signing and can't be bumped, and broadcast can lag this estimate by
+        the whole signing window), clamp to [MIN_FEE_RATE, MAX_FEE_RATE].
 
-        Why MAX over the min-per-block (not average): we want
-        "probably-confirms-within-N-blocks", not "would-have-confirmed-on-
-        average". The max-of-mins gives the price of admission to the
-        tightest block in the lookback — paying that rate makes any block
-        in that window admit us.
+        Why MEDIAN over the min-per-block (not max): a coinjoin is not a
+        high-time-preference payment — waiting a few extra blocks is fine,
+        so we don't pay the price of admission to the single tightest block
+        in the window. Max-of-mins let ONE anomalous block (a brief spike,
+        or a block that simply contained no cheap txs) set the rate for
+        everyone; the median ignores those outliers but still rises when the
+        whole window is genuinely expensive.
 
         Fallbacks if /v1/blocks isn't usable:
           1. /v1/fees/recommended → hourFee (the API's own "probably within
@@ -186,7 +190,7 @@ class ChainMonitor:
             rates = await self._recent_block_min_feerates()
             base_rate: Optional[float] = None
             if rates:
-                base_rate = max(rates)
+                base_rate = statistics.median(rates)
             else:
                 # Fallback 1: API's own hourFee recommendation.
                 rec = await self._get_json("/v1/fees/recommended")
@@ -196,7 +200,10 @@ class ChainMonitor:
                     except (TypeError, ValueError):
                         base_rate = None
                 if base_rate is None:
-                    # Fallback 2: legacy projected-block min.
+                    # Fallback 2: projected-block floors. The MIN across the
+                    # next 4 projected blocks ≈ the price of admission within
+                    # ~40 min — consistent with the low-time-preference median
+                    # strategy above (max would price next-block admission).
                     data = await self._get_json("/v1/fees/mempool-blocks")
                     proj_rates: List[float] = []
                     if data:
@@ -208,7 +215,7 @@ class ChainMonitor:
                                 except (TypeError, ValueError):
                                     continue
                     if proj_rates:
-                        base_rate = max(proj_rates)
+                        base_rate = min(proj_rates)
 
             if base_rate is None:
                 # Final fallback: the clamp floor. Better to overpay slightly
