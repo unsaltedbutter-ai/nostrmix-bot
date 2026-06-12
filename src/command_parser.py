@@ -38,6 +38,11 @@ AMOUNT_PATTERN = re.compile(r'^\d+(\.\d+)?$|^\.\d+$')
 BECH32_ADDR_PATTERN = re.compile(r'^(?:bc1|tb1|bcrt1)[02-9ac-hj-np-z]{8,87}$')
 BASE58_ADDR_PATTERN = re.compile(r'^[13][1-9A-HJ-NP-Za-km-z]{25,34}$')
 
+# A bare-pasted PSBT: hex starting with the PSBT magic ("psbt" + 0xff). A
+# signed PSBT pasted straight from a wallet routes to accept_psbt without
+# the psbt_accept verb.
+PSBT_HEX_PATTERN = re.compile(r'^70736274ff[0-9a-fA-F]+$')
+
 
 def _looks_like_address(token: str) -> bool:
     # bech32 is case-insensitive (lowercase canonical); base58 is not.
@@ -58,9 +63,9 @@ class CommandParser:
     - /cancel or exit [mix_id] → exit_mix
     - /psbt_chunk <chunk_idx>/<total> <hex> → accept_psbt_chunk
 
-    A message with no verb that contains txid:vout pairs or bitcoin
-    addresses routes to commit_utxos / provide_addresses respectively —
-    pasting the data is enough.
+    A message with no verb that contains txid:vout pairs, bitcoin
+    addresses, or PSBT hex routes to commit_utxos / provide_addresses /
+    accept_psbt respectively — pasting the data is enough.
     """
 
     def __init__(self, bot_name: str = "butterbot"):
@@ -162,11 +167,16 @@ class CommandParser:
                 mix_id = None
             return ParsedCommand("exit_mix", [mix_id], raw)
 
-        # -- BARE PASTE — data with no verb. txid:vout pairs and bitcoin
-        # addresses are shape-unambiguous in this grammar (see the address
-        # patterns above), so pasting them straight from a wallet works
+        # -- BARE PASTE — data with no verb. PSBT hex, txid:vout pairs, and
+        # bitcoin addresses are each shape-unambiguous in this grammar (see
+        # the patterns above), so pasting them straight from a wallet works
         # without typing a command first. Non-matching tokens are ignored,
         # same as the verb forms.
+        # PSBT first: join the tokens (a client may hard-wrap the long hex)
+        # and route only when the WHOLE message is one PSBT.
+        joined = "".join(parts)
+        if PSBT_HEX_PATTERN.match(joined):
+            return ParsedCommand("accept_psbt", [joined], raw)
         utxos = [{"txid": m.group(1).lower(), "vout": int(m.group(2))}
                  for m in UTXO_PATTERN.finditer(raw)]
         if utxos:

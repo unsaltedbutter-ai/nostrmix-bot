@@ -55,7 +55,7 @@ from bitcointx.core.psbt import (
 class PSBTManager:
     """Build, validate, and combine PSBTs for coinjoin."""
 
-    MAX_PSBT_HEX_SIZE = 50000  # 50KB relay concern
+    MAX_PSBT_HEX_SIZE = 50000  # hex chars (25 KB) — DM/relay size concern
 
     def __init__(self, network: str = "mainnet",
                  input_vsize_map: Optional[Dict[str, int]] = None,

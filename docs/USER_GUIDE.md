@@ -70,27 +70,35 @@ the 1-to-1 link between your coin and your identity is broken. The leftover that
 
 ## 4. Command reference
 
-Everything is a DM to the bot. Commands are **case-insensitive**, and the leading
-`/` is **optional** — `join 0.01` and `/join 0.01` both work. The bot's own
-prompts show the bare form, so this guide does too.
+Everything is a DM to the bot — and **mostly, you just paste**:
 
-| Command | What it does |
+- Send **`txid:vout` outpoints** and they're added as the *inputs* of your
+  current mix.
+- Send **bitcoin addresses** and they're added as your payout *outputs*. They
+  accumulate across messages — one per message is fine; the bot replies with a
+  running tally (`2 of 3 address(es) on file`).
+- Send **signed PSBT hex** and it's taken as the signature for your inputs.
+
+The bot recognizes each by its shape, so no command words are needed. The verbs
+below all still work (they're what `help` shows); commands are
+**case-insensitive** and the leading `/` is **optional** — `join 0.01` and
+`/join 0.01` both work.
+
+| You send | What it does |
 |---|---|
 | `list` (or `open`, `mixes`) | Show open mixes you can join |
 | `join <mix_name>` | Register interest in a specific open mix |
 | `join <amount>` | Join — or start — a mix of that BTC size (e.g. `join 0.01`) |
-| `inputs <txid:vout> ...` (or `commit`) | Declare the UTXO(s) you'll contribute; repeats **add** to your set |
-| `addresses <addr1> <addr2> ...` (or `address`, `outputs`) | Give your fresh payout addresses; they **accumulate** across messages |
+| `<txid:vout> …` — or `inputs <txid:vout> …` | Add UTXO(s) as your inputs; repeats **add** to your set |
+| `bc1q… …` — or `addresses bc1q… …` | Add fresh payout addresses; they **accumulate** across messages |
 | `addresses clear` | Wipe your address list and start over (the fix for a mis-paste) |
-| `psbt_accept <hex>` | Return your **signed** PSBT |
-| `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large) |
+| `70736274ff…` — or `psbt_accept 70736274ff…` | Return your **signed** PSBT |
+| `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large; verb required) |
 | `cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
 | `help` (or `commands`, `?`) | Show the commands relevant to where you are right now |
 
-**You usually don't need the `inputs`/`addresses` verbs at all**: a pasted
-`txid:vout` list or a pasted bitcoin address is recognized on its own. Copy from
-your wallet, paste to the bot, done — one address per message is fine; the bot
-keeps a running tally (`2 of 3 address(es) on file`).
+Verb spellings are forgiving: `inputs` = `input` = `commit`, and `addresses` =
+`address` = `outputs`.
 
 If you send something the bot doesn't understand, it replies with a command list
 tuned to your current step.
@@ -99,7 +107,7 @@ tuned to your current step.
 
 ## 5. Conforming vs non-conforming
 
-Every UTXO you commit is classified against the mix's **output size** (shown in
+Every UTXO you send is classified against the mix's **output size** (shown in
 `list`, e.g. `0.01000000 BTC`):
 
 - **Conforming** — amount is **exactly** the output size. It moves **1 input → 1
@@ -224,7 +232,9 @@ sats to zap and to which address; you advance once it's paid.
 Once the mix has enough participants, the bot assembles the transaction and DMs
 you, over the same NIP-17 thread:
 
-1. **Your miner-fee share**, e.g. `Your share of the miner fee: 270 sats …`.
+1. **Your miner-fee share and the rate it was computed at**, e.g.
+   `Your share of the miner fee: 270 sats (~0.00000270 BTC) at 1.5 sat/vB.`
+   (Conforming-only participants see `0 sats` — pass-throughs ride free.)
 2. **The unsigned PSBT**, delivered as a message that begins `psbt_accept
    70736274ff…`. (If it's very large it arrives in pieces as `psbt_chunk
    1/3 …`, `2/3 …` — concatenate the hex in order to get the whole PSBT.)
@@ -289,15 +299,15 @@ only hold those keys.
 
 ## 11. Return the signed PSBT
 
-DM the bot the signed hex:
+DM the bot the signed hex — just paste it (`psbt_accept` in front also works):
 
 ```
-psbt_accept 70736274ff…<your signed PSBT>…
+70736274ff…<your signed PSBT>…
 ```
 
 Only if it's very large — **over ~50,000 hex characters (~25 KB)**, the bot's
 chunking threshold — send it in numbered pieces instead (split the hex into
-in-order chunks):
+in-order chunks; this is the one command that needs its verb):
 
 ```
 psbt_chunk 1/2 70736274ff…
@@ -305,7 +315,7 @@ psbt_chunk 2/2 …rest…
 ```
 
 In practice a 2-5 participant mix produces a PSBT far smaller than that, so a
-single `psbt_accept` almost always fits — only large mixes need chunking.
+single pasted message almost always fits — only large mixes need chunking.
 
 The bot cryptographically verifies your signature against the exact skeleton it
 sent. When **everyone** has returned a valid signature, it combines them,
@@ -373,7 +383,7 @@ bc1q… bc1q… bc1q…                      → paste one address per mixed out
 …bot DMs your fee share + the PSBT…
    → VERIFY it (psbt_decode.py / Sparrow): inputs, outputs (your addrs), fee
    → SIGN it in your wallet
-psbt_accept <signed-hex>               → return it
+70736274ff…<signed psbt hex>           → paste it back
 …bot broadcasts and DMs you the txid…
 ```
 

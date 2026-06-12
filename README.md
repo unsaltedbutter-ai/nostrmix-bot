@@ -147,15 +147,15 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
 | `DEFAULT_OUTPUT_SIZE` | `1000000` | int ≥ `MINIMUM_UTXO_SIZE` (else load fails) | Equal-output size (sats) of auto-created mixes. Also the conforming/non-conforming dividing line. |
-| `MAX_PARTICIPANTS_DEFAULT` | `20` | int > 0 | Upper bound used by the auto-mix-on-`commit` capacity check. |
+| `MAX_PARTICIPANTS_DEFAULT` | `20` | int > 0 | Upper bound used by the capacity check when pasted inputs auto-create a mix. |
 | `MAX_PENDING_MIXES` | `5` | int ≥ 1 | Max simultaneous **paid** mixes a single npub may be in. A 4th/Nth `join` is refused. |
-| `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `join <amount>` and the `commit` auto-create. At the cap, creation is refused and the user is pointed at `list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
+| `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `join <amount>` and the pasted-inputs auto-create. At the cap, creation is refused and the user is pointed at `list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
 | `SIGNING_DEADLINE_HOURS` | `48` | int > 0 | Time participants have to return a signed PSBT. Reminder DMs fire at ⅛, ¼, ½ of this; past it, the participant is ghosted + blacklisted. |
 | `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set). Only the per-participant pay timeout — the collecting/fill window is now `FILL_DEADLINE_HOURS`. |
 | `EMPTY_MIX_EXPIRY_HOURS` | `168` | int > 0 | How long a mix with **zero** participants stays open before it's retired (held by age since creation). Long so a morning-announced mix is still joinable that night / for days. |
 | `FILL_DEADLINE_HOURS` | `168` | int > 0 | Once a mix **has** participants but hasn't reached its non-conforming target, how long it keeps collecting before it cancels + refunds (freeing committed UTXOs). Refreshed each time a new participant joins. Long by default because gathering is slow on a small bot; shorten as traffic grows. Also the ghost-recovery deadline extension. |
 | `MAX_GHOST_RETRIES` | `3` | int ≥ 0 | How many times a mix restarts collecting after a ghost before it cancels and refunds everyone. |
-| `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at `commit`. |
+| `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at input intake. |
 
 ### Conforming / non-conforming model
 
@@ -177,8 +177,8 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 
 | Key | Default | Type / range | Influences |
 |---|---|---|---|
-| `ACCEPTED_INPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | UTXO script types accepted at `commit`. Each mix additionally locks to the type of its first commit. |
-| `ACCEPTED_OUTPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | Output address types accepted at `addresses`. Each mix locks to the type of its first `addresses`. |
+| `ACCEPTED_INPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | UTXO script types accepted at input intake. Each mix additionally locks to the type of its first accepted input. |
+| `ACCEPTED_OUTPUT_TYPES` | `p2wpkh` | comma-separated; empty → `p2wpkh` | Address types accepted at address intake. Each mix locks to the type of its first accepted address. |
 
 Recognized type tokens: `p2pkh`, `p2sh`, `p2sh-p2wpkh`, `p2wpkh`, `p2wsh`, `p2tr`.
 The MVP defaults to `p2wpkh` only.
@@ -222,7 +222,7 @@ Participant (Nostr DM)
        ↓
 NostrHandler (NIP-17 DMs, NIP-57 zaps, daily announcements)
        ↓
-CommandParser (list, join, inputs, outputs, psbt_accept, cancel)
+CommandParser (list, join, inputs, addresses, psbt_accept, cancel — verbs optional)
        ↓
 Coordinator (state machine, event loop)
        ↓
@@ -255,15 +255,15 @@ additional mixing rounds; the bot does not attempt subset-sum analysis.
 ## Protocol commands
 
 > **Using the bot as a participant?** See the [**User's Guide**](docs/USER_GUIDE.md)
-> for the full walkthrough — joining, committing, verifying the PSBT before you
-> sign, toxic change, and re-mixing.
+> for the full walkthrough — joining, pasting inputs and addresses, verifying the
+> PSBT before you sign, toxic change, and re-mixing.
 
-Commands are matched case-insensitively, and the leading `/` is optional —
-`join 0.01` and `/join 0.01` both work (the bot's prompts show the bare form).
-
-**Bare paste:** `txid:vout` pairs and bitcoin addresses are recognized without a
-command — pasting them straight from a wallet is enough. The `inputs`/`addresses`
-verbs exist mainly for the help text.
+**Mostly, participants just paste.** A `txid:vout` list becomes the sender's mix
+**inputs**, bitcoin addresses become their payout **outputs**, and signed PSBT
+hex is taken as their **signature** — each recognized by shape, no verb needed.
+The verbs below all still work (they're what `help` shows); commands are matched
+case-insensitively and the leading `/` is optional — `join 0.01` and `/join 0.01`
+both work.
 
 - `list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
   a default one (`DEFAULT_OUTPUT_SIZE` / `DEFAULT_REQUIRED_NONCONFORMING`) and lists
@@ -273,22 +273,24 @@ verbs exist mainly for the help text.
   still works regardless of what's listed; this only tunes the guidance.
 - `join <mix_name>` — join a mix by name; or `join <amount>` (e.g. `join 0.01`)
   to join an open mix of that BTC output size, or create one if none exists
-- `inputs <txid:vout> ...` (alias `commit`) — register UTXOs. Sent more than
-  once, the new outpoints are **added** to your set.
-- `addresses <addr1> <addr2> ...` (aliases `address`, `outputs`) — provide payout addresses,
-  one or more per message; they **accumulate** until you've sent enough (the bot
-  replies with a running tally, e.g. `2 of 3 address(es) on file`). You need one
-  per conforming UTXO; non-conforming participants need ≥1 more for an equal
-  output, plus one more to receive change. The address count caps your outputs:
-  if you supply too few, the bot turns your last address into an (oversized)
-  change output rather than burning the leftover — so you get fewer mixed
-  outputs but keep the sats. Only with a single address and an above-dust
-  leftover is that excess donated/folded.
+- `<txid:vout> ...` (or `inputs <txid:vout> ...`; aliases `input`, `commit`) —
+  register UTXOs. Sent more than once, the new outpoints are **added** to your
+  set.
+- `<addr1> <addr2> ...` (or `addresses <addr1> ...`; aliases `address`,
+  `outputs`) — provide payout addresses, one or more per message; they
+  **accumulate** until you've sent enough (the bot replies with a running tally,
+  e.g. `2 of 3 address(es) on file`). You need one per conforming UTXO;
+  non-conforming participants need ≥1 more for an equal output, plus one more to
+  receive change. The address count caps your outputs: if you supply too few,
+  the bot turns your last address into an (oversized) change output rather than
+  burning the leftover — so you get fewer mixed outputs but keep the sats. Only
+  with a single address and an above-dust leftover is that excess donated/folded.
 - `addresses clear` — wipe your accumulated/stored addresses and start the list
   over (the fix for a mis-pasted address). Addresses lock once your mix starts
   assembling, or once you've paid a service fee quoted against them.
-- `psbt_accept <hex>` — return a signed PSBT (or `psbt_chunk <i>/<n> <hex>` for
-  large PSBTs)
+- `70736274ff...` (or `psbt_accept <hex>`) — return a signed PSBT.
+  `psbt_chunk <i>/<n> <hex>` returns it in pieces when it exceeds the DM size
+  threshold (the one command that needs its verb).
 - `cancel [mix_name]` — exit a mix (auto-detects when you're in exactly one)
 
 ## Testing
@@ -308,7 +310,7 @@ Tests that hit the live mempool.space API are marked `@pytest.mark.live`.
 Two scripts let you validate the deployment in layers without launching the full
 bot or risking funds. Launching `src/main.py` itself touches no funds — it
 connects and waits; a transaction is only built/broadcast once participants
-`commit` UTXOs and a mix reaches its non-conforming target.
+register input UTXOs and a mix reaches its non-conforming target.
 
 **`scripts/preflight.py`** — config sanity + connectivity. Loads the same config
 `main.py` uses (printing only non-secret fields), confirms mempool.space is

@@ -283,7 +283,22 @@ class TestAliasesAndBarePaste:
                      "0.01"):
             assert self.parser.parse(text).command == "unknown", text
 
-    def test_psbt_hex_blob_not_misrouted(self):
-        # PSBT hex (70736274ff...) must not look like a UTXO or an address.
+    def test_bare_psbt_paste_routes_to_accept_psbt(self):
+        # PSBT hex (70736274ff…) pasted with no verb is a signed-PSBT return.
         blob = "70736274ff" + "00" * 60
-        assert self.parser.parse(blob).command == "unknown"
+        parsed = self.parser.parse(blob)
+        assert parsed.command == "accept_psbt"
+        assert parsed.args[0] == blob
+
+    def test_bare_psbt_paste_rejoins_client_wrapped_hex(self):
+        # A client may hard-wrap the long hex; the parser re-joins it.
+        blob = "70736274ff" + "ab" * 100
+        wrapped = f"{blob[:80]}\n{blob[80:160]}\n{blob[160:]}"
+        parsed = self.parser.parse(wrapped)
+        assert parsed.command == "accept_psbt"
+        assert parsed.args[0] == blob
+
+    def test_psbt_with_trailing_garbage_is_not_routed(self):
+        # Only an all-hex message is a PSBT — mixed content stays unknown.
+        blob = "70736274ff" + "00" * 60
+        assert self.parser.parse(f"{blob} please").command == "unknown"
