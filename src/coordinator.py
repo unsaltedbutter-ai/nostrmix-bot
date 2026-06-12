@@ -265,7 +265,7 @@ class Coordinator:
         the help text — every command still works regardless of what's listed.
 
         - Not in any mix → list, join
-        - Joined / committed (still assembling their entry) → inputs, outputs
+        - Joined / committed (still assembling their entry) → inputs, addresses
         - Signing (PSBT sent) → psbt_accept
         - join is offered again only when nothing is half-finished and the user
           is under MAX_PENDING_MIXES; cancel whenever they're in a mix.
@@ -279,7 +279,7 @@ class Coordinator:
             return cmds
         assembling = bool({"interested", "committed"} & stages)
         if assembling:
-            cmds += ["inputs", "outputs"]
+            cmds += ["inputs", "addresses"]
         if "signing" in stages:
             cmds.append("psbt_accept")
         if not assembling:
@@ -844,7 +844,7 @@ class Coordinator:
         addresses one at a time, so "copy, paste, switch app, repeat" is the
         natural rhythm. Below the required count we store the partial list and
         reply with a tally; at/above it we (re)compute the output layout from
-        the full accumulated list. `outputs clear` starts the list over.
+        the full accumulated list. `addresses clear` starts the list over.
         """
         if not addrs:
             await self.nostr.send_dm(npub_hex, "Send me at least one output address.")
@@ -1039,7 +1039,7 @@ class Coordinator:
             await self.nostr.send_dm(
                 npub_hex,
                 f"{len(combined)} of {min_addrs} address(es) on file — paste "
-                f"{min_addrs - len(combined)} more. (outputs clear starts over.)",
+                f"{min_addrs - len(combined)} more. (addresses clear starts over.)",
             )
             return
 
@@ -1047,7 +1047,7 @@ class Coordinator:
                                              already_paid)
 
     async def _cmd_clear_addresses(self, ctx: SenderContext, npub_hex: str):
-        """Handle `outputs clear` — wipe the accumulated/stored addresses so
+        """Handle `addresses clear` — wipe the accumulated/stored addresses so
         the list can be rebuilt from scratch. This is the fix path for a
         mis-pasted address, since intake otherwise only appends."""
         participants = await self.db.get_participants_by_npub(npub_hex)

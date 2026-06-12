@@ -249,7 +249,7 @@ Commands are matched case-insensitively, and the leading `/` is optional —
 `join 0.01` and `/join 0.01` both work (the bot's prompts show the bare form).
 
 **Bare paste:** `txid:vout` pairs and bitcoin addresses are recognized without a
-command — pasting them straight from a wallet is enough. The `inputs`/`outputs`
+command — pasting them straight from a wallet is enough. The `inputs`/`addresses`
 verbs exist mainly for the help text.
 
 - `list` (or `open`, `mixes`) — list open mixes. If none are open, the bot opens
@@ -262,7 +262,7 @@ verbs exist mainly for the help text.
   to join an open mix of that BTC output size, or create one if none exists
 - `inputs <txid:vout> ...` (alias `commit`) — register UTXOs. Sent more than
   once, the new outpoints are **added** to your set.
-- `outputs <addr1> <addr2> ...` (alias `addresses`) — provide payout addresses,
+- `addresses <addr1> <addr2> ...` (aliases `address`, `outputs`) — provide payout addresses,
   one or more per message; they **accumulate** until you've sent enough (the bot
   replies with a running tally, e.g. `2 of 3 address(es) on file`). You need one
   per conforming UTXO; non-conforming participants need ≥1 more for an equal
@@ -271,7 +271,7 @@ verbs exist mainly for the help text.
   change output rather than burning the leftover — so you get fewer mixed
   outputs but keep the sats. Only with a single address and an above-dust
   leftover is that excess donated/folded.
-- `outputs clear` — wipe your accumulated/stored addresses and start the list
+- `addresses clear` — wipe your accumulated/stored addresses and start the list
   over (the fix for a mis-pasted address). Addresses lock once your mix starts
   assembling, or once you've paid a service fee quoted against them.
 - `psbt_accept <hex>` — return a signed PSBT (or `psbt_chunk <i>/<n> <hex>` for

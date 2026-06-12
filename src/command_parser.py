@@ -51,9 +51,9 @@ class CommandParser:
     Recognized commands:
     - /list or list → list_mixes
     - join <mix_id> <num_outputs> → join_mix
-    - /inputs (alias /commit) <txid:vout> ... → commit_utxos
-    - /outputs (alias /addresses) <addr> ... → provide_addresses
-    - /outputs clear → clear_addresses
+    - /inputs (aliases /input, /commit) <txid:vout> ... → commit_utxos
+    - /addresses (aliases /address, /outputs) <addr> ... → provide_addresses
+    - /addresses clear → clear_addresses
     - /psbt_accept <hex> → accept_psbt
     - /cancel or exit [mix_id] → exit_mix
     - /psbt_chunk <chunk_idx>/<total> <hex> → accept_psbt_chunk
@@ -110,8 +110,8 @@ class CommandParser:
                 return ParsedCommand("join_mix", [mix_id, alt, None], raw)
             return ParsedCommand("join_mix", [], raw)
 
-        # -- INPUTS (alias: COMMIT) --
-        if cmd in ("inputs", "commit"):
+        # -- INPUTS (aliases: INPUT, COMMIT) --
+        if cmd in ("inputs", "input", "commit"):
             # Find every txid:vout pair regardless of separator — spaces, commas,
             # or ", " (a wallet "copy all"). finditer ignores whatever sits
             # between matches, so all forms parse the same. (The verb word
@@ -120,9 +120,9 @@ class CommandParser:
                      for m in UTXO_PATTERN.finditer(raw)]
             return ParsedCommand("commit_utxos", [utxos], raw)
 
-        # -- OUTPUTS (alias: ADDRESSES) --
-        if cmd in ("outputs", "addresses"):
-            # "outputs clear" — wipe the accumulated address list and start over.
+        # -- ADDRESSES (aliases: ADDRESS, OUTPUTS) --
+        if cmd in ("addresses", "address", "outputs"):
+            # "addresses clear" — wipe the accumulated address list and start over.
             if len(args) == 1 and args[0].lower() == "clear":
                 return ParsedCommand("clear_addresses", [], raw)
             # Accept addresses separated by spaces and/or commas — a wallet
@@ -208,7 +208,7 @@ class CommandParser:
         ("list", "list — open mixes"),
         ("join", "join <mix> — join (or join 0.01)"),
         ("inputs", "inputs <txid:vout> … — add UTXOs (or just paste them)"),
-        ("outputs", "outputs <addr> … — payout addresses (or just paste them)"),
+        ("addresses", "addresses <addr> … — payout addresses (or just paste them)"),
         ("psbt_accept", "psbt_accept <hex> — return signed PSBT"),
         ("cancel", "cancel — leave"),
     ]

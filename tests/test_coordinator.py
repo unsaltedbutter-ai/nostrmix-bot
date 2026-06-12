@@ -380,7 +380,7 @@ class TestProvideAddressesPaidState:
         outputs stored, then sends MORE addresses. The layout is recomputed
         from the full accumulated list — funds still bound the output count,
         so the quoted zap stays in sync and never doubles. A wrong address is
-        fixed via `outputs clear` + re-paste, not by re-sending the list."""
+        fixed via `addresses clear` + re-paste, not by re-sending the list."""
         coord, db, nostr, chain, lightning = await make_coord(fee_per_element=100)
         try:
             mix_id = await db.create_mix(output_size=1_000_000, fee_per_element=100)
@@ -4971,7 +4971,7 @@ class TestStageAwareHelp:
             npub = "npub_interested"
             await db.add_participant(mix_id, npub, "")  # default 'interested'
             cmds = await coord._relevant_commands(npub)
-            assert "inputs" in cmds and "outputs" in cmds and "cancel" in cmds
+            assert "inputs" in cmds and "addresses" in cmds and "cancel" in cmds
             assert "psbt_accept" not in cmds
             assert "join" not in cmds  # half-finished → don't invite another mix
         finally:
@@ -5023,7 +5023,7 @@ class TestFeeRateStoredAsFloat:
 class TestAppendModeAddressIntake:
     """Addresses accumulate across messages (phone wallets hand them out one
     at a time). Partial sets tally instead of erroring; double-sends are
-    harmless; `outputs clear` restarts the list; a no-fee paid participant can
+    harmless; `addresses clear` restarts the list; a no-fee paid participant can
     still append while the mix is collecting; a top-up commit re-lays out from
     the accumulated list."""
 

@@ -80,14 +80,14 @@ prompts show the bare form, so this guide does too.
 | `join <mix_name>` | Register interest in a specific open mix |
 | `join <amount>` | Join — or start — a mix of that BTC size (e.g. `join 0.01`) |
 | `inputs <txid:vout> ...` (or `commit`) | Declare the UTXO(s) you'll contribute; repeats **add** to your set |
-| `outputs <addr1> <addr2> ...` (or `addresses`) | Give your fresh payout addresses; they **accumulate** across messages |
-| `outputs clear` | Wipe your address list and start over (the fix for a mis-paste) |
+| `addresses <addr1> <addr2> ...` (or `address`, `outputs`) | Give your fresh payout addresses; they **accumulate** across messages |
+| `addresses clear` | Wipe your address list and start over (the fix for a mis-paste) |
 | `psbt_accept <hex>` | Return your **signed** PSBT |
 | `psbt_chunk <i>/<n> <hex>` | Return a signed PSBT in pieces (only if it's very large) |
 | `cancel [mix_name]` (or `exit`, `leave`) | Leave a mix (auto-detects if you're in exactly one); you're refunded any service fee |
 | `help` (or `commands`, `?`) | Show the commands relevant to where you are right now |
 
-**You usually don't need the `inputs`/`outputs` verbs at all**: a pasted
+**You usually don't need the `inputs`/`addresses` verbs at all**: a pasted
 `txid:vout` list or a pasted bitcoin address is recognized on its own. Copy from
 your wallet, paste to the bot, done — one address per message is fine; the bot
 keeps a running tally (`2 of 3 address(es) on file`).
@@ -185,9 +185,9 @@ above the dust floor) and tells you which it accepted or rejected.
 > tab — it's the "Transaction Output" value. Copy that string verbatim.
 
 **Paste fresh payout addresses** — `bc1q…`, again no command needed (or prefix
-with `outputs`). They **accumulate**: one address per message is fine, and the
+with `addresses`). They **accumulate**: one address per message is fine, and the
 bot replies with a running tally (`2 of 3 address(es) on file`) until you've
-sent enough. Pasted a wrong one? `outputs clear` wipes the list to start over.
+sent enough. Pasted a wrong one? `addresses clear` wipes the list to start over.
 
 ```
 bc1qaaa… bc1qbbb… bc1qccc…
@@ -368,7 +368,7 @@ join silver-cupcake                    → join the mix you picked
 <txid:vout> …                          → paste the coins you'll contribute
 bc1q… bc1q… bc1q…                      → paste one address per mixed output
                                          + one extra for change (tally builds
-                                         across messages; outputs clear resets)
+                                         across messages; addresses clear resets)
    (pay the zap only if a fee is charged — off by default)
 …bot DMs your fee share + the PSBT…
    → VERIFY it (psbt_decode.py / Sparrow): inputs, outputs (your addrs), fee

@@ -215,9 +215,9 @@ class TestCommandParser:
 
 
 class TestAliasesAndBarePaste:
-    """inputs/outputs are the documented verbs (commit/addresses stay as
-    aliases), and pasting bare txid:vout pairs or bitcoin addresses needs no
-    verb at all."""
+    """inputs/addresses are the documented verbs (input/commit and
+    address/outputs stay as aliases), and pasting bare txid:vout pairs or
+    bitcoin addresses needs no verb at all."""
 
     GOOD_TXID = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
     ADDR_BECH32 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
@@ -228,24 +228,25 @@ class TestAliasesAndBarePaste:
         self.parser = CommandParser(bot_name="butterbot")
 
     def test_inputs_alias_for_commit(self):
-        for verb in ("inputs", "/inputs", "commit", "/commit"):
+        for verb in ("inputs", "/inputs", "input", "commit", "/commit"):
             parsed = self.parser.parse(f"{verb} {self.GOOD_TXID}:0")
             assert parsed.command == "commit_utxos"
             assert parsed.args[0] == [{"txid": self.GOOD_TXID, "vout": 0}]
 
     def test_outputs_alias_for_addresses(self):
-        for verb in ("outputs", "/outputs", "addresses", "/addresses"):
+        for verb in ("addresses", "/addresses", "address", "outputs", "/outputs"):
             parsed = self.parser.parse(f"{verb} {self.ADDR_BECH32}")
             assert parsed.command == "provide_addresses"
             assert parsed.args[0] == [self.ADDR_BECH32]
 
-    def test_outputs_clear(self):
-        for text in ("outputs clear", "/outputs CLEAR", "addresses clear"):
+    def test_addresses_clear(self):
+        for text in ("addresses clear", "address clear",
+                     "/addresses CLEAR", "outputs clear"):
             assert self.parser.parse(text).command == "clear_addresses"
 
-    def test_outputs_clear_with_extra_args_is_not_clear(self):
+    def test_addresses_clear_with_extra_args_is_not_clear(self):
         # "clear" only as the sole argument — anything else is an address list.
-        parsed = self.parser.parse(f"outputs clear {self.ADDR_BECH32}")
+        parsed = self.parser.parse(f"addresses clear {self.ADDR_BECH32}")
         assert parsed.command == "provide_addresses"
 
     def test_bare_utxo_paste(self):
