@@ -80,4 +80,7 @@ class PrivacyCheck:
             )
 
         except Exception as e:
-            return False, f"Privacy check error: {str(e)}"
+            # The message is logged by the coordinator — keep str(e) out of
+            # it: bitcointx exceptions can embed PSBT fragments (addresses,
+            # scripts). The class name is enough to triage.
+            return False, f"Privacy check error: {type(e).__name__}"

@@ -34,6 +34,19 @@ privacy:
 - **Re-mix your change** in a later round — toxic change becomes a fresh input.
 - **Never co-spend** change together with your mixed outputs in a later transaction.
 
+### Data retention
+
+The bot keeps participant data (npub, Lightning address, UTXOs, addresses, PSBTs)
+only while it's needed: a mix's data is destroyed (with SQLite `secure_delete`)
+within minutes of the coinjoin confirming, a whole-mix cancel destroys it after
+refunds, and a participant who **cancels or is dropped** has their row deleted the
+moment their refund settles — immediately when no fee was paid. The only rows that
+outlive a departure are: a minimal `refunds_owed` record (Lightning address + sats,
+no npub, no mix link) when a refund failed, the participant row itself in the rare
+case sats are owed but there's no Lightning address to pay them to, and `blacklist`
+entries for ghosters. Logs are tokenised (no raw npubs/txids/addresses), and HTTP
+client loggers are capped so request URLs never write txids to disk.
+
 ## Quick Start
 
 ```bash

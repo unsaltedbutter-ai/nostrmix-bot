@@ -1429,6 +1429,9 @@ class Coordinator:
             await self.db.update_participant(pid, state="cancelled")
             msg = "Sorry to see you go."
 
+        # The departure is settled — delete the row now rather than letting
+        # the npub/lud16 linger until the mix itself ends.
+        await self._scrub_departed(target_p, actual_mix_id, "voluntary_exit")
         await self.nostr.send_dm(npub_hex, msg)
 
     # --- Zap Handler ---
@@ -1642,6 +1645,8 @@ class Coordinator:
                     await self.db.delete_outputs_by_participant(p["id"])
                     await self.db.update_participant(p["id"], state="cancelled")
                     p["state"] = "cancelled"  # sync in-memory for filters below
+                    # Nothing was ever paid — scrub the row immediately.
+                    await self._scrub_departed(p, mix_id, "pay_timeout")
                     try:
                         await self.nostr.send_dm(
                             p["npub_hex"],
@@ -1885,12 +1890,16 @@ class Coordinator:
         # (e.g. event loop crash + restart between the caller's read and
         # this call). The DB is the source of truth.
         fresh = await self.db.get_participant(pid)
-        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+        # A MISSING row is terminal too: a departed participant is scrubbed
+        # right after their refund settles, so a stale re-call (crash resume)
+        # finds no row — paying out again would be the double-refund bug.
+        if fresh is None or fresh.get("state") in self._REFUND_TERMINAL_STATES:
             logger.info(
                 "Skipping refund for participant %s in mix %s — already in state %s",
-                tokens.p(p["npub_hex"]), tokens.m(mix_id), fresh.get("state"),
+                tokens.p(p["npub_hex"]), tokens.m(mix_id),
+                fresh.get("state") if fresh else "scrubbed",
             )
-            return fresh.get("state") or "cancelled"
+            return (fresh.get("state") or "cancelled") if fresh else "cancelled"
 
         # Commit the intent BEFORE the network call. If the bot crashes
         # between this UPDATE and the LN call, the participant will be in
@@ -1923,6 +1932,46 @@ class Coordinator:
             max(fee_paid - self.cfg.REFUND_KEEP_MIN_SATS, 0),
         )
 
+    async def _scrub_departed(self, p: Dict, mix_id: str, reason: str) -> bool:
+        """Delete a departed participant's row the moment their refund story
+        is settled — a cancelled user's npub/lud16 on disk is pure linkage
+        liability while the mix lives on. Scrubbed:
+          - 'refunded' (payout completed)
+          - 'cancelled' with no service fee paid (nothing owed)
+          - 'refund_failed' — first converted to a minimal refunds_owed debt
+            (lud16 + sats, no npub, no mix link), exactly as _destroy_mix
+            does at mix teardown.
+        Kept (returns False):
+          - 'cancelled'/'refund_failed' with sats owed but no usable
+            Lightning address — the row is the only record of who is owed;
+          - 'refunding' — in-flight payout whose outcome is unknown;
+          - any non-departed state (defensive).
+        Idempotent: a second call finds no row and reports scrubbed.
+        """
+        fresh = await self.db.get_participant(p["id"])
+        if not fresh:
+            return True  # already gone
+        state = fresh.get("state")
+        fee_paid = int(fresh.get("fee_paid") or 0)
+        lud16 = (fresh.get("lightning_addr") or "").strip()
+
+        if state == "refund_failed":
+            owed = self._refund_keep_math(fee_paid) if fee_paid > 0 else 0
+            if owed > 0:
+                if not lud16:
+                    return False  # nowhere to record the debt — keep the row
+                await self.db.add_refund_owed(fresh["id"], lud16, owed, reason)
+        elif state == "cancelled":
+            if fee_paid > 0:
+                return False  # stranded sats — the row is the only record
+        elif state != "refunded":
+            return False
+
+        await self.db.scrub_participant(fresh["id"])
+        logger.info("Departed participant scrubbed from mix %s (%s)",
+                    tokens.m(mix_id), reason)
+        return True
+
     async def _drop_underfunded(self, p: Dict, mix_id: str):
         """Refund + DM a participant whose allocation collapsed to 0 equal
         outputs once the real miner fee was applied. C2 fix — the old code
@@ -1932,9 +1981,10 @@ class Coordinator:
         across a crash boundary (C-B fix)."""
         # If already past 'paid' (e.g. a prior _drop_underfunded call landed
         # before a crash), skip the whole thing — UTXOs are gone, refund
-        # decision is recorded.
+        # decision is recorded. A missing row means the departure was already
+        # settled AND scrubbed — equally terminal.
         fresh = await self.db.get_participant(p["id"])
-        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+        if fresh is None or fresh.get("state") in self._REFUND_TERMINAL_STATES:
             return
 
         # Release the dropped participant's UTXOs back to the pool — the
@@ -1987,6 +2037,10 @@ class Coordinator:
                 f"output plus miner fees.",
             )
 
+        # Departure settled — delete the row (kept only if sats are stranded
+        # with no Lightning address, or a refund is in unknown-outcome limbo).
+        await self._scrub_departed(p, mix_id, "underfunded_dropped")
+
     async def _drop_address_starved(self, p: Dict, mix_id: str):
         """Drop a participant who reached assembly without enough output
         addresses to receive the outputs they committed (most often a survivor
@@ -1994,9 +2048,10 @@ class Coordinator:
         Releases their UTXOs and refunds any service fee, with an accurate
         message telling them to resubmit /addresses.
 
-        Idempotent via _safe_refund (C-B): safe to call twice across a crash."""
+        Idempotent via _safe_refund (C-B): safe to call twice across a crash.
+        A missing row (already settled + scrubbed) is treated as terminal."""
         fresh = await self.db.get_participant(p["id"])
-        if fresh and fresh.get("state") in self._REFUND_TERMINAL_STATES:
+        if fresh is None or fresh.get("state") in self._REFUND_TERMINAL_STATES:
             return
 
         await self.db.delete_utxos_by_participant(p["id"])
@@ -2034,6 +2089,10 @@ class Coordinator:
         else:
             await self.db.update_participant(p["id"], state="cancelled")
             await self.nostr.send_dm(npub, msg)
+
+        # Departure settled — delete the row (kept only if sats are stranded
+        # with no Lightning address, or a refund is in unknown-outcome limbo).
+        await self._scrub_departed(p, mix_id, "address_starved_dropped")
 
     async def _assemble_psbt(self, mix: Dict, active: List[Dict]):
         """Build the PSBT skeleton and send to all paid participants.

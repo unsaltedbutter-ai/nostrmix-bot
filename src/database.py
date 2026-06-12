@@ -188,6 +188,18 @@ class Database:
         await self._execute("DELETE FROM participants WHERE id=?", (pid,))
         await self._conn.commit()
 
+    async def scrub_participant(self, pid: str):
+        """Delete one participant and every row keyed to them (outputs,
+        utxos, psbt_rounds). The per-participant analogue of
+        destroy_mix_data — used the moment a departed participant's refund
+        story is settled, so their npub/lud16 don't outlive their
+        participation. Child rows first (FKs are ON, no cascade)."""
+        await self._execute("DELETE FROM outputs WHERE participant_id=?", (pid,))
+        await self._execute("DELETE FROM utxos WHERE participant_id=?", (pid,))
+        await self._execute("DELETE FROM psbt_rounds WHERE participant_id=?", (pid,))
+        await self._execute("DELETE FROM participants WHERE id=?", (pid,))
+        await self._conn.commit()
+
     async def count_participants_by_mix(self, mix_id: str,
                                         exclude_states: Optional[List[str]] = None) -> int:
         sql = "SELECT COUNT(*) as cnt FROM participants WHERE mix_id=?"

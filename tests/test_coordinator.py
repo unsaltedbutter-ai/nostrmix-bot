@@ -1186,8 +1186,9 @@ class TestPerParticipantPayTimeout:
 
             await coord._tick()
 
-            p = await db.get_participant(pid)
-            assert p["state"] == "cancelled"
+            # Nothing was paid, so the departure is settled instantly: the
+            # row (npub) is scrubbed, not parked as 'cancelled'.
+            assert await db.get_participant(pid) is None
             assert await db.get_utxos_by_participant(pid) == []
         finally:
             await db.close()
@@ -2115,9 +2116,9 @@ class TestBroadcast409TreatedAsSuccess:
 
             # The under-funded participant should be marked refunded with a
             # Lightning refund attempted, and DM'd that they were dropped.
-            poor_after = await db.get_participant(poor)
-            assert poor_after["state"] in ("refunded", "cancelled"), (
-                f"poor should be refunded/cancelled, got {poor_after['state']}"
+            # Once settled (refunded), the departed row is scrubbed outright.
+            assert await db.get_participant(poor) is None, (
+                "poor's row should be scrubbed after the refund settled"
             )
             assert any(r[0] == "poor@x" for r in lightning.refunds), (
                 f"poor should have gotten a Lightning refund; got {lightning.refunds}"
@@ -2522,11 +2523,10 @@ class TestExitMixSingleAndNone:
 
             await coord._cmd_exit_mix(FakeCtx("npub_solo"), "npub_solo", None)
 
-            p = await db.get_participant(pid)
-            # C-B: paid users go through the idempotent refund path and end
-            # in 'refunded' (or 'refund_failed') rather than the older
-            # 'cancelled'. 'cancelled' is now reserved for unpaid exits.
-            assert p["state"] == "refunded"
+            # C-B + scrub: the paid user goes through the idempotent refund
+            # path; once 'refunded' the row is deleted on the spot — the
+            # npub/lud16 must not linger until the mix itself ends.
+            assert await db.get_participant(pid) is None
             # Refund was attempted for the participant's lud16.
             assert any(r[0] == "solo@x" for r in lightning.refunds)
             dms = [m for r, m in nostr.sent_dms if r == "npub_solo"]
@@ -2557,8 +2557,9 @@ class TestExitMixSingleAndNone:
 
             await coord._cmd_exit_mix(FakeCtx("npub_mm"), "npub_mm", mix_a)
 
-            # C-B: paid exit lands in 'refunded' (not 'cancelled').
-            assert (await db.get_participant(pid_a))["state"] == "refunded"
+            # C-B + scrub: the matched paid exit is refunded then deleted;
+            # the other mix's row is untouched.
+            assert await db.get_participant(pid_a) is None
             assert (await db.get_participant(pid_b))["state"] == "paid"
         finally:
             await db.close()
@@ -2579,7 +2580,7 @@ class TestExitMixSingleAndNone:
 
             await coord._cmd_exit_mix(FakeCtx("npub_mm2"), "npub_mm2", mix_b)
 
-            assert (await db.get_participant(pid_b))["state"] == "refunded"
+            assert await db.get_participant(pid_b) is None  # refunded + scrubbed
             assert (await db.get_participant(pid_a))["state"] == "paid"
             # The refund went to mix_b's lud16 for an amount derived from
             # mix_b's 4000-sat fee (not mix_a's 500).
@@ -2967,11 +2968,14 @@ class TestRefundIdempotency:
 
             p = await db.get_participant(pid)
             await coord._drop_underfunded(p, mix_id)
-            assert (await db.get_participant(pid))["state"] == "refunded"
+            # Refunded, then scrubbed on the spot.
+            assert await db.get_participant(pid) is None
             first_count = len(lightning.refunds)
+            assert first_count == 1
 
             # Re-call with the now-stale `p` dict (state was 'paid' when we
-            # read it). Real crash-resume hits the same scenario.
+            # read it). Real crash-resume hits the same scenario — the
+            # MISSING row must read as terminal, not as "never refunded".
             await coord._drop_underfunded(p, mix_id)
             assert len(lightning.refunds) == first_count, (
                 "C-B regression: _drop_underfunded paid twice"
@@ -5166,5 +5170,92 @@ class TestAppendModeAddressIntake:
             await db.update_participant(pid, state="committed")
             await coord._cmd_clear_addresses(FakeCtx(npub), npub)
             assert "no addresses on file" in nostr.sent_dms[-1][1].lower()
+        finally:
+            await db.close()
+
+
+# --- Departed-participant scrub: rows must not outlive a settled departure ---
+
+
+class TestDepartedParticipantScrub:
+    """A cancelled/dropped participant's row (npub + lud16) is deleted the
+    moment their refund story settles. Held ONLY while sats are genuinely
+    owed with no way to record the debt."""
+
+    @pytest.mark.asyncio
+    async def test_unpaid_exit_scrubs_row_immediately(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000)
+            pid = await db.add_participant(mix_id, "npub_free", "free@x")
+            await db.add_utxo(pid, TXID[0], 0, 250_000, "p2wpkh", FAKE_SCRIPTPUBKEY)
+            await db.update_participant(pid, state="committed")
+
+            await coord._cmd_exit_mix(FakeCtx("npub_free"), "npub_free", None)
+
+            assert await db.get_participant(pid) is None
+            assert await db.get_utxos_by_participant(pid) == []
+            assert lightning.refunds == []  # nothing was owed
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_refund_converts_to_owed_debt_then_scrubs(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            async def reject(lud16, sats, reason="x"):
+                return None  # both LN backends refused
+            lightning.send_refund = reject
+
+            mix_id = await db.create_mix(output_size=100_000)
+            pid = await db.add_participant(mix_id, "npub_owed", "owed@x")
+            await db.update_participant(pid, state="paid", fee_paid=1000)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_owed"), "npub_owed", None)
+
+            # Row gone; the debt survives as the minimal refunds_owed record
+            # (lud16 + sats keyed on the opaque pid — no npub, no mix link).
+            assert await db.get_participant(pid) is None
+            owed = await db.get_refunds_owed()
+            assert len(owed) == 1
+            assert owed[0]["lightning_addr"] == "owed@x"
+            assert owed[0]["sats"] == coord._refund_keep_math(1000)
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_stranded_fee_without_lud16_keeps_the_row(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000)
+            # Paid a fee but no lightning address on file: the participant
+            # row is the ONLY record of who is owed — it must survive.
+            pid = await db.add_participant(mix_id, "npub_stranded", "")
+            await db.update_participant(pid, state="paid", fee_paid=1000)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_stranded"), "npub_stranded", None)
+
+            p = await db.get_participant(pid)
+            assert p is not None and p["state"] == "cancelled"
+            assert await db.get_refunds_owed() == []
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_scrub_deletes_leftover_psbt_rounds(self):
+        """A ghost-recovery survivor can exit while old psbt_rounds rows
+        still reference them — the scrub must take those too (FKs are ON)."""
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            mix_id = await db.create_mix(output_size=100_000)
+            pid = await db.add_participant(mix_id, "npub_rounds", "r@x")
+            await db.update_participant(pid, state="paid", fee_paid=0)
+            await db.add_psbt_round(mix_id, pid, round_num=1)
+
+            await coord._cmd_exit_mix(FakeCtx("npub_rounds"), "npub_rounds", None)
+
+            assert await db.get_participant(pid) is None
+            rounds = await db.get_psbt_rounds_by_mix(mix_id)
+            assert all(r["participant_id"] != pid for r in rounds)
         finally:
             await db.close()

@@ -333,7 +333,16 @@ class PSBTManager:
             return True, "valid"
 
         except Exception as e:
-            return False, f"Validation error: {str(e)}"
+            # The reason string is DM'd back to the participant — never embed
+            # str(e): bitcointx exceptions can carry serialized PSBT fragments
+            # (other participants' addresses/scripts). The operator gets a
+            # truncated copy in the log; the user gets only the class name.
+            msg = str(e)
+            if len(msg) > 120:
+                msg = msg[:120] + "...(truncated)"
+            logger.warning("PSBT validation error: %s — %s",
+                           type(e).__name__, msg)
+            return False, f"Validation error: {type(e).__name__}"
 
     @staticmethod
     def _extract_signature(psbt_input) -> Optional[Tuple[bytes, bytes]]:
