@@ -4825,6 +4825,34 @@ class TestListAutoCreate:
             await db.close()
 
 
+class TestJoinUnknownNameIsHelpful:
+    """A join with a name that doesn't match shouldn't dead-end — it should
+    surface the open mix names (or tell the user to start one)."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_lists_open_mixes(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            real = await coord._create_default_mix()  # an open, collecting mix
+            await coord._cmd_join_mix(FakeCtx("npub_typo"), "wrong-name", None, None)
+            msg = nostr.sent_dms[-1][1]
+            assert "wrong-name" in msg
+            assert real in msg                # the actual open name is offered
+            assert f"join {real}" in msg
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_with_nothing_open_points_to_start(self):
+        coord, db, nostr, chain, lightning = await make_coord()
+        try:
+            await coord._cmd_join_mix(FakeCtx("npub_none"), "ghost-mix", None, None)
+            msg = nostr.sent_dms[-1][1].lower()
+            assert "ghost-mix" in msg and "join 0.01" in msg
+        finally:
+            await db.close()
+
+
 class TestStageAwareHelp:
     """The /help command list is tuned to where the user is. Tuning only the
     guidance — every command still works regardless of what's shown."""

@@ -367,8 +367,18 @@ class Coordinator:
                 if alt:
                     mix, mix_id = alt, alt_mix_id
             if not mix:
-                await self.nostr.send_dm(
-                    npub_hex, f"No mix named '{alt_mix_id or mix_id}' found.")
+                # Don't dead-end on a typo — show the open names to copy, or
+                # point them at starting one if nothing's open.
+                open_mixes = await self.db.get_mixes_by_state(
+                    "announced", "collecting")
+                names = [m["id"] for m in open_mixes]
+                if names:
+                    msg = (f"No mix named '{alt_mix_id or mix_id}'. Open now: "
+                           f"{', '.join(names)}. Try: join {names[0]}")
+                else:
+                    msg = (f"No mix named '{alt_mix_id or mix_id}', and none are "
+                           f"open. Send `join 0.01` to start one.")
+                await self.nostr.send_dm(npub_hex, msg)
                 return
             if mix["state"] not in ("announced", "collecting"):
                 await self.nostr.send_dm(npub_hex, f"Mix '{mix_id}' is already in progress or completed.")
