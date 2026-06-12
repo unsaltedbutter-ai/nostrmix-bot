@@ -138,7 +138,9 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | `MAX_PENDING_MIXES` | `5` | int ≥ 1 | Max simultaneous **paid** mixes a single npub may be in. A 4th/Nth `join` is refused. |
 | `MAX_OPEN_MIXES` | `10` | int ≥ 1 (clamped up to 1) | Cap on simultaneously-open mixes (state `announced`/`collecting`). Gates **every** new-mix creation path — `join <amount>` and the `commit` auto-create. At the cap, creation is refused and the user is pointed at `list`. (The daily auto-create only fires when zero mixes are open, so it never hits this.) |
 | `SIGNING_DEADLINE_HOURS` | `48` | int > 0 | Time participants have to return a signed PSBT. Reminder DMs fire at ⅛, ¼, ½ of this; past it, the participant is ghosted + blacklisted. |
-| `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set); also the collecting deadline and the ghost-recovery deadline extension. |
+| `PAY_DEADLINE_HOURS` | `12` | int > 0 | Time a `committed` participant has to pay (when a fee is set). Only the per-participant pay timeout — the collecting/fill window is now `FILL_DEADLINE_HOURS`. |
+| `EMPTY_MIX_EXPIRY_HOURS` | `168` | int > 0 | How long a mix with **zero** participants stays open before it's retired (held by age since creation). Long so a morning-announced mix is still joinable that night / for days. |
+| `FILL_DEADLINE_HOURS` | `168` | int > 0 | Once a mix **has** participants but hasn't reached its non-conforming target, how long it keeps collecting before it cancels + refunds (freeing committed UTXOs). Refreshed each time a new participant joins. Long by default because gathering is slow on a small bot; shorten as traffic grows. Also the ghost-recovery deadline extension. |
 | `MAX_GHOST_RETRIES` | `3` | int ≥ 0 | How many times a mix restarts collecting after a ghost before it cancels and refunds everyone. |
 | `MINIMUM_UTXO_SIZE` | `10000` | int > 0 | Dust threshold. Below this, a change/leftover is folded into the miner fee instead of becoming an output; UTXOs smaller than this are rejected at `commit`. |
 
