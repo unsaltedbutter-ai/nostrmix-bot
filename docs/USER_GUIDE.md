@@ -32,7 +32,11 @@ until you've inspected it and added your signature in your own wallet.
 - **A Nostr client that supports NIP-17 private DMs** (gift-wrapped direct
   messages) — e.g. 0xchat or Amethyst. Confirm your client implements NIP-17;
   older NIP-04 DMs won't reach the bot privately.
-- **The bot's npub** (published by the operator). All commands are DMs to it.
+- **The bot's npub** — everything in this guide is a DM to:
+
+  ```
+  npub1g27uaw60wmt3j39a72rp73v36a49e0vmj4kw54l6pvyh3248dp7qzcj6jn
+  ```
 - **A wallet that imports and signs PSBTs** — **Sparrow** or **Electrum** are the
   easiest. You sign there; the bot never sees your keys.
 - **Native SegWit (`p2wpkh`, `bc1q…`) coins and addresses.** This mixer currently
