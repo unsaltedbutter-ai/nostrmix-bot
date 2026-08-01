@@ -12,10 +12,8 @@ from nostrbot_sdk import (
     NostrBotConfig,
     SenderContext,
     ValidatedZap,
-    build_note_tags,
-    send_note,
 )
-from nostr_sdk import Keys, Tag
+from nostr_sdk import Keys
 
 from .config import BotConfig
 
@@ -54,13 +52,23 @@ class NostrHandler:
         self._on_ready = cb
 
     def build_config(self) -> NostrBotConfig:
-        """Build a NostrBotConfig from our BotConfig."""
+        """Build a NostrBotConfig from our BotConfig.
+
+        dm_expiry_seconds is passed explicitly rather than left on the SDK
+        default: our DMs carry PSBTs, addresses and txids, and how long those
+        may sit on public relays is a decision this bot owns. As of SDK v0.5.2
+        the same NIP-40 tag goes on the gift wrap as well as the message inside
+        it, so the relay (which sees only the wrap) and the recipient's client
+        expire it at the same moment. BotConfig._validate holds the window above
+        SIGNING_DEADLINE_HOURS.
+        """
         cfg = self._cfg
         return NostrBotConfig(
             nsec=cfg.NOSTR_PRIVATE_KEY_NPUB,
             relays=cfg.NOSTR_RELAYS,
             profile=cfg.profile,
             zap_provider_pubkey=cfg.ZAP_PROVIDER_PUBKEY_HEX,
+            dm_expiry_seconds=cfg.DM_EXPIRY_SECONDS,
         )
 
     @property

@@ -3,9 +3,19 @@
 import os
 import json
 import logging
+import math
 from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Mirrors nostrbot_sdk.expiration: dm_expiration_tag() anchors a DM's NIP-40
+# stamp at `now - r`, r drawn from [0, min(GIFT_WRAP_MAX_BACKDATE_SECS,
+# window / BACKDATE_FRACTION)], so the expiration can't be read backwards to
+# recover the send time. Mirrored rather than imported to keep config.py free
+# of SDK imports; tests/test_config.py pins these against the real SDK values
+# so a change upstream fails loudly instead of silently shortening our floor.
+_GIFT_WRAP_MAX_BACKDATE_HOURS = 48
+_BACKDATE_FRACTION = 4
 
 
 # Defaults matching the plan's env template
@@ -19,6 +29,16 @@ _DEFAULTS = {
     "BOT_PICTURE": "",
     "BOT_NIP05": "",
     "BOT_WEBSITE": "",
+    # NIP-40 lifetime of outbound DMs. As of nostrbot-sdk v0.5.2 the same tag is
+    # stamped on the gift wrap as well as the message inside it, so the relay
+    # holding our PSBTs, addresses and txids and the recipient's client agree on
+    # when they die. The SDK backdates the shared timestamp by a random amount (up to
+    # min(2 days, quarter of this window)) so `expiration - window` can't be
+    # used to recover the real send time, which means the GUARANTEED lifetime
+    # is 3/4 of this value — see _validate(), which holds that floor above
+    # SIGNING_DEADLINE_HOURS so a PSBT never expires before its deadline.
+    # Default 7 days, matching the other lifecycle windows.
+    "DM_EXPIRY_HOURS": 168,
 
     # Zap receiving
     "ZAP_PROVIDER_PUBKEY_HEX": "",
@@ -209,6 +229,29 @@ class BotConfig:
                 f"the mix would build dust equal-outputs."
             )
 
+        # DM expiry must outlive the signing deadline. The SDK backdates the
+        # tag it stamps on the rumor and the gift wrap by a random amount, up
+        # to min(2 days, a quarter of the window), so an observer can't read
+        # the send time off `expiration - window`. Only 3/4 of DM_EXPIRY_HOURS
+        # is therefore guaranteed. If that floor sank below the signing
+        # deadline, a relay could drop a PSBT DM while the participant still
+        # had hours left to sign: they'd come back to an empty inbox, ghost,
+        # and get blacklisted for a message we let expire. Clamp up rather
+        # than reject — a safe value always exists.
+        if self.DM_EXPIRY_HOURS < 1:
+            self._values["DM_EXPIRY_HOURS"] = 1
+        if self.dm_guaranteed_hours < self.SIGNING_DEADLINE_HOURS:
+            safe = self._min_safe_dm_expiry_hours(self.SIGNING_DEADLINE_HOURS)
+            logger.warning(
+                "DM_EXPIRY_HOURS=%d guarantees only %.1fh of DM lifetime after "
+                "the SDK's privacy backdate, which is under SIGNING_DEADLINE_"
+                "HOURS=%d — a signing PSBT could expire off relays before its "
+                "deadline. Raising DM_EXPIRY_HOURS to %d.",
+                self.DM_EXPIRY_HOURS, self.dm_guaranteed_hours,
+                self.SIGNING_DEADLINE_HOURS, safe,
+            )
+            self._values["DM_EXPIRY_HOURS"] = safe
+
         # Parse relay URLs
         raw = self._values.get("NOSTR_RELAYS", "")
         relay_list = [r.strip() for r in raw.split(",") if r.strip()]
@@ -303,6 +346,43 @@ class BotConfig:
     @property
     def BOT_WEBSITE(self) -> str:
         return self._values["BOT_WEBSITE"]
+
+    @property
+    def DM_EXPIRY_HOURS(self) -> int:
+        return self._values["DM_EXPIRY_HOURS"]
+
+    @property
+    def DM_EXPIRY_SECONDS(self) -> int:
+        """DM_EXPIRY_HOURS in the unit NostrBotConfig.dm_expiry_seconds wants."""
+        return self.DM_EXPIRY_HOURS * 3600
+
+    @property
+    def dm_guaranteed_hours(self) -> float:
+        """Worst-case lifetime of a DM: what survives the SDK's backdating.
+
+        The tag is anchored at `now - r`, so the shortest window a recipient
+        can get is DM_EXPIRY_HOURS minus the largest possible r.
+        """
+        return self.DM_EXPIRY_HOURS - min(
+            _GIFT_WRAP_MAX_BACKDATE_HOURS,
+            self.DM_EXPIRY_HOURS / _BACKDATE_FRACTION,
+        )
+
+    @staticmethod
+    def _min_safe_dm_expiry_hours(signing_deadline_hours: int) -> int:
+        """Smallest DM_EXPIRY_HOURS whose guaranteed lifetime covers `signing_deadline_hours`.
+
+        Below the point where window/4 exceeds the 2-day cap, the backdate
+        scales with the window and 3/4 of it survives; above it the backdate is
+        a flat 2 days.
+        """
+        scaled = math.ceil(
+            signing_deadline_hours * _BACKDATE_FRACTION / (_BACKDATE_FRACTION - 1)
+        )
+        cap_crossover = _GIFT_WRAP_MAX_BACKDATE_HOURS * _BACKDATE_FRACTION
+        if scaled <= cap_crossover:
+            return scaled
+        return signing_deadline_hours + _GIFT_WRAP_MAX_BACKDATE_HOURS
 
     @property
     def ZAP_PROVIDER_PUBKEY_HEX(self) -> str:

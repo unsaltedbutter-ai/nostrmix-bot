@@ -33,6 +33,9 @@ class TestConfigTranslation:
         assert ncfg.relays == cfg.NOSTR_RELAYS
         assert ncfg.profile == cfg.profile
         assert ncfg.zap_provider_pubkey == cfg.ZAP_PROVIDER_PUBKEY_HEX
+        # DM lifetime is ours to set, not the SDK's to default.
+        assert ncfg.dm_expiry_seconds == cfg.DM_EXPIRY_SECONDS
+        assert ncfg.dm_expiry_seconds == 168 * 3600
 
 
 class TestCallbackRegistration:
@@ -259,6 +262,95 @@ class TestSdkInterfacePinning:
         assert "self.start()" in run_src, "run() no longer calls start()"
         assert "already started" in start_src, "start() no longer guards re-entry"
         assert hasattr(NostrBot, "stop")
+
+
+class TestDmExpirationOnBothLayers:
+    """Pin the v0.5.2 behavior our DMs depend on, against the REAL SDK.
+
+    A relay only ever sees the gift wrap, the recipient's client only reads the
+    message inside it, and our DMs carry PSBTs, addresses and txids. Both layers
+    must therefore carry the expiration, and carry the *same* one, so the two
+    ends never disagree about when a DM dies. Everything here runs offline: the
+    client is mocked, only the crypto is real.
+    """
+
+    @staticmethod
+    def _expiration(tags) -> int | None:
+        for t in tags:
+            v = t.as_vec()
+            if v and v[0] == "expiration":
+                return int(v[1])
+        return None
+
+    @staticmethod
+    def _bot_with_mocked_client(nsec: str):
+        """A real NostrBot on OUR config (only the key and client are fake).
+
+        Built through NostrHandler.build_config so the expiry these tests
+        measure is the one the live bot would actually use.
+        """
+        import dataclasses
+        from nostrbot_sdk import NostrBot
+
+        ncfg = NostrHandler(_cfg()).build_config()
+        bot = NostrBot(dataclasses.replace(ncfg, nsec=nsec))
+        bot._nip17_support = MagicMock()
+        bot._nip17_support.check = AsyncMock(
+            return_value=["wss://relay.example.invalid"]
+        )
+        bot._client = MagicMock()
+        bot._client.add_relay = AsyncMock(return_value=False)
+        bot._client.connect = AsyncMock()
+        bot._client.send_event = AsyncMock()
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_send_dm_stamps_the_same_expiration_inside_and_outside(self):
+        from nostr_sdk import Keys, Timestamp, UnwrappedGift
+
+        recipient = Keys.generate()
+        bot = self._bot_with_mocked_client(Keys.generate().secret_key().to_bech32())
+
+        assert await bot.send_dm(recipient.public_key().to_hex(), "psbt...")
+
+        wrap = bot._client.send_event.call_args.args[0]
+        assert wrap.kind().as_u16() == 1059, "not a gift wrap"
+
+        outer = self._expiration(wrap.tags().to_vec())
+        rumor = (await UnwrappedGift.from_gift_wrap_async(recipient, wrap)).rumor()
+        inner = self._expiration(rumor.tags().to_vec())
+
+        assert outer is not None, "no expiration on the wrap — the relay can't act on it"
+        assert inner is not None, "no expiration inside — the recipient can't see one"
+        assert outer == inner, "the two layers disagree on when the DM dies"
+        assert outer > Timestamp.now().as_secs(), "DM born already expired"
+
+    @pytest.mark.asyncio
+    async def test_dm_outlives_the_signing_deadline_but_not_the_window(self):
+        """The tag is anchored in the past to hide the send time, so the
+        remaining lifetime is between 3/4 and all of DM_EXPIRY_HOURS — and the
+        floor has to clear SIGNING_DEADLINE_HOURS."""
+        from nostr_sdk import Keys, Timestamp
+
+        cfg = _cfg()
+        bot = self._bot_with_mocked_client(Keys.generate().secret_key().to_bech32())
+        assert await bot.send_dm(Keys.generate().public_key().to_hex(), "psbt...")
+
+        wrap = bot._client.send_event.call_args.args[0]
+        remaining_h = (
+            self._expiration(wrap.tags().to_vec()) - Timestamp.now().as_secs()
+        ) / 3600
+        assert cfg.dm_guaranteed_hours <= remaining_h <= cfg.DM_EXPIRY_HOURS
+        assert remaining_h > cfg.SIGNING_DEADLINE_HOURS
+
+    def test_sdk_still_exposes_the_dm_expiration_helper(self):
+        """dm_expiration_tag is what produces the one tag both layers share. If
+        it disappears, send_dm has likely moved back to a per-layer tag and the
+        agreement asserted above is worth re-checking."""
+        import nostrbot_sdk
+
+        assert hasattr(nostrbot_sdk, "dm_expiration_tag")
+        assert "dm_expiry_seconds" in nostrbot_sdk.NostrBotConfig.__dataclass_fields__
 
 
 class TestRunForeverDoesNotRestart:

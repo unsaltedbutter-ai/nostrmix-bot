@@ -10,7 +10,12 @@
 # (conftest.py imports the same shim for tests). Delete that module if/when
 # bitcointx ships a release with the renamed names.
 
-nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.1
+# v0.5.2 extends the NIP-40 expiration we already send: the outer gift wrap now
+# carries the same tag as the message inside it, so the relay and the recipient's
+# client agree on when a DM dies. It also moves the pin from nostr-sdk 0.44.2 to
+# >=0.45.0a7 — a pre-release, so `pip install -r` needs the specifier to allow it
+# (it does; the floor itself is a pre-release version).
+nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.2
 # Pinned: the conftest.py libsecp256k1 symbol-rename shim is written against
 # 1.1.5's loader internals. A 1.2+ release could change those and break tests.
 python-bitcointx==1.1.5

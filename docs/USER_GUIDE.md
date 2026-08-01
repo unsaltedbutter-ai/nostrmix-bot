@@ -68,6 +68,9 @@ the 1-to-1 link between your coin and your identity is broken. The leftover that
   ([§13](#13-gotta-keep-em-separated)).
 - **Sign promptly.** There's a signing deadline (default **48h**). Miss it and
   you're treated as a ghost — blacklisted, and the mix re-forms without you.
+- **Don't treat the DMs as storage.** Every message the bot sends is marked to
+  expire after about a week, so relays drop it and it can disappear from your
+  client. Keep anything you want (a PSBT, your addresses) outside the chat.
 - **Re-mix** change in a later round for stronger privacy ([§14](#14-re-mixing-for-more-privacy)).
 
 ---

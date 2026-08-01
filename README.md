@@ -47,6 +47,13 @@ case sats are owed but there's no Lightning address to pay them to, and `blackli
 entries for ghosters. Logs are tokenised (no raw npubs/txids/addresses), and HTTP
 client loggers are capped so request URLs never write txids to disk.
 
+Copies the bot doesn't hold are covered too: every outbound DM carries a NIP-40
+expiration (`DM_EXPIRY_HOURS`, 7 days by default) on the gift wrap as well as the
+message inside it, so the relay storing it and the recipient's client drop it at
+the same moment rather than only one of them knowing when it dies. The shared
+timestamp is anchored slightly in the past so it can't be read backwards to
+recover when the DM was sent.
+
 ## Quick Start
 
 ```bash
@@ -115,6 +122,7 @@ read as strings, whitespace-trimmed, and coerced to the type of their default
 | `BOT_PICTURE` | `""` | URL | kind-0 profile picture. |
 | `BOT_NIP05` | `""` | nip05 id | kind-0 profile NIP-05. |
 | `BOT_WEBSITE` | `""` | URL | kind-0 profile website. |
+| `DM_EXPIRY_HOURS` | `168` | int > 0 (clamped up, see note) | NIP-40 lifetime of the bot's outbound DMs, carried on the gift wrap **and** the message inside it so relay and client expire it together. The SDK anchors the shared tag up to ¼ of the window in the past (capped at 2 days) so `expiration − window` can't reveal the send time, so the **guaranteed** lifetime is ¾ of this — 126h at the default. The loader raises the value if that floor wouldn't clear `SIGNING_DEADLINE_HOURS` (a PSBT expiring before its deadline would ghost an honest participant) and logs a warning when it does. |
 
 ### Zap receiving (service fee)
 

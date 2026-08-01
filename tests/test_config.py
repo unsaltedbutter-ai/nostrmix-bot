@@ -46,6 +46,11 @@ class TestBotConfig:
         assert isinstance(cfg.NOSTR_RELAYS, list)
         assert len(cfg.NOSTR_RELAYS) >= 1
         assert cfg.FEE_MULTIPLIER == 1.25
+        # NIP-40 DM lifetime: 7 days, of which 126h always survives the SDK's
+        # privacy backdate — comfortably past the 48h signing deadline.
+        assert cfg.DM_EXPIRY_HOURS == 168
+        assert cfg.DM_EXPIRY_SECONDS == 168 * 3600
+        assert cfg.dm_guaranteed_hours == 126
 
         # Clean up
         os.unlink(env_path)
@@ -66,6 +71,74 @@ class TestBotConfig:
             # it doesn't bleed into other tests' BotConfig instances.
             os.environ.pop("MAX_OPEN_MIXES", None)
             os.unlink(env_path)
+
+    def test_dm_expiry_clamped_above_signing_deadline(self, caplog):
+        """A DM window whose guaranteed part is under SIGNING_DEADLINE_HOURS is
+        raised. Otherwise a relay could drop the PSBT DM while the participant
+        still had time to sign, and they'd be ghosted for our expiry choice."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("SIGNING_DEADLINE_HOURS=48\n")
+            f.write("DM_EXPIRY_HOURS=50\n")  # only 37.5h guaranteed
+            env_path = f.name
+
+        try:
+            with caplog.at_level("WARNING"):
+                cfg = BotConfig(env_path)
+            # ceil(48 * 4/3) — the smallest window keeping 48h after backdating.
+            assert cfg.DM_EXPIRY_HOURS == 64
+            assert cfg.dm_guaranteed_hours >= cfg.SIGNING_DEADLINE_HOURS
+            assert "DM_EXPIRY_HOURS" in caplog.text
+        finally:
+            os.environ.pop("SIGNING_DEADLINE_HOURS", None)
+            os.environ.pop("DM_EXPIRY_HOURS", None)
+            os.unlink(env_path)
+
+    def test_dm_expiry_long_signing_deadline_uses_flat_backdate_cap(self):
+        """Past a 192h window the backdate stops scaling and sits at 2 days, so
+        the safe floor is deadline + 48h rather than deadline * 4/3."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("SIGNING_DEADLINE_HOURS=200\n")
+            f.write("DM_EXPIRY_HOURS=168\n")
+            env_path = f.name
+
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.DM_EXPIRY_HOURS == 248
+            assert cfg.dm_guaranteed_hours >= 200
+        finally:
+            os.environ.pop("SIGNING_DEADLINE_HOURS", None)
+            os.environ.pop("DM_EXPIRY_HOURS", None)
+            os.unlink(env_path)
+
+    def test_dm_expiry_generous_window_left_alone(self):
+        """An operator-chosen window that already covers the deadline stands."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("NOSTR_PRIVATE_KEY_NPUB=nsec1abc...\n")
+            f.write("DM_EXPIRY_HOURS=72\n")
+            env_path = f.name
+
+        try:
+            cfg = BotConfig(env_path)
+            assert cfg.DM_EXPIRY_HOURS == 72
+        finally:
+            os.environ.pop("DM_EXPIRY_HOURS", None)
+            os.unlink(env_path)
+
+    def test_backdate_constants_match_the_sdk(self):
+        """config.py mirrors nostrbot-sdk's backdating bounds instead of
+        importing them. If the SDK widens its backdate, our guaranteed-lifetime
+        floor silently shrinks — fail here instead."""
+        from nostrbot_sdk.expiration import (
+            GIFT_WRAP_MAX_BACKDATE_SECS,
+            _BACKDATE_FRACTION,
+        )
+        from src.config import _BACKDATE_FRACTION as OURS_FRACTION
+        from src.config import _GIFT_WRAP_MAX_BACKDATE_HOURS as OURS_HOURS
+
+        assert OURS_HOURS * 3600 == GIFT_WRAP_MAX_BACKDATE_SECS
+        assert OURS_FRACTION == _BACKDATE_FRACTION
 
     def test_relay_parsing(self):
         """Test relay list parsing."""

@@ -42,6 +42,9 @@ def _check_config(cfg: BotConfig) -> list[str]:
     print(f"  config file        : {cfg._env_path}")
     print(f"  bot key set        : {bool(cfg.NOSTR_PRIVATE_KEY_NPUB)}")
     print(f"  relays             : {len(cfg.NOSTR_RELAYS)} -> {', '.join(cfg.NOSTR_RELAYS)}")
+    print(f"  dm expiry          : {cfg.DM_EXPIRY_HOURS}h "
+          f"({cfg.dm_guaranteed_hours:.0f}h guaranteed after backdating; "
+          f"signing deadline {cfg.SIGNING_DEADLINE_HOURS}h)")
     print(f"  FEE_PER_ELEMENT    : {cfg.FEE_PER_ELEMENT} ({'zaps OFF' if cfg.FEE_PER_ELEMENT == 0 else 'zaps ON'})")
     print(f"  output_size        : {cfg.DEFAULT_OUTPUT_SIZE} sats")
     print(f"  required NC parts   : {cfg.DEFAULT_REQUIRED_NONCONFORMING}")
